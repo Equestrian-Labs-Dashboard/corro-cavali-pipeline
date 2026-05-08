@@ -14,7 +14,7 @@ FIXES v2.3 + Smartrr safe fix:
 - gross_profit viene directo de ShopifyQL (campo gross_profit)
 
 EJECUCIÓN:
-  python backfill.py
+  python backfill_historical.py
   (requiere env vars: SHOPIFY_TOKEN_CORRO, SHOPIFY_TOKEN_CAVALI, GOOGLE_CREDENTIALS)
   Opcional/recomendado para Cavali: SMARTRR_API_KEY_CAVALI
 
@@ -24,11 +24,18 @@ COMPORTAMIENTO EN SHEETS:
       Además actualiza smartrr_subscribers para Cavali
 """
 
-import os, json, time, random, requests, gspread
+import os, json, time, random, requests, gspread, sys
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
 import pytz
 import re
+
+
+# Force live logs in GitHub Actions / non-interactive shells
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 TIMEZONE    = pytz.timezone("America/Bogota")
 GQL_VERSION = "2025-10"
@@ -1120,7 +1127,9 @@ def write_smartrr(gc, sheet_id, smartrr_row):
 # MAIN
 # ─────────────────────────────────────────────────────────────────
 def main():
+    print("Starting historical backfill...", flush=True)
     gc      = get_gc()
+    print("Google Sheets auth OK.", flush=True)
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
     today   = datetime.now(TIMEZONE).date()
 
