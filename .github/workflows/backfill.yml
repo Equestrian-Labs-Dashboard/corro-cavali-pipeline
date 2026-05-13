@@ -23,7 +23,12 @@ jobs:
 
       - name: Check backfill version
         run: |
-          grep -n "FAST / SAFE MODE\|Limpiando tabs existentes\|Safe mode" backfill_historical.py || true
+          if grep -q "Limpiando tabs existentes" backfill_historical.py; then
+            echo "::error::OLD backfill_historical.py detected. Do not run this file because it clears Sheets at start."
+            exit 1
+          fi
+
+          grep -n "FAST / SAFE MODE\|Safe mode" backfill_historical.py
 
       - name: Run historical backfill
         env:
