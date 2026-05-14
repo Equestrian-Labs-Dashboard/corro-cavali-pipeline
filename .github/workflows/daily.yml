@@ -6,10 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
