@@ -23,7 +23,11 @@ jobs:
 
       - name: Check backfill version
         run: |
-          grep -n "FAST / SAFE MODE\|Limpiando tabs existentes\|Safe mode" backfill_historical.py || true
+          if grep -q "Limpiando tabs existentes" backfill_historical.py; then
+            echo "::error::OLD backfill_historical.py detected. It clears Sheets at start."
+            exit 1
+          fi
+          grep -n "Safe mode\|smartrr product volume" backfill_historical.py || true
 
       - name: Run historical backfill
         env:
