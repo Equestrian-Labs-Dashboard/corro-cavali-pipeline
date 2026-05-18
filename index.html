@@ -182,7 +182,12 @@ select:focus{border-color:var(--gr)}
     <div class="sb-sub">Analytics Suite</div>
   </div>
   <div class="sb-nav">
-<div class="sb-sec" style="margin-top:4px">Brands</div>
+    <div class="sb-sec">Performance</div>
+    <div class="sb-item on" style="cursor:default">
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="1" y="1" width="4" height="4" rx="1" fill="currentColor"/><rect x="7" y="1" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/><rect x="1" y="7" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/><rect x="7" y="7" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/></svg>
+      Current Dashboard
+    </div>
+    <div class="sb-sec" style="margin-top:4px">Brands</div>
     <a class="sb-item" href="#" onclick="setBrand('corro');return false">
       <div style="width:5px;height:5px;border-radius:50%;background:#2EE896"></div>Corro
     </a>
@@ -200,8 +205,8 @@ select:focus{border-color:var(--gr)}
       <span>Frequency</span>
       <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#72AEFF;border:1px solid rgba(114,174,255,.25)">RET</span>
     </a>
-    <a class="sb-suite" href="https://script.google.com/a/macros/corroshop.com/s/AKfycbxe4ehlUKnVqzVEAqigm9CZQXzMzb2hDezQZlsuok4GXCjlH4GAzSL3RWhZTsZE6tH8/exec" onclick="return false" title="Cashflow link pending">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M2 8.5h7" stroke="#2EE896" stroke-width="1.2" stroke-linecap="round"/><path d="M3 6.4c0-1.15 1.05-2.1 2.5-2.1S8 5.25 8 6.4 6.95 8.5 5.5 8.5 3 7.55 3 6.4Z" fill="#2EE896" opacity=".25" stroke="#2EE896" stroke-width=".8"/><path d="M5.5 2v6.4" stroke="#2EE896" stroke-width=".8" stroke-linecap="round"/><path d="M7.15 3.15c-.38-.48-.98-.75-1.65-.75-.95 0-1.65.47-1.65 1.15 0 1.65 3.3.7 3.3 2.38 0 .7-.68 1.28-1.75 1.28-.82 0-1.45-.3-1.9-.85" stroke="#2EE896" stroke-width=".75" stroke-linecap="round"/></svg>
+    <a class="sb-suite" href="#" onclick="return false" title="Cashflow link pending">
+      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M2 8.5h7M2 5.5h7M2 2.5h7" stroke="#2EE896" stroke-width="1.2" stroke-linecap="round"/><circle cx="8.5" cy="2.5" r="1" fill="#2EE896"/><circle cx="5.5" cy="5.5" r="1" fill="#2EE896" opacity=".7"/><circle cx="3.5" cy="8.5" r="1" fill="#2EE896" opacity=".45"/></svg>
       <span>Cashflow</span>
       <span class="sb-badge" style="background:rgba(46,232,150,.12);color:#2EE896;border:1px solid rgba(46,232,150,.25)">CF</span>
     </a>
@@ -287,19 +292,12 @@ select:focus{border-color:var(--gr)}
 
   <!-- 06 · Cavali Subscribers (Smartrr) -->
   <div class="cavali-only" id="subs-sec">
-    <div class="sec"><div class="sec-num">06</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--pu)">Cavali — Active Subscribers by Box · Smartrr</div><div class="sec-line"></div></div>
+    <div class="sec"><div class="sec-num">06</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--pu)">Cavali — Product Volume by Product-Variant · Smartrr</div><div class="sec-line"></div></div>
     <div id="smartrr-status"></div>
     <div class="kg" id="s-subs"></div>
   </div>
 
-  <div class="sec">
-    <div class="sec-num" id="q1-num">07</div>
-    <div class="sec-line"></div>
-    <div class="sec-lbl">Q1 2026 Snapshot</div>
-    <div class="sec-line"></div>
-  </div>
-  <div class="kg" id="q1-grid"></div>
-  <div style="font-size:10px;color:var(--tx3);margin-top:5px" id="q1-note"></div>
+  <!-- Q1 snapshot removed: use Quarter filter for Q1 2026. -->
 
   <div class="sec">
     <div class="sec-num" id="mi-num">08</div>
@@ -415,33 +413,82 @@ function _smartrrNum(v) {
   return isNaN(n) ? 0 : n;
 }
 
-async function fetchSmartrrSubs() {
+async function fetchSmartrrSubs(kpiRow) {
   if (brand !== "cavali") return null;
-  if (_smartrrCache && Date.now() - _smartrrTs < 10 * 60 * 1000) return _smartrrCache;
 
   const sid = SIDS[brand];
   const rows = await fetchTab(sid, "smartrr_subscribers");
   if (!rows || !rows.length) return null;
 
   const candidates = rows.filter(r => (r.brand || "cavali").toLowerCase() === "cavali");
-  const row = bestRow(candidates.length ? candidates : rows);
+  const all = candidates.length ? candidates : rows;
+  const opt = getOpt();
+  const targetPeriod = (kpiRow && kpiRow.period) || "";
+  const targetStart = (kpiRow && kpiRow.period_start) || opt.start || "";
+  const targetEnd = (kpiRow && kpiRow.period_end) || opt.end || "";
+
+  // New schema: one row per product + period. This lets Cavali vary with the selected date filter.
+  const hasProductRows = all.some(r => (r.product || r.product_variant || r.product_name) && (r.active_subscribers || r.sales_volume || r.count));
+  if (hasProductRows) {
+    let periodRows = all.filter(r => {
+      const p = (r.period || "").trim();
+      const ps = (r.period_start || "").trim();
+      const pe = (r.period_end || "").trim();
+      return (targetPeriod && p === targetPeriod) || (ps === targetStart && pe === targetEnd);
+    });
+
+    let periodMatched = true;
+    if (!periodRows.length) {
+      // Do not silently pretend the latest active snapshot is the selected period.
+      // We show the latest rows as diagnostic fallback, with a visible warning.
+      periodMatched = false;
+      const latestTs = Math.max(...all.map(r => Date.parse(r.updated_at) || 0));
+      periodRows = all.filter(r => (Date.parse(r.updated_at) || 0) === latestTs);
+    }
+
+    const byProduct = {};
+    const examples = [];
+    periodRows.forEach(r => {
+      const name = String(r.product || r.product_variant || r.product_name || "Other / Unmapped").trim() || "Other / Unmapped";
+      const v = _smartrrNum(r.active_subscribers || r.sales_volume || r.count || r.total || 0);
+      byProduct[name] = (byProduct[name] || 0) + v;
+      if ((r.examples || r.example || "") && examples.length < 4) examples.push(r.examples || r.example);
+    });
+
+    const products = Object.entries(byProduct)
+      .filter(([,v]) => v > 0)
+      .sort((a,b) => b[1] - a[1])
+      .map(([label,value]) => ({label, value}));
+
+    const total = products.reduce((a,x)=>a+x.value,0);
+    const ref = bestRow(periodRows) || {};
+    return {
+      products, total, periodMatched,
+      period_start: targetStart, period_end: targetEnd, period: targetPeriod,
+      updated_at: ref.updated_at || "",
+      source: ref.source || "Smartrr → Sheets",
+      error: ref.error || (!periodMatched ? "No Smartrr row for selected period; showing latest diagnostic rows." : ""),
+      examples,
+    };
+  }
+
+  // Legacy schema fallback: one latest snapshot row. Kept only so older sheets do not break.
+  const row = bestRow(all);
   if (!row) return null;
-
-  const sea = _smartrrNum(row.seasonal);
-  const sig = _smartrrNum(row.signature);
-  const pre = _smartrrNum(row.premier);
-  const jun = _smartrrNum(row.junior);
-  const other = _smartrrNum(row.other);
-  const total = _smartrrNum(row.total_subscribers) || (sea + sig + pre + jun + other);
-
-  _smartrrCache = {
-    sea, sig, pre, jun, other, total,
+  const products = [
+    { label:"Cavali Club Membership", value:_smartrrNum(row.seasonal) },
+    { label:"The Signature Box Subscription", value:_smartrrNum(row.signature) },
+    { label:"The Premier Box Subscription", value:_smartrrNum(row.premier) },
+    { label:"Cavali Club Junior Membership", value:_smartrrNum(row.junior) },
+    { label:"Other / Unmapped", value:_smartrrNum(row.other) },
+  ].filter(x => x.value > 0);
+  const total = _smartrrNum(row.total_subscribers) || products.reduce((a,x)=>a+x.value,0);
+  return {
+    products, total, periodMatched:false,
     updated_at: row.updated_at || "",
     source: row.source || "Smartrr → Sheets",
-    error: row.error || ""
+    error: row.error || "Legacy Smartrr snapshot only. Run updated pipeline/backfill for period-specific product volume.",
   };
-  _smartrrTs = Date.now();
-  return _smartrrCache;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -944,83 +991,49 @@ function renderSubsEmpty(reason) {
     </div>`;
 }
 
-async function renderSubs() {
+async function renderSubs(kpiRow) {
   if (brand !== "cavali") return;
   const el = document.getElementById("s-subs"); if (!el) return;
   const statusEl = document.getElementById("smartrr-status");
   el.innerHTML = skel(4);
   if (statusEl) statusEl.innerHTML = "";
 
-  const data = await fetchSmartrrSubs();
+  const data = await fetchSmartrrSubs(kpiRow);
   const ft = document.getElementById("ft-smartrr");
 
   if (data === null) {
-    if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-warn">⚠ Smartrr data not loaded yet. Run pipeline.</div>`;
+    if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-warn">⚠ Smartrr period data not loaded yet. Run pipeline/backfill.</div>`;
     if (ft) { ft.textContent = "Smartrr"; ft.style.color = "var(--am)"; }
-    renderSubsEmpty("Missing smartrr_subscribers tab or empty Sheet row");
+    renderSubsEmpty("Missing smartrr_subscribers period rows");
     return;
   }
 
-  if (!data.total) {
-    const msg = data.error || "Smartrr returned 0 active subscriptions";
+  if (!data.total || !data.products?.length) {
+    const msg = data.error || "Smartrr returned 0 products for this period";
     if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-warn">⚠ ${msg}</div>`;
     if (ft) { ft.textContent = "Smartrr"; ft.style.color = "var(--am)"; }
     renderSubsEmpty(msg);
     return;
   }
 
-  const storeLabel = "cavaliclub.com";
-  if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-ok">✓ Smartrr · ${data.total} active subs · ${storeLabel}</div>`;
-  if (ft) { ft.textContent = "Smartrr ✓"; ft.style.color = "var(--gr)"; }
+  const periodTxt = data.period_start && data.period_end ? `${fmtD(data.period_start)} – ${fmtD(data.period_end)}` : "latest";
+  const statusClass = data.periodMatched ? "smartrr-ok" : "smartrr-warn";
+  const statusIcon = data.periodMatched ? "✓" : "⚠";
+  if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge ${statusClass}">${statusIcon} Smartrr · ${data.total} product volume · ${periodTxt}</div>`
+    + (data.error ? `<div class="smartrr-badge smartrr-warn">${data.error}</div>` : "")
+    + (data.examples?.length ? `<div class="smartrr-badge smartrr-warn">Examples: ${data.examples.slice(0,3).join(" · ")}</div>` : "");
+  if (ft) { ft.textContent = data.periodMatched ? "Smartrr ✓" : "Smartrr ⚠"; ft.style.color = data.periodMatched ? "var(--gr)" : "var(--am)"; }
 
-  const cards = [
-    { l:"Seasonal",          v:data.sea, c:"#D8B054" },
-    { l:"Signature",         v:data.sig, c:"#A090FF" },
-    { l:"Premier",           v:data.pre, c:"#2EE896" },
-    { l:"Junior",            v:data.jun, c:"#F06868" },
-    ...(data.other > 0 ? [{ l:"Other", v:data.other, c:"#707070" }] : []),
-    { l:"Total Subscribers", v:data.total || (data.sea + data.sig + data.pre + data.jun + data.other), c:"#72AEFF" },
-  ];
+  const palette = ["#D8B054", "#A090FF", "#2EE896", "#F06868", "#72AEFF", "#707070", "#C8D8E8", "#0C7050"];
+  const cards = data.products.map((p, i) => ({ l:p.label, v:p.value, c:palette[i % palette.length] }));
+  cards.push({ l:"Total", v:data.total, c:"#72AEFF" });
   _renderSubCards(cards, `${data.source || "Smartrr → Sheets"} · ${data.updated_at || "latest"}`);
 }
 
-/* ══════════════════════════════════════════════════════
-   Q1 2026 SNAPSHOT
-══════════════════════════════════════════════════════ */
+// Q1 Snapshot removed from dashboard. Use the Quarter selector for Q1 2026 instead.
+async function renderQ1() { return; }
 
-async function renderQ1(kpiRows) {
-  const el   = document.getElementById("q1-grid");
-  const note = document.getElementById("q1-note");
-  if (!el) return;
-  const Q1_PK = "q1_2026", Q1_S = "2026-01-01", Q1_E = "2026-03-31";
-  let row = null;
-  if (kpiRows?.length) {
-    let m = kpiRows.filter(r=>r.period===Q1_PK);
-    if (!m.length) m = kpiRows.filter(r=>(r.period_start||"").trim()===Q1_S&&(r.period_end||"").trim()===Q1_E);
-    row = bestRow(m);
-  }
-  const prevQ = kpiRows?.length ? bestRow(kpiRows.filter(r=>r.period==="q4_2025")) : null;
-  if (!row) {
-    el.innerHTML=`<div style="font-size:11px;color:var(--tx3);padding:6px 0">Q1 2026 data not found. Run <strong style="color:var(--gd)">Backfill Historical Data</strong> action then refresh.</div>`;
-    if (note) note.innerHTML = "";
-    return;
-  }
-  const gp = resolveGrossProfit(row);
-  const fields = [
-    {k:"gross_sales",  l:"Gross Sales Q1",  f:"$"},
-    {k:"net_sales",    l:"Net Sales Q1",    f:"$"},
-    {k:"gross_profit", l:"Gross Profit Q1", f:"$", gp:true},
-    {k:"pct_gm",       l:"Gross Margin",    f:"%"},
-    {k:"nb_orders",    l:"Orders Q1",       f:""},
-    {k:"aov",          l:"AOV Q1",          f:"$"},
-  ];
-  el.innerHTML = fields.map(s => {
-    const val    = s.gp ? fv(gp,"$") : fv(row[s.k],s.f);
-    const cmpVal = s.gp ? (prevQ ? resolveGrossProfit(prevQ) : null) : (prevQ ? prevQ[s.k] : null);
-    return kcard(s.l, val, prevQ?pctChg(s.gp?gp:row[s.k], cmpVal):null, "Q4 25", "", "var(--gd)");
-  }).join('');
-  if (note) note.innerHTML = `Q1 2026 = Jan 1 – Mar 31, 2026. Updated: <strong>${row.updated_at||"—"}</strong>. Compared vs Q4 2025.`;
-}
+/* Q1 Snapshot removed: use Quarter filter for Q1 2026. */
 
 /* ══════════════════════════════════════════════════════
    MANUAL DATA
@@ -1106,8 +1119,7 @@ async function render() {
   const root = document.getElementById("app-root");
   if (root) root.classList.toggle("is-cavali", brand==="cavali");
 
-  safeSet("q1-num", brand==="cavali" ? "07" : "06");
-  safeSet("mi-num", brand==="cavali" ? "08" : "07");
+  safeSet("mi-num", brand==="cavali" ? "07" : "06");
 
   const skelIds = { "s-web": 3, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
@@ -1231,9 +1243,8 @@ async function render() {
 
   renderCAC(cacV||0, (m.ltv||0), cacSrc);
 
-  if (brand==="cavali") await renderSubs();
+  if (brand==="cavali") await renderSubs(row);
 
-  await renderQ1(kpiR);
 
   renderIbar(opt, cmpLbl);
   loadManual();
