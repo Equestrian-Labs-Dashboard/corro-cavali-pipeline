@@ -95,8 +95,8 @@ AD_SPEND_DATA = {
 
 
 SMARTRR_HEADERS = [
-    "updated_at", "brand", "period", "period_start", "period_end",
-    "product", "active_subscribers", "source", "error", "examples",
+    "updated_at", "brand", "seasonal", "signature", "premier", "junior",
+    "other", "total_subscribers", "source", "error",
 ]
 
 SMARTRR_API_KEYS = {
@@ -1112,177 +1112,6 @@ def write_smartrr(gc, sheet_id, smartrr_row):
     ws.append_row(smartrr_row, value_input_option="USER_ENTERED")
     print("    smartrr_subscribers: 1 row")
 
-
-
-def _smartrr_event_date(subscription):
-    """Best-effort date used to make Smartrr product volume respond to dashboard period filters."""
-    candidates = [
-        _dig(subscription, "createdAt"), _dig(subscription, "created_at"),
-        _dig(subscription, "orderCreatedAt"), _dig(subscription, "order_created_at"),
-        _dig(subscription, "processedAt"), _dig(subscription, "processed_at"),
-        _dig(subscription, "submittedAt"), _dig(subscription, "submitted_at"),
-        _dig(subscription, "startedAt"), _dig(subscription, "started_at"),
-        _dig(subscription, "firstBillingDate"), _dig(subscription, "first_billing_date"),
-        _dig(subscription, "nextBillingDate"), _dig(subscription, "next_billing_date"),
-        _dig(subscription, "sts.0.createdAt"), _dig(subscription, "sts.0.created_at"),
-        _dig(subscription, "lineItems.0.createdAt"), _dig(subscription, "line_items.0.created_at"),
-        _dig(subscription, "stLineItems.0.createdAt"), _dig(subscription, "stLineItems.0.created_at"),
-    ]
-    for val in candidates:
-        dt = _parse_shopify_dt(val)
-        if dt:
-            return dt.astimezone(TIMEZONE).date()
-        # date-only fallback
-        txt = str(val or "").strip()
-        m = re.match(r"(\d{4}-\d{2}-\d{2})", txt)
-        if m:
-            try:
-                return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-            except Exception:
-                pass
-    return None
-
-
-def _smartrr_product_label(subscription):
-    """Return the real Product & Variant label used by Cavali/Smartrr instead of fixed buckets."""
-    text = _smartrr_plan_text(subscription)
-    t = _norm_txt(text)
-    if not t or t in ("none", "null"):
-        return "Other / Unmapped"
-    if re.search(r"(^|\s|\|)ø($|\s|\|)", t) or " empty " in f" {t} ":
-        return "Ø"
-    if "cavali club junior membership" in t or "junior membership" in t:
-        return "Cavali Club Junior Membership"
-    if "signature box subscription" in t:
-        return "The Signature Box Subscription"
-    if "the signature box" in t or "signature box" in t:
-        return "The Signature Box Subscription"
-    if "premier box subscription" in t:
-        return "The Premier Box Subscription"
-    if "the premier box" in t or "premier box" in t:
-        return "The Premier Box Subscription"
-    if "cavali club membership" in t:
-        return "Cavali Club Membership"
-    if "welcome box" in t:
-        return "Welcome Box"
-    if "tryon eco-friendly equestrian backpack" in t or "tryon eco friendly equestrian backpack" in t:
-        return "Tryon Eco-Friendly Equestrian Backpack"
-    if "stop bugg" in t and "fly spray" in t:
-        return "Stop Bugg'n Fly Spray 16oz"
-    if "cheese knives" in t:
-        return "Cavali Club Cheese Knives"
-
-    # If there is a clean product-looking segment, surface it so we can map it later from the dashboard test.
-    for seg in [x.strip() for x in str(text).split("|") if x and x.strip()]:
-        low = _norm_txt(seg)
-        if len(seg) <= 80 and not any(skip in low for skip in ("month", "months", "delivery", "frequency", "selling plan", "program")):
-            return seg[:80]
-    return "Other / Unmapped"
-
-
-def fetch_smartrr_product_volume_rows(brand_name, store_url=None, token=None, periods=None):
-    """
-    Returns Smartrr rows by selected dashboard period + real product label.
-    This replaces the previous fixed snapshot buckets, so Cavali changes with Week/MTD/Month/Quarter filters.
-    """
-    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-    source = "Smartrr purchase-state · product volume by selected period"
-    if brand_name != "cavali":
-        return []
-    key = SMARTRR_API_KEYS.get(brand_name, "")
-    if not key:
-        return [[now_str, brand_name, "", "", "", "Other / Unmapped", 0, source, "SMARTRR_API_KEY_CAVALI missing", ""]]
-    periods = periods or []
-    if not periods:
-        today = datetime.now(TIMEZONE).date()
-        periods = [(f"mtd_{today:%Y-%m}", today.replace(day=1), today)]
-
-    base_url = "https://api.smartrr.com/vendor/purchase-state"
-    active = []
-    seen = set()
-    last_status = ""
-    try:
-        page_size = 250
-        page_number = 0
-        while page_number < 200:
-            params = {
-                "pageSize": page_size,
-                "pageNumber": page_number,
-                "filterEquals[purchaseStateStatus]": "ACTIVE",
-                "include": "items,lineItems,stLineItems,product,variant,subscriptionProgram,sellingPlan",
-            }
-            r = _smartrr_get(base_url, key, params=params)
-            last_status = f"HTTP {r.status_code}"
-            if r.status_code >= 400:
-                return [[now_str, brand_name, "", "", "", "Other / Unmapped", 0, source, f"Smartrr {last_status}: {(r.text or '')[:250]}", ""]]
-            payload = r.json()
-            items = _smartrr_items(payload)
-            total_hint = _smartrr_total_hint(payload)
-            if not items:
-                break
-            for sub in items:
-                raw_id = str(_dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "purchase_state_id") or _dig(sub, "shopifyId") or _dig(sub, "shopify_id") or json.dumps(sub, sort_keys=True)[:200])
-                if raw_id in seen:
-                    continue
-                seen.add(raw_id)
-                if not _smartrr_is_active(sub):
-                    continue
-                active.append({
-                    "product": _smartrr_product_label(sub),
-                    "date": _smartrr_event_date(sub),
-                    "example": _smartrr_plan_text(sub)[:160],
-                })
-            if len(items) < page_size:
-                break
-            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
-                break
-            page_number += 1
-
-        rows = []
-        no_date = sum(1 for x in active if not x.get("date"))
-        for pk, ps, pe in periods:
-            if not isinstance(ps, date):
-                ps = datetime.strptime(str(ps), "%Y-%m-%d").date()
-            if not isinstance(pe, date):
-                pe = datetime.strptime(str(pe), "%Y-%m-%d").date()
-            counts = {}
-            examples = {}
-            for x in active:
-                dt = x.get("date")
-                if not dt or not (ps <= dt <= pe):
-                    continue
-                prod = x.get("product") or "Other / Unmapped"
-                counts[prod] = counts.get(prod, 0) + 1
-                examples.setdefault(prod, x.get("example", ""))
-            if not counts:
-                rows.append([now_str, brand_name, pk, str(ps), str(pe), "Other / Unmapped", 0, source, f"No Smartrr product rows matched this period. Active rows without usable date: {no_date}", ""])
-            else:
-                for prod, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-                    rows.append([now_str, brand_name, pk, str(ps), str(pe), prod, cnt, source, f"Active rows without usable date: {no_date}" if no_date else "", examples.get(prod, "")])
-        print(f"    smartrr product volume rows: {len(rows)} periods={len(periods)} active_rows={len(active)} no_date={no_date}")
-        for prod, cnt in sorted({x['product']: sum(1 for y in active if y['product'] == x['product']) for x in active}.items(), key=lambda kv: -kv[1])[:10]:
-            print(f"      smartrr product test: {prod}={cnt}")
-        return rows
-    except Exception as e:
-        print(f"    ⚠ smartrr product volume error: {e}")
-        return [[now_str, brand_name, "", "", "", "Other / Unmapped", 0, source, str(e), ""]]
-
-
-def write_smartrr_product_rows(gc, sheet_id, smartrr_rows):
-    if not smartrr_rows:
-        return
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet("smartrr_subscribers")
-    except Exception:
-        ws = sh.add_worksheet("smartrr_subscribers", rows=max(100, len(smartrr_rows)+10), cols=len(SMARTRR_HEADERS))
-    ws.clear()
-    ws.append_row(SMARTRR_HEADERS)
-    if smartrr_rows:
-        ws.append_rows(smartrr_rows, value_input_option="USER_ENTERED")
-    print(f"    smartrr_subscribers: {len(smartrr_rows)} period/product rows")
-
-
 # HELPERS SHEETS
 # ─────────────────────────────────────────────────────────────────
 def _safe_date(v):
@@ -1535,9 +1364,8 @@ def main():
 
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
 
-        smartrr_periods = [(r[1], r[2], r[3]) for r in kpi_rows]
-        smartrr_rows = fetch_smartrr_product_volume_rows(brand_name, url, token, smartrr_periods)
-        write_smartrr_product_rows(gc, cfg["sheet_id"], smartrr_rows)
+        smartrr_row = fetch_smartrr_active_subs(brand_name, url, token)
+        write_smartrr(gc, cfg["sheet_id"], smartrr_row)
 
         print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
         for row in kpi_rows:
