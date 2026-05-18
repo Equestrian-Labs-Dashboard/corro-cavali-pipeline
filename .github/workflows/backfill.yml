@@ -1,4 +1,4 @@
-name: Historical Dashboard Backfill
+name: Historical Dashboard Backfill SAFE
 
 on:
   workflow_dispatch:
@@ -21,18 +21,28 @@ jobs:
         run: |
           pip install requests gspread google-auth pytz
 
-      - name: Check backfill version
+      - name: Verify SAFE backfill file
         run: |
-          if grep -q "Limpiando tabs existentes" backfill_historical.py; then
-            echo "::error::OLD backfill_historical.py detected. It clears Sheets at start."
+          echo "Checking backfill_safe.py..."
+          if [ ! -f backfill_safe.py ]; then
+            echo "::error::backfill_safe.py is missing in the repo root. Upload it before running."
             exit 1
           fi
-          grep -n "Safe mode\|smartrr product volume" backfill_historical.py || true
 
-      - name: Run historical backfill
+          if grep -q "Limpiando tabs existentes" backfill_safe.py; then
+            echo "::error::OLD / UNSAFE code detected inside backfill_safe.py. It would clear Sheets at start."
+            exit 1
+          fi
+
+          grep -n "FAST / SAFE MODE\|Safe mode\|tabs are NOT cleared" backfill_safe.py || {
+            echo "::error::SAFE marker not found. Upload the correct file."
+            exit 1
+          }
+
+      - name: Run SAFE historical backfill
         env:
           SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
           SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SMARTRR_API_KEY_CAVALI: ${{ secrets.SMARTRR_API_KEY_CAVALI }}
-        run: python -u backfill_historical.py
+        run: python -u backfill_safe.py
