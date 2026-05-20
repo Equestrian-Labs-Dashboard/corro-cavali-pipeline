@@ -664,22 +664,12 @@ def get_periods():
 
 
 # ─────────────────────────────────────────────────────────────────
-# SMARTRR — product volume by Product-Variant using CREATED DATE
+# SMARTRR — fetch active subscriptions and split by real Cavali box/product
 # ─────────────────────────────────────────────────────────────────
 
-SMARTRR_PRODUCT_VOLUME_HEADERS = [
-    "updated_at", "brand", "period", "period_start", "period_end",
-    "product_variant", "sku", "total_quantity", "gross_revenue",
-    "source", "date_basis", "active_filter", "sample_line_ids",
-]
-
-
 def _norm_txt(v):
-    return re.sub(r"\s+", " ", str(v or "").strip())
-
-
-def _norm_key(k):
-    return re.sub(r"[^a-z0-9]", "", str(k or "").lower())
+    """Normalize text for robust Cavali box/product matching."""
+    return re.sub(r"\s+", " ", str(v or "").strip().lower())
 
 
 def _dig(obj, *paths):
@@ -704,36 +694,17 @@ def _dig(obj, *paths):
     return ""
 
 
-def _deep_values_for_keys(obj, key_names, depth=0, limit=80):
-    """Find values anywhere in a nested object for loose key-name matches."""
-    out = []
-    wanted = {_norm_key(k) for k in key_names}
-    if obj is None or depth > 8 or len(out) >= limit:
-        return out
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            nk = _norm_key(k)
-            if nk in wanted and v not in (None, ""):
-                out.append(v)
-            if isinstance(v, (dict, list)) and len(out) < limit:
-                out.extend(_deep_values_for_keys(v, key_names, depth + 1, limit - len(out)))
-    elif isinstance(obj, list):
-        for v in obj[:80]:
-            if len(out) >= limit:
-                break
-            out.extend(_deep_values_for_keys(v, key_names, depth + 1, limit - len(out)))
-    return out
-
-
 def _smartrr_items(payload):
     """Normalize Smartrr list responses into a list."""
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, dict):
         return []
+
     for key in (
-        "data", "items", "results", "records", "purchaseStates", "purchase_states",
-        "purchaseState", "purchase_state", "subscriptions", "subscription_contracts", "contracts",
+        "data", "items", "results", "records",
+        "purchaseStates", "purchase_states", "purchaseState", "purchase_state",
+        "subscriptions", "subscription_contracts", "contracts",
     ):
         val = payload.get(key)
         if isinstance(val, list):
@@ -758,6 +729,106 @@ def _smartrr_total_hint(payload):
     return None
 
 
+def _collect_text(obj, depth=0, out=None):
+    """Collect product/line-item text from nested Smartrr objects."""
+    if out is None:
+        out = []
+    if depth > 7 or obj is None:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).lower()
+            # Product/line-item fields first. Plan/group fields are useful only when product title is absent.
+            useful_key = any(x in lk for x in (
+                "product", "variant", "lineitem", "line_item", "stline", "item", "sku",
+                "title", "name", "label", "program", "plan"
+            ))
+            if isinstance(v, (dict, list)):
+                _collect_text(v, depth + 1, out)
+            elif useful_key and v not in (None, ""):
+                out.append(str(v))
+    elif isinstance(obj, list):
+        for v in obj[:80]:
+            _collect_text(v, depth + 1, out)
+    return out
+
+
+def _smartrr_plan_text(subscription):
+    """
+    Build classification text from Smartrr response.
+    Important: Cavali Club Quarterly/Yearly Membership are plan/group names,
+    NOT the Seasonal box. The actual boxes are Product values:
+      - Cavali Club Membership        => Seasonal
+      - The Signature Box             => Signature
+      - The Premier Box               => Premier
+      - Cavali Club Junior Membership => Junior
+    """
+    # Put the most product-specific fields first.
+    vals = [
+        _dig(subscription, "product.title"),
+        _dig(subscription, "product.name"),
+        _dig(subscription, "productTitle"),
+        _dig(subscription, "product_title"),
+        _dig(subscription, "productName"),
+        _dig(subscription, "product_name"),
+        _dig(subscription, "variant.title"),
+        _dig(subscription, "variant.name"),
+        _dig(subscription, "stLineItems.0.title"),
+        _dig(subscription, "stLineItems.0.name"),
+        _dig(subscription, "stLineItems.0.productTitle"),
+        _dig(subscription, "stLineItems.0.product_title"),
+        _dig(subscription, "stLineItems.0.productName"),
+        _dig(subscription, "stLineItems.0.product_name"),
+        _dig(subscription, "lineItems.0.title"),
+        _dig(subscription, "lineItems.0.name"),
+        _dig(subscription, "lineItems.0.productTitle"),
+        _dig(subscription, "line_items.0.title"),
+        _dig(subscription, "items.0.title"),
+        _dig(subscription, "items.0.name"),
+        _dig(subscription, "items.0.productTitle"),
+        _dig(subscription, "subscriptionContractLine.title"),
+        _dig(subscription, "subscription_contract_line.title"),
+        # lower-priority plan/group text
+        _dig(subscription, "sellingPlan.name"),
+        _dig(subscription, "selling_plan.name"),
+        _dig(subscription, "sellingPlanName"),
+        _dig(subscription, "selling_plan_name"),
+        _dig(subscription, "subscriptionProgram.name"),
+        _dig(subscription, "subscription_program.name"),
+        _dig(subscription, "planName"),
+        _dig(subscription, "plan_name"),
+        _dig(subscription, "name"),
+        _dig(subscription, "title"),
+    ]
+    vals.extend(_collect_text(subscription))
+    return " | ".join(str(v) for v in vals if v)
+
+
+def _smartrr_is_active(subscription):
+    status = str(
+        _dig(subscription, "purchaseStateStatus") or
+        _dig(subscription, "purchase_state_status") or
+        _dig(subscription, "status") or
+        _dig(subscription, "subscriptionStatus") or
+        _dig(subscription, "subscription_status") or
+        _dig(subscription, "state") or
+        _dig(subscription, "sts.0.purchaseStateStatus") or
+        _dig(subscription, "sts.0.status")
+    ).strip().lower()
+
+    cancelled = (
+        _dig(subscription, "cancelledAt") or
+        _dig(subscription, "cancelled_at") or
+        _dig(subscription, "deletedAt") or
+        _dig(subscription, "deleted_at")
+    )
+    if cancelled:
+        return False
+
+    # Endpoint is already filtered by ACTIVE. If no status field is returned, count it.
+    return status in ("", "active", "activated")
+
+
 def _smartrr_headers(api_key, mode="token"):
     if mode == "bearer":
         return {
@@ -773,6 +844,7 @@ def _smartrr_headers(api_key, mode="token"):
 
 
 def _smartrr_get(url, api_key, params=None):
+    """Try the Smartrr access-token header first; retry bearer only if needed."""
     r = requests.get(url, headers=_smartrr_headers(api_key, "token"), params=params, timeout=60)
     if r.status_code in (401, 403):
         rb = requests.get(url, headers=_smartrr_headers(api_key, "bearer"), params=params, timeout=60)
@@ -781,340 +853,264 @@ def _smartrr_get(url, api_key, params=None):
     return r
 
 
-def _smartrr_status(subscription):
-    return str(
-        _dig(subscription, "purchaseStateStatus") or
-        _dig(subscription, "purchase_state_status") or
-        _dig(subscription, "status") or
-        _dig(subscription, "subscriptionStatus") or
-        _dig(subscription, "subscription_status") or
-        _dig(subscription, "state") or
-        _dig(subscription, "sts.0.purchaseStateStatus") or
-        _dig(subscription, "sts.0.status")
-    ).strip().lower()
-
-
-def _smartrr_is_active(subscription):
-    status = _smartrr_status(subscription)
-    cancelled = (
-        _dig(subscription, "cancelledAt") or _dig(subscription, "cancelled_at") or
-        _dig(subscription, "deletedAt") or _dig(subscription, "deleted_at") or
-        _dig(subscription, "pausedAt") or _dig(subscription, "paused_at")
-    )
-    if cancelled:
-        return False
-    if status in ("cancelled", "canceled", "paused", "inactive", "expired"):
-        return False
-    return status in ("", "active", "activated")
-
-
-def _parse_smartrr_date(v):
-    """Parse Smartrr/Shopify datetimes. Returns a date in local dashboard timezone."""
-    if v in (None, "", "ø", "null", "None"):
+def _parse_shopify_dt(v):
+    if not v:
         return None
-    s = str(v).strip()
-    # Smartrr UI often shows `2026-04-17 14:02:55.033`.
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
-        try:
-            return datetime.strptime(s[:26], fmt).date()
-        except Exception:
-            pass
     try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo:
-            dt = dt.astimezone(TIMEZONE)
-        return dt.date()
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-def _to_number(v, default=0.0):
-    if v in (None, "", "ø", "null", "None"):
-        return default
-    try:
-        return float(str(v).replace(",", "").replace("USD", "").strip())
-    except Exception:
-        return default
+def _smartrr_empty_row(now_str, brand_name, source, reason):
+    """Write an explicit empty/error row. No hardcoded reviewed fallback values."""
+    return [now_str, brand_name, 0, 0, 0, 0, 0, 0, source, reason or ""]
 
 
-def _money_to_usd(v):
-    n = _to_number(v, 0.0)
-    # Smartrr ORM price commonly comes as cents, e.g. 6900 = $69.
-    if abs(n) >= 1000:
-        return n / 100.0
-    return n
-
-
-def _first_deep(obj, keys):
-    vals = _deep_values_for_keys(obj, keys, limit=8)
-    for v in vals:
-        if v not in (None, "", "ø"):
-            return v
-    return ""
-
-
-def _candidate_line_dicts(obj, depth=0, out=None):
-    """Find nested dicts that look like Smartrr order line items."""
-    if out is None:
-        out = []
-    if obj is None or depth > 9:
-        return out
+def _find_contract_gid(obj, depth=0):
+    """Find gid://shopify/SubscriptionContract/... anywhere in the Smartrr object."""
+    if depth > 8 or obj is None:
+        return ""
+    if isinstance(obj, str):
+        m = re.search(r'gid://shopify/SubscriptionContract/(\d+)', obj)
+        if m:
+            return f"gid://shopify/SubscriptionContract/{m.group(1)}"
+        m = re.search(r'SubscriptionContract/(\d+)', obj)
+        if m:
+            return f"gid://shopify/SubscriptionContract/{m.group(1)}"
+        return ""
     if isinstance(obj, dict):
-        keys = {_norm_key(k) for k in obj.keys()}
-        has_qty = any(k in keys for k in ("quantity", "qty"))
-        has_product = any(k in keys for k in (
-            "purchasableandpurchasablevariantname", "productvariant", "productvariantname",
-            "producttitle", "productname", "title", "name", "varianttitle", "variantname",
-        )) or bool(_first_deep(obj, [
-            "purchasable_and_purchasable_variant_name", "purchasableAndPurchasableVariantName",
-            "productTitle", "product_title", "productName", "product_name", "variantTitle", "variant_title",
-        ]))
-        has_created = any("created" in k for k in keys)
-        has_line_marker = any("lineitem" in k or "orderlineitem" in k for k in keys)
-        if has_qty and has_product and (has_created or has_line_marker):
-            out.append(obj)
+        # Prefer obvious id fields first.
+        for key in (
+            "shopifyId", "shopify_id", "shopifySubscriptionContractId", "shopify_subscription_contract_id",
+            "subscriptionContractId", "subscription_contract_id", "externalSubscriptionId", "external_subscription_id",
+        ):
+            val = obj.get(key)
+            found = _find_contract_gid(val, depth + 1)
+            if found:
+                return found
+            if val is not None:
+                s = str(val).strip()
+                if re.fullmatch(r'\d{6,}', s) and "contract" in key.lower():
+                    return f"gid://shopify/SubscriptionContract/{s}"
         for v in obj.values():
-            if isinstance(v, (dict, list)):
-                _candidate_line_dicts(v, depth + 1, out)
-    elif isinstance(obj, list):
-        for v in obj[:500]:
-            _candidate_line_dicts(v, depth + 1, out)
-    return out
-
-
-def _line_created_date(line):
-    # IMPORTANT: this intentionally uses the line item's Created Date, matching the Smartrr drilldown.
-    val = (
-        _dig(line, "createdDate") or _dig(line, "created_date") or
-        _dig(line, "createdAt") or _dig(line, "created_at") or
-        _dig(line, "created") or _dig(line, "lineCreatedDate") or
-        _dig(line, "orderLineItemCreatedDate") or
-        _first_deep(line, [
-            "createdDate", "created_date", "createdAt", "created_at", "created",
-            "lineCreatedDate", "orderLineItemCreatedDate",
-        ])
-    )
-    return _parse_smartrr_date(val)
-
-
-def _line_deleted(line):
-    val = (
-        _dig(line, "deletedAt") or _dig(line, "deleted_at") or
-        _dig(line, "deleted") or _first_deep(line, ["deletedAt", "deleted_at", "deleted"])
-    )
-    return bool(val and str(val).strip() not in ("", "ø", "null", "None"))
-
-
-def _line_product(line):
-    vals = [
-        _dig(line, "purchasable_and_purchasable_variant_name"),
-        _dig(line, "purchasableAndPurchasableVariantName"),
-        _dig(line, "productVariant"), _dig(line, "productVariantName"),
-        _dig(line, "product_variant"), _dig(line, "product_variant_name"),
-        _dig(line, "variantTitle"), _dig(line, "variant_title"),
-        _dig(line, "productTitle"), _dig(line, "product_title"),
-        _dig(line, "productName"), _dig(line, "product_name"),
-        _dig(line, "title"), _dig(line, "name"),
-        _first_deep(line, [
-            "purchasable_and_purchasable_variant_name", "purchasableAndPurchasableVariantName",
-            "productVariantName", "product_variant_name", "productTitle", "product_title",
-            "productName", "product_name", "variantTitle", "variant_title", "title", "name",
-        ]),
-    ]
-    for v in vals:
-        txt = _norm_txt(v)
-        if txt and txt not in ("ø", "Default Title"):
-            return txt
-    return "Unknown Product"
-
-
-def _line_sku(line):
-    vals = [
-        _dig(line, "sku"), _dig(line, "SKU"), _dig(line, "variant.sku"),
-        _dig(line, "purchasableVariant.sku"), _dig(line, "purchasable_variant.sku"),
-        _first_deep(line, ["sku", "SKU", "purchasableVariantSku", "purchasable_variant_sku"]),
-    ]
-    for v in vals:
-        txt = _norm_txt(v)
-        if txt:
-            return txt
-    return "ø"
-
-
-def _line_id(line):
-    vals = [
-        _dig(line, "id"), _dig(line, "lineItemId"), _dig(line, "line_item_id"),
-        _dig(line, "shopifyId"), _dig(line, "shopify_id"), _dig(line, "shopifyLineItemId"),
-        _first_deep(line, ["id", "lineItemId", "line_item_id", "shopifyId", "shopify_id", "shopifyLineItemId"]),
-    ]
-    for v in vals:
-        txt = _norm_txt(v)
-        if txt:
-            return txt
+            found = _find_contract_gid(v, depth + 1)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for v in obj[:80]:
+            found = _find_contract_gid(v, depth + 1)
+            if found:
+                return found
     return ""
 
 
-def _line_quantity(line):
-    q = _dig(line, "quantity") or _dig(line, "qty") or _first_deep(line, ["quantity", "qty"])
-    n = _to_number(q, 1.0)
-    return int(n) if n and n > 0 else 1
+def _classify_box_text(text):
+    """Map Cavali product/box names to dashboard buckets."""
+    t = _norm_txt(text)
+    if not t:
+        return "other"
+    # Specific first so Junior Membership does not get swallowed by generic Membership.
+    if "cavali club junior membership" in t or "junior membership" in t or re.search(r'\bjunior\b', t):
+        return "junior"
+    if "the signature box" in t or "signature box" in t or re.search(r'\bsignature\b', t):
+        return "signature"
+    if "the premier box" in t or "premier box" in t or re.search(r'\bpremier\b', t):
+        return "premier"
+    if re.search(r'\bcavali club membership\b', t) or re.search(r'\bseasonal\b', t):
+        return "seasonal"
+    return "other"
 
 
-def _line_revenue(line, qty):
-    gross = (
-        _dig(line, "grossRevenue") or _dig(line, "gross_revenue") or
-        _dig(line, "shopIncome") or _dig(line, "shop_income") or
-        _dig(line, "totalPrice") or _dig(line, "total_price") or
-        _dig(line, "linePrice") or _dig(line, "line_price") or
-        ""
-    )
-    if gross not in (None, ""):
-        return _money_to_usd(gross)
-    price = (
-        _dig(line, "price") or _dig(line, "unitPrice") or _dig(line, "unit_price") or
-        _first_deep(line, ["price", "unitPrice", "unit_price"])
-    )
-    return _money_to_usd(price) * qty
+def fetch_shopify_subscription_contract_titles(store_url, token, contract_gids):
+    """
+    Smartrr purchase-state can return active subscription IDs without product labels.
+    Resolve those Shopify SubscriptionContract IDs through Shopify GraphQL and read line titles.
+    """
+    ids = sorted({gid for gid in contract_gids if gid and str(gid).startswith("gid://shopify/SubscriptionContract/")})
+    result = {}
+    if not ids:
+        return result
+
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        ids_arg = ",".join(json.dumps(x) for x in chunk)
+        q = f'''
+        {{
+          nodes(ids: [{ids_arg}]) {{
+            id
+            ... on SubscriptionContract {{
+              lines(first: 10) {{
+                edges {{
+                  node {{
+                    title
+                    variantTitle
+                    productId
+                    variantId
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+        '''
+        data = gql(store_url, token, q)
+        nodes = (data or {}).get("nodes") or []
+        for node in nodes:
+            if not node or not node.get("id"):
+                continue
+            parts = []
+            for edge in (((node.get("lines") or {}).get("edges")) or []):
+                ln = edge.get("node") or {}
+                for key in ("title", "variantTitle", "productId", "variantId"):
+                    if ln.get(key):
+                        parts.append(str(ln.get(key)))
+            result[node["id"]] = " | ".join(parts)
+        # Be gentle with Shopify GraphQL during large active-sub lists.
+        if i + 50 < len(ids):
+            time.sleep(0.35)
+    return result
 
 
-def fetch_smartrr_active_purchase_states(brand_name):
-    """Fetch ACTIVE purchase states once. No Shopify SubscriptionContract lookup."""
+def fetch_smartrr_active_subs(brand_name, store_url=None, token=None):
+    """
+    Returns one Sheets row for smartrr_subscribers.
+
+    Correct source of truth for Cavali box split:
+      1) Smartrr ACTIVE purchase states for the active subscriber universe.
+      2) Product/box name from Smartrr payload when present.
+      3) If Smartrr does not expose product labels, resolve Shopify SubscriptionContract
+         line titles through Shopify GraphQL and classify:
+           Cavali Club Membership        -> Seasonal
+           The Signature Box             -> Signature
+           The Premier Box               -> Premier
+           Cavali Club Junior Membership -> Junior
+    """
+    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
     key = SMARTRR_API_KEYS.get(brand_name, "")
-    if brand_name != "cavali" or not key:
-        if brand_name == "cavali":
-            print("    ⚠ smartrr: SMARTRR_API_KEY_CAVALI missing")
-        return []
+    source = "Smartrr ACTIVE purchase-state + Shopify SubscriptionContract lines"
+    if brand_name != "cavali":
+        return None
+    if not key:
+        return _smartrr_empty_row(now_str, brand_name, source, "SMARTRR_API_KEY_CAVALI missing")
 
     base_url = "https://api.smartrr.com/vendor/purchase-state"
-    active = []
-    seen = set()
-    page_size = 250
-    page_number = 0
-    total_hint = None
+    active_subs = []
+    seen_ids = set()
+    last_status = ""
 
-    while page_number < 200:
-        params = {
-            "pageSize": page_size,
-            "pageNumber": page_number,
-            "filterEquals[purchaseStateStatus]": "ACTIVE",
-            "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders",
-        }
-        r = _smartrr_get(base_url, key, params=params)
-        if r.status_code >= 400:
-            print(f"    ⚠ smartrr HTTP {r.status_code}: {(r.text or '')[:350]}")
-            break
-        payload = r.json()
-        items = _smartrr_items(payload)
-        total_hint = _smartrr_total_hint(payload)
-        if not items:
-            break
-        for sub in items:
-            if not _smartrr_is_active(sub):
-                continue
-            sid = str(_dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or json.dumps(sub, sort_keys=True)[:200])
-            if sid in seen:
-                continue
-            seen.add(sid)
-            active.append(sub)
-        if len(items) < page_size:
-            break
-        if total_hint is not None and (page_number + 1) * page_size >= total_hint:
-            break
-        page_number += 1
+    try:
+        page_size = 250
+        page_number = 0
+        total_hint = None
 
-    print(f"    smartrr active purchase states fetched: {len(active)}")
-    return active
+        while page_number < 200:
+            params = {
+                "pageSize": page_size,
+                "pageNumber": page_number,
+                "filterEquals[purchaseStateStatus]": "ACTIVE",
+                "include": "items,lineItems,stLineItems,product,variant,subscriptionProgram,sellingPlan",
+            }
+            r = _smartrr_get(base_url, key, params=params)
+            last_status = f"HTTP {r.status_code}"
+            if r.status_code >= 400:
+                body = (r.text or "")[:350]
+                return _smartrr_empty_row(now_str, brand_name, source, f"Smartrr {last_status}: {body}")
 
+            payload = r.json()
+            items = _smartrr_items(payload)
+            total_hint = _smartrr_total_hint(payload)
+            if not items:
+                break
 
-def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs):
-    """Build period/product rows using ACTIVE subscriptions and line item Created Date."""
-    if brand_name != "cavali" or not active_states:
-        return []
+            for sub in items:
+                raw_id = str(
+                    _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "purchase_state_id") or
+                    _dig(sub, "shopifyId") or _dig(sub, "shopify_id") or
+                    _dig(sub, "externalSubscriptionId") or _dig(sub, "external_subscription_id") or
+                    _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or ""
+                )
+                contract_gid = _find_contract_gid(sub)
+                dedupe_id = contract_gid or raw_id or json.dumps(sub, sort_keys=True)[:200]
+                if dedupe_id in seen_ids:
+                    continue
+                seen_ids.add(dedupe_id)
 
-    period_ranges = []
-    for pk, s, e in period_defs:
-        try:
-            period_ranges.append((pk, str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
+                if not _smartrr_is_active(sub):
+                    continue
 
-    buckets = {}
-    skipped_no_created = 0
-    line_count = 0
-    seen_lines = set()
+                direct_text = _smartrr_plan_text(sub)
+                direct_bucket = _classify_box_text(direct_text)
+                active_subs.append({
+                    "bucket": direct_bucket,
+                    "direct_text": direct_text,
+                    "contract_gid": contract_gid,
+                })
 
-    for sub in active_states:
-        for line in _candidate_line_dicts(sub):
-            if _line_deleted(line):
-                continue
-            created = _line_created_date(line)
-            if not created:
-                skipped_no_created += 1
-                continue
-            prod = _line_product(line)
-            sku = _line_sku(line)
-            qty = _line_quantity(line)
-            gross = _line_revenue(line, qty)
-            lid = _line_id(line) or f"{prod}|{sku}|{created}|{qty}|{gross}"
-            # Dedupe one physical line item across nested duplicate payload representations.
-            dedupe = str(lid)
-            if dedupe in seen_lines:
-                continue
-            seen_lines.add(dedupe)
-            line_count += 1
+            if len(items) < page_size:
+                break
+            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
+                break
+            page_number += 1
 
-            for pk, ps, pe, ds, de in period_ranges:
-                if ds <= created <= de:
-                    key = (pk, ps, pe, prod, sku)
-                    rec = buckets.setdefault(key, {"qty": 0, "gross": 0.0, "ids": []})
-                    rec["qty"] += qty
-                    rec["gross"] += gross
-                    if len(rec["ids"]) < 5:
-                        rec["ids"].append(str(lid)[:80])
+        if not active_subs:
+            return _smartrr_empty_row(now_str, brand_name, source, f"Smartrr returned 0 ACTIVE rows. Last status: {last_status or 'no response'}")
 
-    rows = []
-    for (pk, ps, pe, prod, sku), v in sorted(buckets.items(), key=lambda x: (x[0][0], -x[1]["qty"], x[0][3])):
-        rows.append([
-            now_str, brand_name, pk, ps, pe,
-            prod, sku, v["qty"], round(v["gross"], 2),
-            "Smartrr purchase-state ACTIVE line items",
-            "Order Line Item Created Date",
-            "purchaseStateStatus=ACTIVE; cancelled/paused/deleted excluded",
-            "; ".join(v["ids"]),
-        ])
+        # Resolve the records that Smartrr could not classify by product label.
+        unresolved_gids = [s["contract_gid"] for s in active_subs if s["bucket"] == "other" and s.get("contract_gid")]
+        contract_titles = {}
+        if unresolved_gids and store_url and token:
+            contract_titles = fetch_shopify_subscription_contract_titles(store_url, token, unresolved_gids)
 
-    print(f"    smartrr_product_volume: active_line_items={line_count} rows={len(rows)} skipped_no_created_date={skipped_no_created}")
-    tests = [r for r in rows if r[2] in ("2026-04", "mtd_2026-05")][:10]
-    for r in tests[:8]:
-        print(f"      smartrr product test: {r[5]} · sku={r[6]} · qty={r[7]} · gross={r[8]} · period={r[2]}")
-    return rows
+        counts = {"seasonal": 0, "signature": 0, "premier": 0, "junior": 0, "other": 0}
+        unknown_examples = []
+        for sub in active_subs:
+            bucket = sub["bucket"]
+            if bucket == "other" and sub.get("contract_gid"):
+                title_text = contract_titles.get(sub["contract_gid"], "")
+                resolved_bucket = _classify_box_text(title_text)
+                if resolved_bucket != "other":
+                    bucket = resolved_bucket
+                elif title_text and len(unknown_examples) < 5:
+                    unknown_examples.append(title_text[:180])
+            elif bucket == "other" and sub.get("direct_text") and len(unknown_examples) < 5:
+                unknown_examples.append(sub["direct_text"][:180])
+            counts[bucket] += 1
+
+        total = sum(counts.values())
+        error = ""
+        if counts["other"] > 0:
+            error = "Unmapped active subscriptions remained after product lookup: " + "; ".join(unknown_examples[:5])
+
+        print(
+            f"    smartrr: seasonal={counts['seasonal']} signature={counts['signature']} "
+            f"premier={counts['premier']} junior={counts['junior']} other={counts['other']} total={total}"
+        )
+        return [
+            now_str, brand_name,
+            counts["seasonal"], counts["signature"], counts["premier"], counts["junior"],
+            counts["other"], total, source, error,
+        ]
+
+    except Exception as e:
+        print(f"    ⚠ smartrr error: {e}")
+        return _smartrr_empty_row(now_str, brand_name, source, str(e))
 
 
-def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
-    """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
+
+def write_smartrr(gc, sheet_id, smartrr_row):
+    if not smartrr_row:
+        return
     sh = gc.open_by_key(sheet_id)
     try:
-        ws = sh.worksheet("smartrr_product_volume")
+        ws = sh.worksheet("smartrr_subscribers")
     except Exception:
-        ws = sh.add_worksheet("smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
+        ws = sh.add_worksheet("smartrr_subscribers", rows=50, cols=len(SMARTRR_HEADERS))
 
-    vals = ws.get_all_values()
-    keep = []
-    replace = {str(p).strip() for p in periods_to_replace if p}
-    if len(vals) >= 2:
-        h = vals[0]
-        for r in vals[1:]:
-            m = _row_to_map(h, r)
-            if str(m.get("period", "")).strip() not in replace:
-                keep.append(_map_to_row(SMARTRR_PRODUCT_VOLUME_HEADERS, m))
-
-    merged = keep + rows
     ws.clear()
-    ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
-    if merged:
-        ws.append_rows(merged, value_input_option="USER_ENTERED")
-    print(f"    smartrr_product_volume: {len(rows)} refreshed rows; {len(merged)} total rows")
-
+    ws.append_row(SMARTRR_HEADERS)
+    ws.append_row(smartrr_row, value_input_option="USER_ENTERED")
+    print("    smartrr_subscribers: 1 row")
 
 # HELPERS SHEETS
 # ─────────────────────────────────────────────────────────────────
@@ -1368,13 +1364,8 @@ def main():
 
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
 
-        if brand_name == "cavali":
-            # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.
-            # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
-            active_states = fetch_smartrr_active_purchase_states(brand_name)
-            period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
-            smartrr_rows = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
-            write_smartrr_product_volume(gc, cfg["sheet_id"], smartrr_rows, [p[0] for p in period_defs])
+        smartrr_row = fetch_smartrr_active_subs(brand_name, url, token)
+        write_smartrr(gc, cfg["sheet_id"], smartrr_row)
 
         print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
         for row in kpi_rows:
