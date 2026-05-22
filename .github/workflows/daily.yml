@@ -23,10 +23,13 @@ jobs:
         run: |
           pip install requests gspread google-auth pytz
 
-      - name: Run pipeline
+      - name: Run pipeline — Cavali first
         env:
           SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
           SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SMARTRR_API_KEY_CAVALI: ${{ secrets.SMARTRR_API_KEY_CAVALI }}
-        run: python -u pipeline.py
+          RUN_BRANDS: cavali,corro
+        run: |
+          echo "RUN_BRANDS=$RUN_BRANDS"
+          python -u pipeline.py
