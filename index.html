@@ -109,10 +109,6 @@ select:focus{border-color:var(--gr)}
 .smartrr-total-note{background:var(--sf2);border:1px solid var(--bd);border-radius:9px;padding:12px 14px;color:var(--tx2);font-size:10px;line-height:1.55;display:flex;flex-direction:column;justify-content:center}
 .smartrr-total-note strong{color:var(--tx)}
 .smartrr-product-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:7px;width:100%}
-.smartrr-section-title{display:flex;align-items:center;gap:8px;margin:12px 0 7px;font-size:9px;font-weight:700;color:var(--bl);letter-spacing:.12em;text-transform:uppercase}
-.smartrr-section-title:after{content:"";height:1px;background:var(--bd);flex:1}
-.smartrr-section-pill{font-size:8px;color:var(--pu);border:1px solid rgba(160,144,255,.4);background:rgba(160,144,255,.08);border-radius:20px;padding:2px 8px}
-.smartrr-error-box{background:var(--am-bg);border:1px solid var(--am-bd);color:var(--am);border-radius:8px;padding:10px 12px;font-size:11px;line-height:1.5;margin-top:8px}
 .kc-sub.sm-sub-small{padding:10px 11px;min-height:122px}
 .kc-sub.sm-sub-small .kc-lbl{font-size:9px;line-height:1.2;margin-bottom:5px}
 .kc-sub.sm-sub-small .sub-mini-label{font-size:8px;color:var(--tx3);font-weight:700;letter-spacing:.09em;text-transform:uppercase;margin-bottom:5px}
@@ -445,10 +441,21 @@ async function fetchSmartrrProductRows() {
 }
 
 function canonicalProductName(v) {
-  const t = String(v || "").toLowerCase();
+  let raw = String(v || "").trim().replace(/\s+/g, " ");
+  if (!raw || raw === "ø" || raw === "Default Title") return "Unknown Product";
+  const t = raw.toLowerCase();
+  if ((t.includes("quarterly membership") || t.includes("yearly membership") || t.includes("annual membership")) &&
+      !t.includes("cavali club membership") && !t.includes("junior")) return "Unknown Product";
+  if (t.includes("junior")) return "Cavali Club Junior Membership";
   if (t.includes("premier")) return "The Premier Box";
+  if (t.includes("signature") && t.includes("spring")) return "The Signature Spring Box";
   if (t.includes("signature")) return "The Signature Box";
-  return "Other";
+  if (t.includes("cavali club membership") || t.includes("seasonal")) return "Cavali Club Membership";
+  if (t.includes("welcome box")) return "Welcome Box";
+  if (t.includes("fly spray") || t.includes("bugg") || t.includes("bug'n") || t.includes("buggn")) return "Stop Bugg’n Fly Spray 16oz";
+  if (t.includes("backpack")) return "Tryon Eco-Friendly Equestrian Backpack";
+  raw = raw.replace(/\s+subscription$/i, "").replace(/\s+default title$/i, "").trim();
+  return raw || "Unknown Product";
 }
 
 function filterSmartrrRowsForCurrentPeriod(rows, opt) {
@@ -614,90 +621,19 @@ function renderIbar(opt, cmpLbl) {
 /* ══════════════════════════════════════════════════════
    SHEETS FETCH (5-min cache)
 ══════════════════════════════════════════════════════ */
-const __tabInflight = {};
-const __tabError = {};
-function __tabCacheKey(sid, tab) { return `dashboard_tab_cache__${sid}__${tab}`; }
-function __rowsToObjects(values) {
-  const rows = values || [];
-  if (rows.length < 2) return [];
-  const h = rows[0];
-  return rows.slice(1).map(row => Object.fromEntries(h.map((hh,i)=>[hh,row[i]||""])));
-}
-function __saveTabLocal(sid, tab, rows) {
-  try { localStorage.setItem(__tabCacheKey(sid, tab), JSON.stringify({ts: Date.now(), rows})); } catch(e) {}
-}
-function __loadTabLocal(sid, tab, maxAgeMs = 60 * 60 * 1000) {
-  try {
-    const raw = localStorage.getItem(__tabCacheKey(sid, tab));
-    if (!raw) return null;
-    const d = JSON.parse(raw);
-    if (!d || !Array.isArray(d.rows)) return null;
-    if (Date.now() - (d.ts || 0) > maxAgeMs) return null;
-    return d.rows;
-  } catch(e) { return null; }
-}
-async function __sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-async function fetchTabsBatch(sid, tabs) {
-  const uniqueTabs = [...new Set((tabs || []).filter(Boolean))];
-  const out = Object.fromEntries(uniqueTabs.map(t => [t, cache[`${sid}__${t}`] || __loadTabLocal(sid, t) || []]));
-  const need = uniqueTabs.filter(t => !cache[`${sid}__${t}`]);
-  if (!need.length) return out;
-
-  const batchKey = `${sid}__batch__${need.join('|')}`;
-  if (__tabInflight[batchKey]) return __tabInflight[batchKey];
-
-  __tabInflight[batchKey] = (async () => {
-    const ranges = need.map(t => `ranges=${encodeURIComponent(t)}`).join('&');
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}`;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 25000);
-      try {
-        const r = await fetch(url, { signal: controller.signal });
-        clearTimeout(timer);
-        if (r.status === 429) {
-          console.warn(`Sheets API 429; retry ${attempt + 1}/3`);
-          await __sleep(1200 * (attempt + 1));
-          continue;
-        }
-        if (!r.ok) {
-          console.warn(`Sheets batch HTTP ${r.status}`);
-          break;
-        }
-        const d = await r.json();
-        const valueRanges = d.valueRanges || [];
-        need.forEach((tab, i) => {
-          const res = __rowsToObjects((valueRanges[i] || {}).values || []);
-          cache[`${sid}__${tab}`] = res;
-          __saveTabLocal(sid, tab, res);
-          out[tab] = res;
-        });
-        return out;
-      } catch(e) {
-        clearTimeout(timer);
-        console.warn('Sheets batch fetch failed', e);
-        await __sleep(800 * (attempt + 1));
-      }
-    }
-    need.forEach(tab => {
-      __tabError[`${sid}__${tab}`] = 'Sheets API limit or network error';
-      out[tab] = cache[`${sid}__${tab}`] || __loadTabLocal(sid, tab, 24 * 60 * 60 * 1000) || [];
-    });
-    return out;
-  })();
-
-  try { return await __tabInflight[batchKey]; }
-  finally { delete __tabInflight[batchKey]; }
-}
-
 async function fetchTab(sid, tab) {
   const k = `${sid}__${tab}`;
   if (cache[k]) return cache[k];
-  const local = __loadTabLocal(sid, tab);
-  if (local) { cache[k] = local; return local; }
-  const result = await fetchTabsBatch(sid, [tab]);
-  return result[tab] || [];
+  try {
+    const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/${encodeURIComponent(tab)}?key=${AKEY}`);
+    if (!r.ok) { console.warn(`Tab ${tab} HTTP ${r.status}`); return []; }
+    const d = await r.json(), rows = d.values||[];
+    if (rows.length < 2) return [];
+    const h = rows[0], res = rows.slice(1).map(row => Object.fromEntries(h.map((hh,i)=>[hh,row[i]||""])));
+    cache[k] = res;
+    setTimeout(()=>delete cache[k], 5*60*1000);
+    return res;
+  } catch(e) { console.error(e); return []; }
 }
 
 function bestRow(arr) {
@@ -1311,13 +1247,13 @@ async function render() {
   if (ovLbl) ovLbl.textContent = `Loading ${brand==="corro"?"Corro":"Cavali"}...`;
   if (ovEl) ovEl.classList.add("show");
 
-  try { /* render-v14-try-start */
   const sid = SIDS[brand];
-  const tabData = await fetchTabsBatch(sid, ["kpis_daily", "revenue_share", "new_vs_returning", "ad_spend"]);
-  const kpiR = tabData.kpis_daily || [];
-  const rsR  = tabData.revenue_share || [];
-  const nvrR = tabData.new_vs_returning || [];
-  const adR  = tabData.ad_spend || [];
+  const [kpiR, rsR, nvrR, adR] = await Promise.all([
+    fetchTab(sid, "kpis_daily"),
+    fetchTab(sid, "revenue_share"),
+    fetchTab(sid, "new_vs_returning"),
+    fetchTab(sid, "ad_spend"),
+  ]);
 
   const row              = findRow(kpiR, opt);
   const { row:cmpRow, lbl:cmpLbl } = findCmp(kpiR, opt);
@@ -1533,13 +1469,7 @@ async function render() {
     safeSet("sb-upd", upd.slice(0,10)||"Today");
   }
 
-  } catch(e) {
-    console.error("Dashboard render failed", e);
-    const msg = e && e.message ? e.message : String(e);
-    safeHTML("ibar", `<span style="color:var(--am)">Dashboard render error:</span> ${msg}`);
-  } finally {
-    if (ovEl) ovEl.classList.remove("show");
-  }
+  if (ovEl) ovEl.classList.remove("show");
 }
 
 /* ══════════════════════════════════════════════════════
@@ -1556,13 +1486,13 @@ function setBrand(b) {
   brand = b;
   document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
   safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  _smartrrRowsCache = null; _smartrrRowsTs = 0; render();
+  cache = {}; _smartrrRowsCache = null; _smartrrRowsTs = 0; render();
 }
 function setPT(p, el) {
   ptype = p;
   document.querySelectorAll(".period-btn").forEach(x=>x.classList.remove("on"));
   if (el) el.classList.add("on");
-  render();
+  cache = {}; render();
 }
 function toggleTheme() {
   const h=document.documentElement, dk=h.getAttribute("data-theme")==="dark";
@@ -1571,7 +1501,7 @@ function toggleTheme() {
   if (btn) btn.textContent = dk?"☀":"☾";
 }
 
-setInterval(()=>{ render(); }, 15*60*1000);
+setInterval(()=>{ cache={}; render(); }, 5*60*1000);
 renderSelbar();
 render();
 </script>
