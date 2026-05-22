@@ -678,17 +678,13 @@ def get_periods():
 SMARTRR_PRODUCT_VOLUME_HEADERS = [
     "updated_at", "brand", "period", "period_start", "period_end",
     "product_variant", "sku",
-    # Period count: new subscribers created inside the selected Week/MTD/Month/Quarter.
-    "total_quantity", "new_subscribers",
-    # Snapshot counts up to the selected period_end. total = active + paused.
-    "total_subscribers_to_date", "active_subscribers_to_date", "paused_subscribers_to_date", "paused_subscribers_in_period",
+    # selected-period metrics
+    "total_quantity", "new_subscribers", "paused_subscribers_period",
+    # current Smartrr totals, NOT filtered by selected month/week/quarter
+    "total_subscribers_current", "active_subscribers_current", "paused_subscribers_current",
+    # backward-compatible aliases used by older dashboards
+    "total_subscribers_to_date", "active_subscribers_to_date", "paused_subscribers_to_date",
     "gross_revenue", "source", "date_basis", "active_filter", "sample_line_ids",
-]
-
-SMARTRR_DELIVERY_DUE_HEADERS = [
-    "updated_at", "brand", "period", "period_start", "period_end",
-    "product_bucket", "clients_to_receive", "sample_subscription_ids",
-    "source", "date_basis",
 ]
 
 
@@ -813,7 +809,7 @@ def _smartrr_status(subscription):
 
 
 def _smartrr_status_group(subscription):
-    """Return active / paused / inactive from Smartrr payload + requested endpoint hint."""
+    """Return active / paused / inactive for Smartrr purchase states."""
     status = _smartrr_status(subscription)
     hint = str(subscription.get("_smartrr_status_hint", "") if isinstance(subscription, dict) else "").strip().lower()
     if not status and hint:
@@ -831,15 +827,23 @@ def _smartrr_status_group(subscription):
         _dig(subscription, "pauseStartedAt") or _dig(subscription, "pause_started_at") or
         _dig(subscription, "pausedUntil") or _dig(subscription, "paused_until")
     )
-    if paused_marker or status in ("paused", "pause", "pausing", "suspended") or hint in ("paused", "pause"):
+    if paused_marker or status in ("paused", "pause", "pausing", "suspended"):
         return "paused"
 
-    if status in ("", "active", "activated") or hint in ("active", "activated"):
+    if status in ("", "active", "activated"):
         return "active"
+
+    # Some Smartrr payloads omit status fields even when the endpoint is filtered.
+    if hint in ("active", "activated"):
+        return "active"
+    if hint in ("paused", "pause"):
+        return "paused"
+
     return "inactive"
 
 
 def _smartrr_is_active(subscription):
+    """Backward-compatible helper used by older diagnostics."""
     return _smartrr_status_group(subscription) == "active"
 
 
@@ -1025,70 +1029,84 @@ def fetch_smartrr_active_purchase_states(brand_name):
         return []
 
     base_url = "https://api.smartrr.com/vendor/purchase-state"
-    states, seen = [], set()
+    states = []
+    seen = set()
     page_size = 250
 
+    # User requirement: keep new subscribers for the selected period, but also show
+    # current ACTIVE and PAUSED subscriber totals per product up to the selected end date.
     for requested_status in ("ACTIVE", "PAUSED"):
         page_number = 0
-        fetched_for_status = 0
         total_hint = None
+        fetched_for_status = 0
+
         while page_number < 200:
             params = {
                 "pageSize": page_size,
                 "pageNumber": page_number,
                 "filterEquals[purchaseStateStatus]": requested_status,
-                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders,sellingPlan",
+                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders",
             }
             r = _smartrr_get(base_url, key, params=params)
             if r.status_code >= 400:
                 print(f"    ⚠ smartrr {requested_status} HTTP {r.status_code}: {(r.text or '')[:350]}")
                 break
+
             payload = r.json()
             items = _smartrr_items(payload)
             total_hint = _smartrr_total_hint(payload)
             if not items:
                 break
+
             for sub in items:
                 if isinstance(sub, dict):
                     sub = dict(sub)
                     sub["_smartrr_status_hint"] = requested_status.lower()
+
                 if not _smartrr_is_active_or_paused(sub):
                     continue
+
                 sid = str(
                     _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or
                     _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
-                    _dig(sub, "shopifyIdNumber") or json.dumps(sub, sort_keys=True)[:220]
+                    json.dumps(sub, sort_keys=True)[:200]
                 )
                 if sid in seen:
                     continue
                 seen.add(sid)
                 states.append(sub)
                 fetched_for_status += 1
+
             if len(items) < page_size:
                 break
             if total_hint is not None and (page_number + 1) * page_size >= total_hint:
                 break
             page_number += 1
+
         print(f"    smartrr {requested_status.lower()} purchase states fetched: {fetched_for_status}")
 
-    active_count = sum(1 for x in states if _smartrr_status_group(x) == "active")
-    paused_count = sum(1 for x in states if _smartrr_status_group(x) == "paused")
+    active_count = sum(1 for s in states if _smartrr_status_group(s) == "active")
+    paused_count = sum(1 for s in states if _smartrr_status_group(s) == "paused")
     print(f"    smartrr active+paused purchase states fetched: active={active_count} paused={paused_count} total={len(states)}")
     return states
 
 
-
-def _smartrr_product_bucket(text):
-    """Dashboard product grouping: only the requested product buckets are allowed."""
-    t = str(text or "").lower()
-    if "premier" in t:
-        return "The Premier Box"
-    if "signature" in t:
-        return "The Signature Box"
-    return "Other"
-
 def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs):
-    """Rows for product cards: new in period + total/active/paused to selected end date."""
+    """
+    Build Smartrr rows for dashboard section 06.
+
+    For every selected period/product row:
+      - total_quantity / new_subscribers = active+paused line-items created inside that selected period.
+      - active_subscribers_to_date = ACTIVE line-items for that product created from the beginning
+        through the selected period end date.
+      - paused_subscribers_to_date = PAUSED line-items for that product created from the beginning
+        through the selected period end date.
+
+    This lets the dashboard show, per product:
+      - New Subscribers in the selected filter.
+      - Active Subscribers total up to the filter end date.
+      - Paused Subscribers total up to the filter end date.
+    """
     if brand_name != "cavali" or not active_states:
         return []
 
@@ -1099,12 +1117,15 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
         except Exception:
             pass
 
-    line_items, seen_lines = [], set()
+    line_items = []
     skipped_no_created = 0
+    seen_lines = set()
+
     for sub in active_states:
         state_group = _smartrr_status_group(sub)
         if state_group not in ("active", "paused"):
             continue
+
         for line in _candidate_line_dicts(sub):
             if _line_deleted(line):
                 continue
@@ -1112,8 +1133,8 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             if not created:
                 skipped_no_created += 1
                 continue
-            prod = _smartrr_product_bucket(_line_product(line))
-            sku = "bucket"
+            prod = _line_product(line)
+            sku = _line_sku(line)
             qty = _line_quantity(line)
             gross = _line_revenue(line, qty)
             lid = _line_id(line) or f"{state_group}|{prod}|{sku}|{created}|{qty}|{gross}"
@@ -1122,44 +1143,65 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
                 continue
             seen_lines.add(dedupe)
             line_items.append({
-                "created": created, "product": prod, "sku": sku, "qty": qty,
-                "gross": gross, "id": str(lid)[:80], "status": state_group,
+                "created": created,
+                "product": prod,
+                "sku": sku,
+                "qty": qty,
+                "gross": gross,
+                "id": str(lid)[:80],
+                "status": state_group,
             })
 
     rows = []
     for pk, ps, pe, ds, de in period_ranges:
-        active_buckets, paused_buckets, new_buckets = {}, {}, {}
+        active_buckets = {}
+        paused_buckets = {}
+        new_buckets = {}
+
         for item in line_items:
             key = (item["product"], item["sku"])
+
             if item["created"] <= de:
                 if item["status"] == "active":
                     rec = active_buckets.setdefault(key, {"active": 0, "ids": []})
                     rec["active"] += item["qty"]
-                    if len(rec["ids"]) < 5: rec["ids"].append(item["id"])
+                    if len(rec["ids"]) < 5:
+                        rec["ids"].append(item["id"])
                 elif item["status"] == "paused":
                     rec = paused_buckets.setdefault(key, {"paused": 0, "ids": []})
                     rec["paused"] += item["qty"]
-                    if len(rec["ids"]) < 5: rec["ids"].append(item["id"])
-            # New subscribers are based on subscription line-item created date inside selected period.
+                    if len(rec["ids"]) < 5:
+                        rec["ids"].append(item["id"])
+
             if ds <= item["created"] <= de:
                 rec = new_buckets.setdefault(key, {"new": 0, "gross": 0.0, "ids": []})
                 rec["new"] += item["qty"]
                 rec["gross"] += item["gross"]
-                if len(rec["ids"]) < 5: rec["ids"].append(item["id"])
+                if len(rec["ids"]) < 5:
+                    rec["ids"].append(item["id"])
 
-        all_keys = set(active_buckets) | set(paused_buckets) | set(new_buckets)
-        for prod, sku in sorted(all_keys, key=lambda k: (-(active_buckets.get(k, {}).get("active", 0)+paused_buckets.get(k, {}).get("paused", 0)), k[0].lower())):
+        # Include every active/paused product with total_to_date > 0, even if new_subscribers is 0 in this period.
+        all_keys = set(active_buckets.keys()) | set(paused_buckets.keys()) | set(new_buckets.keys())
+        for prod, sku in sorted(
+            all_keys,
+            key=lambda k: (-(active_buckets.get(k, {}).get("active", 0) + paused_buckets.get(k, {}).get("paused", 0)), k[0].lower()),
+        ):
             active_to_date = active_buckets.get((prod, sku), {}).get("active", 0)
             paused_to_date = paused_buckets.get((prod, sku), {}).get("paused", 0)
-            total_to_date = active_to_date + paused_to_date
             new_count = new_buckets.get((prod, sku), {}).get("new", 0)
             gross = new_buckets.get((prod, sku), {}).get("gross", 0.0)
-            ids = (new_buckets.get((prod, sku), {}).get("ids") or active_buckets.get((prod, sku), {}).get("ids") or paused_buckets.get((prod, sku), {}).get("ids") or [])
-            if total_to_date <= 0 and new_count <= 0:
+            ids = (
+                new_buckets.get((prod, sku), {}).get("ids") or
+                active_buckets.get((prod, sku), {}).get("ids") or
+                paused_buckets.get((prod, sku), {}).get("ids") or []
+            )
+            if active_to_date <= 0 and paused_to_date <= 0 and new_count <= 0:
                 continue
             rows.append([
-                now_str, brand_name, pk, ps, pe, prod, sku,
-                new_count, new_count, total_to_date, active_to_date, paused_to_date,
+                now_str, brand_name, pk, ps, pe,
+                prod, sku,
+                new_count, new_count,
+                active_to_date, paused_to_date,
                 round(gross, 2),
                 "Smartrr purchase-state ACTIVE+PAUSED line items",
                 "Order Line Item Created Date",
@@ -1168,9 +1210,16 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             ])
 
     print(f"    smartrr_product_volume: line_items={len(line_items)} rows={len(rows)} skipped_no_created_date={skipped_no_created}")
-    for r in [x for x in rows if x[2] in ("2026-04", "mtd_2026-05")][:8]:
-        print(f"      smartrr product test: {r[5]} · new={r[8]} · total={r[9]} · active={r[10]} · paused={r[11]} · period={r[2]}")
+    tests = [r for r in rows if r[2] in ("2026-04", "mtd_2026-05")][:10]
+    for r in tests[:8]:
+        print(
+            f"      smartrr product test: {r[5]} · sku={r[6]} · "
+            f"new={r[8]} · active_to_date={r[9]} · paused_to_date={r[10]} · gross={r[11]} · period={r[2]}"
+        )
     return rows
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1211,17 +1260,25 @@ def _shopify_line_revenue(li):
 
 
 def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start, end, orders):
-    """Fallback only for NEW subscribers from Shopify order line_items. It does NOT invent totals."""
+    """
+    Safety fallback for Cavali section 06.
+
+    Smartrr active purchase-state sometimes does not expose usable nested order-line created dates.
+    When that happens, we still write the period rows from Shopify order line_items so the dashboard
+    does NOT go blank. The dashboard uses these as New Subscribers for the selected period and can
+    accumulate existing historical rows for Total Subscribers per product.
+    """
     if brand_name != "cavali":
         return []
+
     buckets = {}
     for o in orders or []:
         for li in (o.get("line_items") or []):
             qty = int(_to_number(li.get("quantity"), 0) or 0)
             if qty <= 0:
                 continue
-            product = _smartrr_product_bucket(_shopify_line_product(li))
-            sku = "bucket"
+            product = _shopify_line_product(li)
+            sku = _shopify_line_sku(li)
             key = (product, sku)
             rec = buckets.setdefault(key, {"qty": 0, "gross": 0.0, "ids": []})
             rec["qty"] += qty
@@ -1232,18 +1289,27 @@ def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start,
 
     rows = []
     for (product, sku), v in sorted(buckets.items(), key=lambda kv: (-kv[1]["qty"], kv[0][0].lower())):
+        # Fallback cannot know the real lifetime ACTIVE total from Smartrr for this product.
+        # To avoid blank cards, use the period new count as the minimum total-to-date.
+        # If Smartrr active rows match later, merge_smartrr_product_volume_rows replaces it.
         rows.append([
-            now_str, brand_name, period, str(start), str(end), product, sku,
-            int(v["qty"]), int(v["qty"]), "", "", "",
+            now_str, brand_name, period, str(start), str(end),
+            product, sku,
+            int(v["qty"]), int(v["qty"]),
+            int(v["qty"]), 0,
             round(v["gross"], 2),
-            "Shopify order line_items fallback for period NEW subscribers only",
+            "Shopify order line_items fallback for Smartrr product volume",
             "Shopify order processed date fallback",
-            "Totals intentionally blank unless Smartrr active/paused rows match",
+            "Fallback minimum total: active/paused Smartrr product total unavailable",
             "; ".join(v["ids"]),
         ])
+
     if rows:
-        print(f"    smartrr_product_volume fallback new-only rows from Shopify orders for {period}: {len(rows)}")
+        print(f"    smartrr_product_volume fallback rows from Shopify orders for {period}: {len(rows)}")
+        for r in rows[:6]:
+            print(f"      fallback product row: {r[5]} · sku={r[6]} · new={r[8]} · active_min={r[9]} · paused={r[10]} · gross={r[11]}")
     return rows
+
 
 
 def _product_match_key(product):
@@ -1260,65 +1326,403 @@ def _is_blank_number(v):
 
 
 def merge_smartrr_product_volume_rows(order_rows, active_rows):
-    """Merge period-new rows with Smartrr real total/active/paused rows. Never copy new into totals."""
+    """
+    Prefer period rows from Shopify orders for New Subscribers, because this matches
+    the selected Week / MTD / Month / Quarter range. Enrich with Smartrr ACTIVE and
+    PAUSED totals-to-date when Smartrr exposes usable product line data.
+
+    Key detail: match by normalized product name first, not only exact product+SKU,
+    because Smartrr and Shopify can label the same item differently.
+    """
     order_rows = order_rows or []
     active_rows = active_rows or []
-    IDX_PERIOD, IDX_PRODUCT, IDX_SKU = 2, 5, 6
-    IDX_NEW, IDX_TOTAL, IDX_ACTIVE, IDX_PAUSED = 8, 9, 10, 11
-    IDX_SOURCE, IDX_DATE_BASIS, IDX_FILTER, IDX_SAMPLE = 13, 14, 15, 16
 
-    active_exact, active_product = {}, {}
+    # Column indexes for SMARTRR_PRODUCT_VOLUME_HEADERS
+    IDX_PERIOD = 2
+    IDX_PRODUCT = 5
+    IDX_SKU = 6
+    IDX_TOTAL_QTY = 7
+    IDX_NEW = 8
+    IDX_ACTIVE = 9
+    IDX_PAUSED = 10
+    IDX_GROSS = 11
+    IDX_SOURCE = 12
+    IDX_DATE_BASIS = 13
+    IDX_FILTER = 14
+    IDX_SAMPLE = 15
+
+    active_exact = {}
+    active_product = {}
     for r in active_rows:
         try:
-            while len(r) < len(SMARTRR_PRODUCT_VOLUME_HEADERS): r.append("")
             exact_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
             active_exact[exact_key] = r
             loose_key = (str(r[IDX_PERIOD]), _product_match_key(r[IDX_PRODUCT]))
+            # Keep the row with the largest active+paused total for the product.
             prev = active_product.get(loose_key)
-            r_total = _to_number(r[IDX_TOTAL], 0)
-            p_total = _to_number(prev[IDX_TOTAL], 0) if prev else -1
+            r_total = _to_number(r[IDX_ACTIVE], 0) + _to_number(r[IDX_PAUSED], 0)
+            p_total = (_to_number(prev[IDX_ACTIVE], 0) + _to_number(prev[IDX_PAUSED], 0)) if prev else -1
             if not prev or r_total > p_total:
                 active_product[loose_key] = r
         except Exception:
             pass
 
-    merged, used_active = [], set()
+    merged = []
+    used_active = set()
+
     for r in order_rows:
         try:
-            row = list(r)
-            while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS): row.append("")
-            key = (str(row[IDX_PERIOD]), str(row[IDX_PRODUCT]), str(row[IDX_SKU]))
-            loose_key = (str(row[IDX_PERIOD]), _product_match_key(row[IDX_PRODUCT]))
+            key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
+            loose_key = (str(r[IDX_PERIOD]), _product_match_key(r[IDX_PRODUCT]))
             a = active_exact.get(key) or active_product.get(loose_key)
+            row = list(r)
+            while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+                row.append("")
+
             if a:
                 used_active.add((str(a[IDX_PERIOD]), str(a[IDX_PRODUCT]), str(a[IDX_SKU])))
-                for idx in (IDX_TOTAL, IDX_ACTIVE, IDX_PAUSED):
-                    if len(a) > idx and not _is_blank_number(a[idx]):
-                        row[idx] = a[idx]
-                for idx in (IDX_FILTER, IDX_SAMPLE):
-                    if len(a) > idx and a[idx] not in (None, ""):
-                        row[idx] = a[idx]
-                row[IDX_SOURCE] = "Smartrr totals + period new subscribers"
+                # Keep exact period new/gross from Shopify/Smartrr period rows,
+                # but use ACTIVE and PAUSED total-to-date from Smartrr when available.
+                if len(a) > IDX_ACTIVE and not _is_blank_number(a[IDX_ACTIVE]):
+                    row[IDX_ACTIVE] = a[IDX_ACTIVE]
+                if len(a) > IDX_PAUSED and not _is_blank_number(a[IDX_PAUSED]):
+                    row[IDX_PAUSED] = a[IDX_PAUSED]
+                if len(a) > IDX_FILTER and a[IDX_FILTER] not in (None, ""):
+                    row[IDX_FILTER] = a[IDX_FILTER]
+                if len(a) > IDX_SAMPLE and a[IDX_SAMPLE] not in (None, ""):
+                    row[IDX_SAMPLE] = a[IDX_SAMPLE]
+                row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED totals + period product rows"
                 row[IDX_DATE_BASIS] = "Order Line Item Created Date / Shopify processed date fallback"
+
+            # Never leave active/paused totals blank.
+            if len(row) > IDX_ACTIVE and _is_blank_number(row[IDX_ACTIVE]):
+                row[IDX_ACTIVE] = row[IDX_NEW] if len(row) > IDX_NEW and not _is_blank_number(row[IDX_NEW]) else row[IDX_TOTAL_QTY]
+            if len(row) > IDX_PAUSED and _is_blank_number(row[IDX_PAUSED]):
+                row[IDX_PAUSED] = 0
             merged.append(row)
         except Exception:
             merged.append(r)
 
+    # Add active/paused products with 0 new subscribers in this period, so every subscribed product can still show.
     for r in active_rows:
         try:
-            row = list(r)
-            while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS): row.append("")
-            active_key = (str(row[IDX_PERIOD]), str(row[IDX_PRODUCT]), str(row[IDX_SKU]))
+            active_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
             if active_key not in used_active:
-                if _is_blank_number(row[IDX_NEW]): row[IDX_NEW] = 0
-                if _is_blank_number(row[7]): row[7] = row[IDX_NEW]
+                row = list(r)
+                while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+                    row.append("")
+                if _is_blank_number(row[IDX_NEW]):
+                    row[IDX_NEW] = 0
+                if _is_blank_number(row[IDX_TOTAL_QTY]):
+                    row[IDX_TOTAL_QTY] = row[IDX_NEW]
+                if _is_blank_number(row[IDX_ACTIVE]):
+                    row[IDX_ACTIVE] = row[IDX_NEW] if not _is_blank_number(row[IDX_NEW]) else 0
+                if _is_blank_number(row[IDX_PAUSED]):
+                    row[IDX_PAUSED] = 0
                 merged.append(row)
         except Exception:
             merged.append(r)
 
-    print(f"    smartrr_product_volume merge: {len(order_rows)} period-new rows + {len(active_rows)} smartrr total rows => {len(merged)} rows")
+    if active_rows:
+        print(f"    smartrr_product_volume merge: {len(order_rows)} order rows + {len(active_rows)} active/paused rows => {len(merged)} rows")
+    else:
+        print(f"    smartrr_product_volume merge: active/paused rows unavailable; using {len(order_rows)} order fallback rows")
     return merged
 
+
+
+# ─────────────────────────────────────────────────────────────────
+# SMARTRR v14 — Product buckets, global current totals, period new/paused
+# ─────────────────────────────────────────────────────────────────
+SMARTRR_PRODUCT_BUCKETS = ("The Premier Box", "The Signature Box", "Other")
+
+
+def _bucket_product_name(*values):
+    """Only the three dashboard product buckets are allowed. Never return customer names."""
+    txt = " ".join(str(v or "") for v in values).lower()
+    txt = re.sub(r"\s+", " ", txt)
+    if "premier" in txt:
+        return "The Premier Box"
+    if "signature" in txt:
+        return "The Signature Box"
+    return "Other"
+
+
+def _subscription_text_blob(sub):
+    """Collect likely product/plan text from a Smartrr purchase-state object without using email/first/last name."""
+    vals = []
+    direct_paths = [
+        "product", "productName", "product_name", "productTitle", "product_title",
+        "variant", "variantName", "variant_name", "variantTitle", "variant_title",
+        "purchasable", "purchasableName", "purchasable_name",
+        "purchasableAndPurchasableVariantName", "purchasable_and_purchasable_variant_name",
+        "sellingPlanName", "selling_plan_name", "subscriptionProgram", "subscription_program",
+        "plan", "planName", "plan_name", "lineItemName", "line_item_name", "title", "name",
+    ]
+    for path in direct_paths:
+        v = _dig(sub, path)
+        if v not in (None, "", "ø"):
+            vals.append(v)
+    vals.extend(_deep_values_for_keys(sub, [
+        "product", "productName", "product_name", "productTitle", "product_title",
+        "variant", "variantName", "variant_name", "variantTitle", "variant_title",
+        "purchasableAndPurchasableVariantName", "purchasable_and_purchasable_variant_name",
+        "sellingPlanName", "selling_plan_name", "subscriptionProgram", "subscription_program",
+        "planName", "plan_name", "lineItemName", "line_item_name", "title", "name",
+    ], limit=60))
+    return " ".join(str(v) for v in vals if v not in (None, "", "ø"))
+
+
+def _subscription_bucket(sub):
+    return _bucket_product_name(_subscription_text_blob(sub))
+
+
+def _subscription_created_date(sub):
+    val = (
+        _dig(sub, "subscriptionCreatedDate") or _dig(sub, "subscription_created_date") or
+        _dig(sub, "createdDate") or _dig(sub, "created_date") or
+        _dig(sub, "createdAt") or _dig(sub, "created_at") or
+        _dig(sub, "initialSubscriptionDate") or _dig(sub, "initial_subscription_date") or
+        _first_deep(sub, [
+            "subscriptionCreatedDate", "subscription_created_date", "createdDate", "created_date",
+            "createdAt", "created_at", "initialSubscriptionDate", "initial_subscription_date",
+        ])
+    )
+    return _parse_smartrr_date(val)
+
+
+def _subscription_paused_date(sub):
+    val = (
+        _dig(sub, "pausedAt") or _dig(sub, "paused_at") or
+        _dig(sub, "pauseStartedAt") or _dig(sub, "pause_started_at") or
+        _dig(sub, "pausedDate") or _dig(sub, "paused_date") or
+        _first_deep(sub, ["pausedAt", "paused_at", "pauseStartedAt", "pause_started_at", "pausedDate", "paused_date"])
+    )
+    return _parse_smartrr_date(val)
+
+
+def _subscription_next_billing_date(sub):
+    val = (
+        _dig(sub, "nextBillingDate") or _dig(sub, "next_billing_date") or
+        _dig(sub, "nextOrderDate") or _dig(sub, "next_order_date") or
+        _dig(sub, "nextChargeScheduledAt") or _dig(sub, "next_charge_scheduled_at") or
+        _first_deep(sub, [
+            "nextBillingDate", "next_billing_date", "nextOrderDate", "next_order_date",
+            "nextChargeScheduledAt", "next_charge_scheduled_at",
+        ])
+    )
+    return _parse_smartrr_date(val)
+
+
+def fetch_smartrr_active_purchase_states(brand_name):
+    """Fetch Smartrr purchase states for current totals and period metrics."""
+    key = SMARTRR_API_KEYS.get(brand_name, "")
+    if brand_name != "cavali" or not key:
+        if brand_name == "cavali":
+            print("    ⚠ smartrr: SMARTRR_API_KEY_CAVALI missing")
+        return []
+
+    base_url = "https://api.smartrr.com/vendor/purchase-state"
+    states, seen = [], set()
+    page_size = 250
+
+    # ACTIVE/PAUSED are required for current totals.
+    # CANCELLED/CANCELED is only used when available to improve period-created history; failures are ignored.
+    for requested_status in ("ACTIVE", "PAUSED", "CANCELLED", "CANCELED"):
+        page_number = 0
+        fetched_for_status = 0
+        while page_number < 200:
+            params = {
+                "pageSize": page_size,
+                "pageNumber": page_number,
+                "filterEquals[purchaseStateStatus]": requested_status,
+                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders,customer,subscriptionProgram,sellingPlan",
+            }
+            r = _smartrr_get(base_url, key, params=params)
+            if r.status_code >= 400:
+                print(f"    ⚠ smartrr {requested_status} HTTP {r.status_code}: {(r.text or '')[:220]}")
+                break
+            payload = r.json()
+            items = _smartrr_items(payload)
+            total_hint = _smartrr_total_hint(payload)
+            if not items:
+                break
+            for sub in items:
+                if isinstance(sub, dict):
+                    sub = dict(sub)
+                    sub["_smartrr_status_hint"] = requested_status.lower()
+                sid = str(
+                    _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or
+                    _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
+                    json.dumps(sub, sort_keys=True)[:220]
+                )
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                states.append(sub)
+                fetched_for_status += 1
+            if len(items) < page_size:
+                break
+            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
+                break
+            page_number += 1
+        print(f"    smartrr {requested_status.lower()} purchase states fetched: {fetched_for_status}")
+
+    active_count = sum(1 for st in states if _smartrr_status_group(st) == "active")
+    paused_count = sum(1 for st in states if _smartrr_status_group(st) == "paused")
+    print(f"    smartrr_product_volume v14 current totals fetched: active={active_count} paused={paused_count} total={active_count + paused_count}")
+    return states
+
+
+def _empty_bucket_dict():
+    return {b: 0 for b in SMARTRR_PRODUCT_BUCKETS}
+
+
+def build_smartrr_v14_product_volume_rows(now_str, brand_name, purchase_states, order_rows, period_defs):
+    """
+    Dashboard rows:
+      - new_subscribers: selected period, by product bucket.
+      - paused_subscribers_period: selected period, by product bucket.
+      - *_current fields: global current ACTIVE/PAUSED Smartrr totals, NOT filtered by month/week/quarter.
+    """
+    if brand_name != "cavali":
+        return []
+
+    current_active = _empty_bucket_dict()
+    current_paused = _empty_bucket_dict()
+    paused_events = []
+
+    for sub in purchase_states or []:
+        bucket = _subscription_bucket(sub)
+        status = _smartrr_status_group(sub)
+        if status == "active":
+            current_active[bucket] += 1
+        elif status == "paused":
+            current_paused[bucket] += 1
+            paused_events.append((bucket, _subscription_paused_date(sub) or _subscription_created_date(sub)))
+
+    print("    smartrr_product_volume v14 current bucket totals: " + ", ".join(
+        f"{b}=active:{current_active[b]} paused:{current_paused[b]}" for b in SMARTRR_PRODUCT_BUCKETS
+    ))
+
+    # Preserve selected-period New Subscribers from the Shopify/Smartrr period rows you said were OK.
+    # They are bucketed strictly to Premier / Signature / Other.
+    by_period_new = {}
+    by_period_gross = {}
+    for r in order_rows or []:
+        try:
+            pk = str(r[2]).strip()
+            bucket = _bucket_product_name(r[5] if len(r) > 5 else "")
+            by_period_new[(pk, bucket)] = by_period_new.get((pk, bucket), 0) + int(_to_number(r[8] if len(r) > 8 else 0, 0))
+            by_period_gross[(pk, bucket)] = by_period_gross.get((pk, bucket), 0.0) + float(_to_number(r[11] if len(r) > 11 else 0, 0))
+        except Exception:
+            pass
+
+    rows = []
+    for pk, ps, pe in period_defs:
+        try:
+            ds = datetime.strptime(str(ps), "%Y-%m-%d").date()
+            de = datetime.strptime(str(pe), "%Y-%m-%d").date()
+        except Exception:
+            ds = de = None
+
+        paused_period = _empty_bucket_dict()
+        if ds and de:
+            for bucket, paused_date in paused_events:
+                if paused_date and ds <= paused_date <= de:
+                    paused_period[bucket] += 1
+
+        for bucket in SMARTRR_PRODUCT_BUCKETS:
+            new_count = int(by_period_new.get((pk, bucket), 0))
+            gross = round(by_period_gross.get((pk, bucket), 0.0), 2)
+            active_current = int(current_active.get(bucket, 0))
+            paused_current = int(current_paused.get(bucket, 0))
+            total_current = active_current + paused_current
+            paused_in_period = int(paused_period.get(bucket, 0))
+            rows.append([
+                now_str, brand_name, pk, str(ps), str(pe),
+                bucket, "product_bucket",
+                new_count, new_count, paused_in_period,
+                total_current, active_current, paused_current,
+                total_current, active_current, paused_current,
+                gross,
+                "Smartrr v14 current totals + selected-period new/paused product buckets",
+                "New/Paused: selected period; Current totals: all ACTIVE/PAUSED states",
+                "Products bucketed as The Premier Box / The Signature Box / Other only",
+                "",
+            ])
+
+    print(f"    smartrr_product_volume v14: refreshed {len(rows)} product-bucket rows")
+    return rows
+
+
+SMARTRR_DELIVERY_DUE_HEADERS = [
+    "updated_at", "brand", "period", "period_start", "period_end",
+    "product_variant", "sku", "clients_due_to_receive", "source", "date_basis", "sample_subscription_ids",
+]
+
+
+def build_smartrr_delivery_due_rows(now_str, brand_name, purchase_states, period_defs):
+    """Clients who should receive product in the selected period based on Next Billing Date."""
+    if brand_name != "cavali":
+        return []
+    active_states = [s for s in (purchase_states or []) if _smartrr_status_group(s) == "active"]
+    rows = []
+    for pk, ps, pe in period_defs:
+        try:
+            ds = datetime.strptime(str(ps), "%Y-%m-%d").date()
+            de = datetime.strptime(str(pe), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        buckets = {b: {"count": 0, "ids": []} for b in SMARTRR_PRODUCT_BUCKETS}
+        for sub in active_states:
+            nb = _subscription_next_billing_date(sub)
+            if not nb or not (ds <= nb <= de):
+                continue
+            bucket = _subscription_bucket(sub)
+            sid = str(_dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or "")[:80]
+            buckets[bucket]["count"] += 1
+            if sid and len(buckets[bucket]["ids"]) < 5:
+                buckets[bucket]["ids"].append(sid)
+        for bucket in SMARTRR_PRODUCT_BUCKETS:
+            rows.append([
+                now_str, brand_name, pk, str(ps), str(pe),
+                bucket, "product_bucket", buckets[bucket]["count"],
+                "Smartrr ACTIVE purchase states", "Next Billing Date", "; ".join(buckets[bucket]["ids"]),
+            ])
+    print(f"    smartrr_delivery_due v14: refreshed {len(rows)} product-bucket rows")
+    return rows
+
+
+def write_smartrr_delivery_due(gc, sheet_id, rows, periods_to_replace):
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet("smartrr_delivery_due")
+    except Exception:
+        ws = sh.add_worksheet("smartrr_delivery_due", rows=1000, cols=len(SMARTRR_DELIVERY_DUE_HEADERS))
+
+    vals = ws.get_all_values()
+    keep = []
+    replace = {str(p).strip() for p in periods_to_replace if p}
+    if len(vals) >= 2:
+        h = vals[0]
+        for r in vals[1:]:
+            m = _row_to_map(h, r)
+            if str(m.get("period", "")).strip() not in replace:
+                keep.append(_map_to_row(SMARTRR_DELIVERY_DUE_HEADERS, m))
+
+    cleaned = []
+    for r in rows or []:
+        row = list(r)
+        while len(row) < len(SMARTRR_DELIVERY_DUE_HEADERS):
+            row.append("")
+        cleaned.append(row[:len(SMARTRR_DELIVERY_DUE_HEADERS)])
+    merged = keep + cleaned
+    ws.clear()
+    ws.append_row(SMARTRR_DELIVERY_DUE_HEADERS)
+    if merged:
+        ws.append_rows(merged, value_input_option="USER_ENTERED")
+    print(f"    smartrr_delivery_due: {len(cleaned)} refreshed rows; {len(merged)} total rows")
 
 def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
     """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
@@ -1329,7 +1733,8 @@ def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
         ws = sh.add_worksheet("smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
 
     vals = ws.get_all_values()
-    keep, replace = [], {str(p).strip() for p in periods_to_replace if p}
+    keep = []
+    replace = {str(p).strip() for p in periods_to_replace if p}
     if len(vals) >= 2:
         h = vals[0]
         for r in vals[1:]:
@@ -1340,114 +1745,31 @@ def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
     cleaned_rows = []
     for r in rows or []:
         row = list(r)
-        while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS): row.append("")
-        # Do NOT fill totals from new subscribers. Blank means Smartrr did not provide that total.
+        while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+            row.append("")
+        # v14 safeguard: never copy selected-period new subscribers into current totals.
+        for idx in range(9, min(len(row), 16)):
+            if _is_blank_number(row[idx]):
+                row[idx] = 0
         cleaned_rows.append(row[:len(SMARTRR_PRODUCT_VOLUME_HEADERS)])
 
     merged = keep + cleaned_rows
-    merged = sorted(merged, key=lambda r: (str(r[1]), _safe_date(r[3]), str(r[2]), -_to_number(r[9], 0), str(r[5]).lower()))
+    merged = sorted(
+        merged,
+        key=lambda r: (
+            str(r[1]),
+            _safe_date(r[3]),
+            str(r[2]),
+            -(_to_number(r[10], 0) + _to_number(r[12], 0)),
+            str(r[5]).lower(),
+        )
+    )
+
     ws.clear()
     ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
     if merged:
         ws.append_rows(merged, value_input_option="USER_ENTERED")
     print(f"    smartrr_product_volume: {len(cleaned_rows)} refreshed rows; {len(merged)} total rows")
-
-
-def _subscription_id(sub):
-    return str(_dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or json.dumps(sub, sort_keys=True)[:220])
-
-
-def _subscription_next_billing_date(sub):
-    val = (
-        _dig(sub, "nextBillingDate") or _dig(sub, "next_billing_date") or
-        _dig(sub, "nextBillingAt") or _dig(sub, "next_billing_at") or
-        _dig(sub, "nextBilling.date") or _dig(sub, "billing.nextDate") or
-        _first_deep(sub, ["nextBillingDate", "next_billing_date", "nextBillingAt", "next_billing_at", "nextBilling"])
-    )
-    return _parse_smartrr_date(val)
-
-
-def _subscription_product_text(sub):
-    """Extract product/program text only; never customer first/last/email names."""
-    product_keys = [
-        "product", "productTitle", "product_title", "productName", "product_name",
-        "purchasable_and_purchasable_variant_name", "purchasableAndPurchasableVariantName",
-        "productVariant", "productVariantName", "product_variant", "product_variant_name",
-        "sellingPlanName", "selling_plan_name", "subscriptionProgram", "subscription_program"
-    ]
-    vals = []
-    vals.extend(str(v) for v in _deep_values_for_keys(sub, product_keys, limit=30) if v)
-    # Also inspect candidate line product names, but bucket later; this avoids displaying raw names.
-    for line in _candidate_line_dicts(sub):
-        prod = _line_product(line)
-        if prod and prod != "Unknown Product":
-            vals.append(prod)
-    return " | ".join(vals)
-
-
-def _delivery_product_bucket(text):
-    return _smartrr_product_bucket(text)
-
-
-def build_smartrr_delivery_due_rows(now_str, brand_name, states, period_defs):
-    """Count active subscriptions whose Next Billing Date falls inside the selected period. Buckets: Premier, Signature, Other."""
-    if brand_name != "cavali" or not states:
-        return []
-    periods = []
-    for pk, s, e in period_defs:
-        try:
-            periods.append((pk, str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
-    rows = []
-    for pk, ps, pe, ds, de in periods:
-        buckets = {"The Premier Box": {"count": 0, "ids": []}, "The Signature Box": {"count": 0, "ids": []}, "Other": {"count": 0, "ids": []}}
-        seen = set()
-        for sub in states:
-            if _smartrr_status_group(sub) != "active":
-                continue
-            nb = _subscription_next_billing_date(sub)
-            if not nb or not (ds <= nb <= de):
-                continue
-            sid = _subscription_id(sub)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            bucket = _delivery_product_bucket(_subscription_product_text(sub))
-            buckets[bucket]["count"] += 1
-            if len(buckets[bucket]["ids"]) < 8:
-                buckets[bucket]["ids"].append(sid[:80])
-        for bucket in ("The Premier Box", "The Signature Box", "Other"):
-            rows.append([now_str, brand_name, pk, ps, pe, bucket, buckets[bucket]["count"], "; ".join(buckets[bucket]["ids"]), "Smartrr ACTIVE purchase-state", "Next Billing Date"])
-    print(f"    smartrr_delivery_due: {len(rows)} rows")
-    return rows
-
-
-def write_smartrr_delivery_due(gc, sheet_id, rows, periods_to_replace):
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet("smartrr_delivery_due")
-    except Exception:
-        ws = sh.add_worksheet("smartrr_delivery_due", rows=400, cols=len(SMARTRR_DELIVERY_DUE_HEADERS))
-    vals = ws.get_all_values()
-    keep, replace = [], {str(p).strip() for p in periods_to_replace if p}
-    if len(vals) >= 2:
-        h = vals[0]
-        for r in vals[1:]:
-            m = _row_to_map(h, r)
-            if str(m.get("period", "")).strip() not in replace:
-                keep.append(_map_to_row(SMARTRR_DELIVERY_DUE_HEADERS, m))
-    cleaned = []
-    for r in rows or []:
-        row = list(r)
-        while len(row) < len(SMARTRR_DELIVERY_DUE_HEADERS): row.append("")
-        cleaned.append(row[:len(SMARTRR_DELIVERY_DUE_HEADERS)])
-    merged = keep + cleaned
-    merged = sorted(merged, key=lambda r: (str(r[1]), _safe_date(r[3]), str(r[2]), str(r[5])))
-    ws.clear(); ws.append_row(SMARTRR_DELIVERY_DUE_HEADERS)
-    if merged:
-        ws.append_rows(merged, value_input_option="USER_ENTERED")
-    print(f"    smartrr_delivery_due: {len(cleaned)} refreshed rows; {len(merged)} total rows")
 
 
 # HELPERS SHEETS
@@ -1659,344 +1981,6 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED")
     print(f"    ad_spend: {len(ad_rows)} months")
 
-
-# ─────────────────────────────────────────────────────────────────
-# SMARTRR v11 OVERRIDES — subscription-level counts, not line-item totals
-# ─────────────────────────────────────────────────────────────────
-# Why this override exists:
-# - New subscribers must be counted from Smartrr subscription Created/Initial date.
-# - Total subscribers to date must be counted from current ACTIVE subscriptions, not May orders.
-# - Paused subscribers are counted separately from current PAUSED subscriptions.
-# - Product cards are restricted to: The Premier Box, The Signature Box, Other.
-# - Customer names/emails must never become product cards.
-
-SMARTRR_PRODUCT_BUCKETS = ("The Premier Box", "The Signature Box", "Other")
-
-
-def _smartrr_product_bucket(text):
-    """Only the requested dashboard product buckets are allowed."""
-    t = str(text or "").lower()
-    if "premier" in t:
-        return "The Premier Box"
-    if "signature" in t:
-        return "The Signature Box"
-    return "Other"
-
-
-def _subscription_created_date(sub):
-    """Subscription-level creation date. This is what Smartrr filters as new subscriptions."""
-    val = (
-        _dig(sub, "subscriptionCreatedDate") or _dig(sub, "subscription_created_date") or
-        _dig(sub, "initialSubscriptionDate") or _dig(sub, "initial_subscription_date") or
-        _dig(sub, "createdDate") or _dig(sub, "created_date") or
-        _dig(sub, "createdAt") or _dig(sub, "created_at") or
-        _dig(sub, "created") or
-        _first_deep(sub, [
-            "subscriptionCreatedDate", "subscription_created_date",
-            "initialSubscriptionDate", "initial_subscription_date",
-            "createdDate", "created_date", "createdAt", "created_at", "created",
-        ])
-    )
-    return _parse_smartrr_date(val)
-
-
-def _walk_product_text(obj, depth=0, out=None):
-    """
-    Collect product/selling-plan/program text without reading customer names.
-    Avoid generic firstName/lastName/email/name fields from customer objects.
-    """
-    if out is None:
-        out = []
-    if obj is None or depth > 8 or len(out) > 80:
-        return out
-    productish_keys = {
-        "product", "producttitle", "productname", "productvariant", "productvariantname",
-        "product_title", "product_name", "product_variant", "product_variant_name",
-        "purchasableandpurchasablevariantname", "purchasable_and_purchasable_variant_name",
-        "sellingplanname", "selling_plan_name", "subscriptionprogram", "subscription_program",
-        "programname", "program_name", "varianttitle", "variant_title",
-    }
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            nk = _norm_key(k)
-            # Product objects may contain a generic title/name. Customer/contact objects must not.
-            if nk in productish_keys:
-                if isinstance(v, (str, int, float)) and str(v).strip():
-                    out.append(str(v))
-                elif isinstance(v, dict):
-                    for subkey in ("title", "name", "productTitle", "productName", "variantTitle", "sku"):
-                        vv = v.get(subkey)
-                        if isinstance(vv, (str, int, float)) and str(vv).strip():
-                            out.append(str(vv))
-                    _walk_product_text(v, depth + 1, out)
-                elif isinstance(v, list):
-                    _walk_product_text(v, depth + 1, out)
-            elif isinstance(v, (dict, list)):
-                _walk_product_text(v, depth + 1, out)
-    elif isinstance(obj, list):
-        for v in obj[:100]:
-            _walk_product_text(v, depth + 1, out)
-    return out
-
-
-def _subscription_product_text(sub):
-    """Product text used only for bucketing; never displayed raw."""
-    vals = []
-    vals.extend(_walk_product_text(sub))
-    # Candidate line dicts are allowed only through product-specific fields, not generic title/name.
-    for line in _candidate_line_dicts(sub):
-        for path in (
-            "productTitle", "product_title", "productName", "product_name",
-            "productVariantName", "product_variant_name",
-            "purchasableAndPurchasableVariantName", "purchasable_and_purchasable_variant_name",
-            "variantTitle", "variant_title",
-        ):
-            v = _dig(line, path)
-            if v:
-                vals.append(str(v))
-    return " | ".join(v for v in vals if v)
-
-
-def fetch_smartrr_active_purchase_states(brand_name):
-    """
-    Fetch Smartrr purchase states.
-    ACTIVE and PAUSED are needed for current totals. CANCELLED/CANCELED are attempted only
-    so New Subscribers can include subscriptions created in-range but later cancelled.
-    Unsupported status filters are ignored safely.
-    """
-    key = SMARTRR_API_KEYS.get(brand_name, "")
-    if brand_name != "cavali" or not key:
-        if brand_name == "cavali":
-            print("    ⚠ smartrr: SMARTRR_API_KEY_CAVALI missing")
-        return []
-
-    base_url = "https://api.smartrr.com/vendor/purchase-state"
-    states, seen = [], set()
-    page_size = 250
-
-    for requested_status in ("ACTIVE", "PAUSED", "CANCELLED", "CANCELED"):
-        page_number = 0
-        fetched_for_status = 0
-        total_hint = None
-        while page_number < 200:
-            params = {
-                "pageSize": page_size,
-                "pageNumber": page_number,
-                "filterEquals[purchaseStateStatus]": requested_status,
-                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders,sellingPlan,subscriptionProgram",
-            }
-            r = _smartrr_get(base_url, key, params=params)
-            if r.status_code >= 400:
-                # Some stores/APIs may not accept CANCELLED vs CANCELED. Do not break the pipeline.
-                print(f"    ⚠ smartrr {requested_status} HTTP {r.status_code}: {(r.text or '')[:220]}")
-                break
-            payload = r.json()
-            items = _smartrr_items(payload)
-            total_hint = _smartrr_total_hint(payload)
-            if not items:
-                break
-            for sub in items:
-                if isinstance(sub, dict):
-                    sub = dict(sub)
-                    sub["_smartrr_status_hint"] = requested_status.lower()
-                sid = str(
-                    _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "purchase_state_id") or
-                    _dig(sub, "shopifyId") or _dig(sub, "shopify_id") or
-                    _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
-                    json.dumps(sub, sort_keys=True)[:240]
-                )
-                if sid in seen:
-                    continue
-                seen.add(sid)
-                states.append(sub)
-                fetched_for_status += 1
-            if len(items) < page_size:
-                break
-            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
-                break
-            page_number += 1
-        print(f"    smartrr {requested_status.lower()} purchase states fetched: {fetched_for_status}")
-
-    active_count = sum(1 for x in states if _smartrr_status_group(x) == "active")
-    paused_count = sum(1 for x in states if _smartrr_status_group(x) == "paused")
-    inactive_count = len(states) - active_count - paused_count
-    print(f"    smartrr purchase states fetched: active={active_count} paused={paused_count} inactive={inactive_count} total={len(states)}")
-    return states
-
-
-def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs):
-    """
-    Build product-volume rows from subscription-level Smartrr records.
-    - New Subscribers = subscriptions whose subscription created date is inside the selected filter.
-    - Total subscribers to date = current ACTIVE subscriptions created on/before period_end.
-    - Paused total = current PAUSED subscriptions created on/before period_end.
-    - Buckets are fixed: Premier, Signature, Other.
-    """
-    if brand_name != "cavali" or not active_states:
-        return []
-
-    period_ranges = []
-    for pk, s, e in period_defs:
-        try:
-            period_ranges.append((pk, str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
-
-    subs = []
-    seen = set()
-    missing_created = 0
-    for sub in active_states:
-        sid = _subscription_id(sub)
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        status_group = _smartrr_status_group(sub)
-        created = _subscription_created_date(sub)
-        if not created:
-            missing_created += 1
-        bucket = _smartrr_product_bucket(_subscription_product_text(sub))
-        subs.append({
-            "id": sid[:90],
-            "created": created,
-            "bucket": bucket,
-            "status": status_group,
-        })
-
-    rows = []
-    for pk, ps, pe, ds, de in period_ranges:
-        # Always keep the three rows stable.
-        b = {name: {"new": 0, "active": 0, "paused": 0, "new_ids": [], "total_ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-        for sub in subs:
-            bucket = sub["bucket"] if sub["bucket"] in b else "Other"
-            created = sub["created"]
-            status = sub["status"]
-
-            # New subscribers need a real subscription-level created date.
-            if created and ds <= created <= de:
-                b[bucket]["new"] += 1
-                if len(b[bucket]["new_ids"]) < 8:
-                    b[bucket]["new_ids"].append(sub["id"])
-
-            # Totals to date are current subscription-state snapshots. Missing created dates are included
-            # so current active totals do not collapse to the selected month only.
-            created_on_or_before_end = (created is None) or (created <= de)
-            if created_on_or_before_end and status == "active":
-                b[bucket]["active"] += 1
-                if len(b[bucket]["total_ids"]) < 8:
-                    b[bucket]["total_ids"].append(sub["id"])
-            elif created_on_or_before_end and status == "paused":
-                b[bucket]["paused"] += 1
-                if len(b[bucket]["total_ids"]) < 8:
-                    b[bucket]["total_ids"].append(sub["id"])
-
-        for bucket in SMARTRR_PRODUCT_BUCKETS:
-            rec = b[bucket]
-            active_to_date = rec["active"]
-            paused_to_date = rec["paused"]
-            # Per user request, this field represents active subscribers to date; paused is separate.
-            total_to_date = active_to_date
-            rows.append([
-                now_str, brand_name, pk, ps, pe, bucket, "bucket",
-                rec["new"], rec["new"], total_to_date, active_to_date, paused_to_date,
-                0,
-                "Smartrr subscription-level purchase states",
-                "Subscription Created Date for New; current ACTIVE/PAUSED snapshot for totals",
-                "Buckets: The Premier Box / The Signature Box / Other",
-                "; ".join(rec["new_ids"] or rec["total_ids"]),
-            ])
-
-    print(f"    smartrr_product_volume v11: subscriptions={len(subs)} rows={len(rows)} missing_created_date={missing_created}")
-    for r in [x for x in rows if x[2] in ("2026-04", "mtd_2026-05")][:9]:
-        print(f"      v11 product row: {r[5]} · new={r[8]} · total_active={r[9]} · active={r[10]} · paused={r[11]} · period={r[2]}")
-    return rows
-
-
-def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start, end, orders):
-    """Deprecated fallback only. Used only if Smartrr rows are unavailable; never supplies totals."""
-    if brand_name != "cavali":
-        return []
-    buckets = {name: {"qty": 0, "gross": 0.0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-    for o in orders or []:
-        for li in (o.get("line_items") or []):
-            qty = int(_to_number(li.get("quantity"), 0) or 0)
-            if qty <= 0:
-                continue
-            product = _smartrr_product_bucket(_shopify_line_product(li))
-            rec = buckets[product]
-            rec["qty"] += qty
-            rec["gross"] += _shopify_line_revenue(li)
-            lid = str(li.get("id") or li.get("admin_graphql_api_id") or "")[:80]
-            if lid and len(rec["ids"]) < 5:
-                rec["ids"].append(lid)
-    rows = []
-    for product in SMARTRR_PRODUCT_BUCKETS:
-        v = buckets[product]
-        rows.append([
-            now_str, brand_name, period, str(start), str(end), product, "bucket",
-            int(v["qty"]), int(v["qty"]), "", "", "",
-            round(v["gross"], 2),
-            "Shopify fallback: period product quantities only",
-            "Shopify order processed date fallback",
-            "Totals intentionally blank; Smartrr subscription-state rows unavailable",
-            "; ".join(v["ids"]),
-        ])
-    return rows
-
-
-def merge_smartrr_product_volume_rows(order_rows, active_rows):
-    """
-    Prefer Smartrr subscription-level rows. They contain the correct current total-to-date.
-    Shopify order rows are only a fallback when Smartrr returns no usable rows.
-    """
-    active_rows = active_rows or []
-    order_rows = order_rows or []
-    if active_rows:
-        print(f"    smartrr_product_volume merge v11: using {len(active_rows)} Smartrr subscription rows; ignoring Shopify totals fallback")
-        return active_rows
-    print(f"    smartrr_product_volume merge v11: Smartrr rows unavailable; using {len(order_rows)} Shopify fallback rows")
-    return order_rows
-
-
-def _delivery_product_bucket(text):
-    return _smartrr_product_bucket(text)
-
-
-def build_smartrr_delivery_due_rows(now_str, brand_name, states, period_defs):
-    """Count ACTIVE subscriptions whose Next Billing Date falls inside the selected period."""
-    if brand_name != "cavali" or not states:
-        return []
-    periods = []
-    for pk, s, e in period_defs:
-        try:
-            periods.append((pk, str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
-    rows = []
-    for pk, ps, pe, ds, de in periods:
-        buckets = {name: {"count": 0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-        seen = set()
-        for sub in states:
-            if _smartrr_status_group(sub) != "active":
-                continue
-            nb = _subscription_next_billing_date(sub)
-            if not nb or not (ds <= nb <= de):
-                continue
-            sid = _subscription_id(sub)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            bucket = _delivery_product_bucket(_subscription_product_text(sub))
-            if bucket not in buckets:
-                bucket = "Other"
-            buckets[bucket]["count"] += 1
-            if len(buckets[bucket]["ids"]) < 8:
-                buckets[bucket]["ids"].append(sid[:80])
-        for bucket in SMARTRR_PRODUCT_BUCKETS:
-            rows.append([now_str, brand_name, pk, ps, pe, bucket, buckets[bucket]["count"], "; ".join(buckets[bucket]["ids"]), "Smartrr ACTIVE purchase-state", "Next Billing Date"])
-    print(f"    smartrr_delivery_due v11: {len(rows)} rows")
-    return rows
-
-
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
@@ -2069,14 +2053,15 @@ def main():
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
 
         if brand_name == "cavali":
-            # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.
-            # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
-            active_states = fetch_smartrr_active_purchase_states(brand_name)
+            # Smartrr v14:
+            # - New subscribers are selected-period product rows.
+            # - Current totals are all ACTIVE/PAUSED Smartrr subscriptions, NOT month-filtered.
+            # - Paused period is counted by pausedAt date when available.
+            purchase_states = fetch_smartrr_active_purchase_states(brand_name)
             period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
-            active_rows = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
-            smartrr_rows = merge_smartrr_product_volume_rows(smartrr_order_rows, active_rows)
+            smartrr_rows = build_smartrr_v14_product_volume_rows(now_str, brand_name, purchase_states, smartrr_order_rows, period_defs)
             write_smartrr_product_volume(gc, cfg["sheet_id"], smartrr_rows, [p[0] for p in period_defs])
-            delivery_rows = build_smartrr_delivery_due_rows(now_str, brand_name, active_states, period_defs)
+            delivery_rows = build_smartrr_delivery_due_rows(now_str, brand_name, purchase_states, period_defs)
             write_smartrr_delivery_due(gc, cfg["sheet_id"], delivery_rows, [p[0] for p in period_defs])
 
         print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
@@ -2086,461 +2071,6 @@ def main():
                   f"  net:{float(row[5] or 0):>12,.2f}"
                   f"  gp:{float(row[6] or 0):>10,.2f}"
                   f"  new_cust:{int(row[20] or 0):>5}")
-
-
-
-
-
-# ─────────────────────────────────────────────────────────────────
-# SMARTRR v13 OVERRIDES — product buckets only, exact meanings
-# ─────────────────────────────────────────────────────────────────
-# Dashboard rules requested:
-#   1) New Subscribers = subscriptions created inside the selected filter period.
-#   2) Current Subscriber Totals = total current ACTIVE/PAUSED subscriptions, NOT filtered by month.
-#   3) Paused in Selected Period = subscriptions that became PAUSED inside the selected filter period
-#      when pause date exists; otherwise paused subscriptions fall back to their subscription-created date.
-#   4) Products are buckets only: The Premier Box, The Signature Box, Other. No customer names.
-
-SMARTRR_PRODUCT_BUCKETS = ("The Premier Box", "The Signature Box", "Other")
-
-
-def _smartrr_product_bucket(text):
-    t = str(text or "").lower()
-    if "premier" in t:
-        return "The Premier Box"
-    if "signature" in t:
-        return "The Signature Box"
-    return "Other"
-
-
-def _subscription_id(sub):
-    sid = (
-        _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "purchase_state_id") or
-        _dig(sub, "shopifyId") or _dig(sub, "shopify_id") or
-        _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
-        _dig(sub, "shopifyIdNumber") or _dig(sub, "shopify_id_number") or
-        _dig(sub, "shopify_id_number")
-    )
-    if sid not in (None, ""):
-        return str(sid)
-    return json.dumps(sub, sort_keys=True)[:240]
-
-
-def _parse_any_smartrr_date(v):
-    if v in (None, "", "ø", "null", "None"):
-        return None
-    s = str(v).strip()
-    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
-        try:
-            return datetime.strptime(s[:26], fmt).date()
-        except Exception:
-            pass
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if getattr(dt, "tzinfo", None):
-            dt = dt.astimezone(TIMEZONE)
-        return dt.date()
-    except Exception:
-        return None
-
-
-def _deep_first_by_key_v13(obj, keys, depth=0):
-    wanted = {_norm_key(k) for k in keys}
-    if obj is None or depth > 9:
-        return ""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if _norm_key(k) in wanted and v not in (None, "", "ø"):
-                return v
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                got = _deep_first_by_key_v13(v, wanted, depth + 1)
-                if got not in (None, "", "ø"):
-                    return got
-    elif isinstance(obj, list):
-        for v in obj[:120]:
-            got = _deep_first_by_key_v13(v, wanted, depth + 1)
-            if got not in (None, "", "ø"):
-                return got
-    return ""
-
-
-def _subscription_created_date(sub):
-    val = (
-        _dig(sub, "subscriptionCreatedDate") or _dig(sub, "subscription_created_date") or
-        _dig(sub, "initialSubscriptionDate") or _dig(sub, "initial_subscription_date") or
-        _dig(sub, "createdDate") or _dig(sub, "created_date") or
-        _dig(sub, "createdAt") or _dig(sub, "created_at") or _dig(sub, "created") or
-        _deep_first_by_key_v13(sub, [
-            "subscriptionCreatedDate", "subscription_created_date", "Subscription Created Date",
-            "initialSubscriptionDate", "initial_subscription_date", "Initial Subscription Date",
-            "createdDate", "created_date", "createdAt", "created_at", "created"
-        ])
-    )
-    return _parse_any_smartrr_date(val)
-
-
-def _subscription_paused_date(sub):
-    val = (
-        _dig(sub, "pausedAt") or _dig(sub, "paused_at") or
-        _dig(sub, "pauseStartedAt") or _dig(sub, "pause_started_at") or
-        _dig(sub, "pausedDate") or _dig(sub, "paused_date") or
-        _dig(sub, "pauseDate") or _dig(sub, "pause_date") or
-        _dig(sub, "pausedUntil") or _dig(sub, "paused_until") or
-        _deep_first_by_key_v13(sub, [
-            "pausedAt", "paused_at", "pauseStartedAt", "pause_started_at",
-            "pausedDate", "paused_date", "pauseDate", "pause_date", "pausedUntil", "paused_until"
-        ])
-    )
-    return _parse_any_smartrr_date(val)
-
-
-def _subscription_next_billing_date(sub):
-    val = (
-        _dig(sub, "nextBillingDate") or _dig(sub, "next_billing_date") or
-        _dig(sub, "nextBillingAt") or _dig(sub, "next_billing_at") or
-        _dig(sub, "nextOrderDate") or _dig(sub, "next_order_date") or
-        _deep_first_by_key_v13(sub, [
-            "nextBillingDate", "next_billing_date", "Next Billing Date",
-            "nextBillingAt", "next_billing_at", "nextOrderDate", "next_order_date"
-        ])
-    )
-    return _parse_any_smartrr_date(val)
-
-
-def _collect_product_text_v13(obj, depth=0, out=None):
-    if out is None:
-        out = []
-    if obj is None or depth > 9 or len(out) > 120:
-        return out
-    productish = {
-        "product", "producttitle", "productname", "productvariant", "productvariantname",
-        "purchasable", "purchasabletitle", "purchasablename",
-        "purchasableandpurchasablevariantname", "purchasablevariant", "purchasablevariantname",
-        "sellingplanname", "subscriptionprogram", "programname", "varianttitle",
-        "product_title", "product_name", "product_variant", "product_variant_name",
-        "purchasable_and_purchasable_variant_name", "variant_title", "selling_plan_name",
-    }
-    # Explicit common paths first. Never use first_name / last_name / email as product text.
-    explicit = [
-        _dig(obj, "product"), _dig(obj, "product.title"), _dig(obj, "product.name"),
-        _dig(obj, "productTitle"), _dig(obj, "product_title"),
-        _dig(obj, "productName"), _dig(obj, "product_name"),
-        _dig(obj, "purchasableAndPurchasableVariantName"), _dig(obj, "purchasable_and_purchasable_variant_name"),
-        _dig(obj, "stLineItems.0.productTitle"), _dig(obj, "stLineItems.0.title"),
-        _dig(obj, "lineItems.0.productTitle"), _dig(obj, "lineItems.0.title"),
-        _dig(obj, "items.0.productTitle"), _dig(obj, "items.0.title"),
-    ]
-    for v in explicit:
-        if isinstance(v, (str, int, float)) and str(v).strip() and "@" not in str(v):
-            out.append(str(v))
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            nk = _norm_key(k)
-            if nk in ("firstname", "lastname", "email", "customeremail", "customername"):
-                continue
-            if nk in productish:
-                if isinstance(v, (str, int, float)) and str(v).strip() and "@" not in str(v):
-                    out.append(str(v))
-                elif isinstance(v, dict):
-                    for sk in ("title", "name", "productTitle", "productName", "variantTitle", "sku"):
-                        vv = v.get(sk)
-                        if isinstance(vv, (str, int, float)) and str(vv).strip() and "@" not in str(vv):
-                            out.append(str(vv))
-                    _collect_product_text_v13(v, depth + 1, out)
-                elif isinstance(v, list):
-                    _collect_product_text_v13(v, depth + 1, out)
-            elif isinstance(v, (dict, list)):
-                _collect_product_text_v13(v, depth + 1, out)
-    elif isinstance(obj, list):
-        for v in obj[:120]:
-            _collect_product_text_v13(v, depth + 1, out)
-    return out
-
-
-def _subscription_product_text(sub):
-    vals = _collect_product_text_v13(sub)
-    return " | ".join(str(v) for v in vals if v)
-
-
-def fetch_smartrr_active_purchase_states(brand_name):
-    key = SMARTRR_API_KEYS.get(brand_name, "")
-    if brand_name != "cavali" or not key:
-        if brand_name == "cavali":
-            print("    ⚠ smartrr: SMARTRR_API_KEY_CAVALI missing")
-        return []
-
-    base_url = "https://api.smartrr.com/vendor/purchase-state"
-    states, seen = [], set()
-    page_size = 250
-    for requested_status in ("ACTIVE", "PAUSED", "CANCELLED", "CANCELED"):
-        page_number = 0
-        fetched = 0
-        total_hint = None
-        while page_number < 200:
-            params = {
-                "pageSize": page_size,
-                "pageNumber": page_number,
-                "filterEquals[purchaseStateStatus]": requested_status,
-                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders,sellingPlan,subscriptionProgram",
-            }
-            r = _smartrr_get(base_url, key, params=params)
-            if r.status_code >= 400:
-                print(f"    ⚠ smartrr {requested_status} HTTP {r.status_code}: {(r.text or '')[:220]}")
-                break
-            payload = r.json()
-            items = _smartrr_items(payload)
-            total_hint = _smartrr_total_hint(payload)
-            if not items:
-                break
-            for sub in items:
-                if isinstance(sub, dict):
-                    sub = dict(sub)
-                    sub["_smartrr_status_hint"] = requested_status.lower()
-                sid = _subscription_id(sub)
-                if sid in seen:
-                    continue
-                seen.add(sid)
-                states.append(sub)
-                fetched += 1
-            if len(items) < page_size:
-                break
-            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
-                break
-            page_number += 1
-        print(f"    smartrr {requested_status.lower()} purchase states fetched: {fetched}")
-
-    active_count = sum(1 for x in states if _smartrr_status_group(x) == "active")
-    paused_count = sum(1 for x in states if _smartrr_status_group(x) == "paused")
-    inactive_count = len(states) - active_count - paused_count
-    print(f"    smartrr v13 states: active={active_count} paused={paused_count} inactive={inactive_count} total={len(states)}")
-    return states
-
-
-def _build_smartrr_subscription_records(states):
-    records, seen = [], set()
-    for sub in states or []:
-        sid = _subscription_id(sub)
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        status = _smartrr_status_group(sub)
-        product_text = _subscription_product_text(sub)
-        bucket = _smartrr_product_bucket(product_text)
-        created = _subscription_created_date(sub)
-        paused_date = _subscription_paused_date(sub)
-        # If Smartrr has no explicit pause date, use created date only as a fallback for period reports.
-        paused_period_date = paused_date or (created if status == "paused" else None)
-        records.append({
-            "id": sid[:90],
-            "status": status,
-            "created": created,
-            "paused_date": paused_period_date,
-            "next_billing": _subscription_next_billing_date(sub),
-            "bucket": bucket,
-        })
-    return records
-
-
-def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs):
-    if brand_name != "cavali" or not active_states:
-        return []
-    periods = []
-    for pk, s, e in period_defs:
-        try:
-            periods.append((str(pk), str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
-
-    records = _build_smartrr_subscription_records(active_states)
-
-    # General current totals. These are deliberately NOT filtered by period.
-    current_totals = {name: {"active": 0, "paused": 0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-    for sub in records:
-        bucket = sub["bucket"] if sub["bucket"] in current_totals else "Other"
-        if sub["status"] == "active":
-            current_totals[bucket]["active"] += 1
-            if len(current_totals[bucket]["ids"]) < 8:
-                current_totals[bucket]["ids"].append(sub["id"])
-        elif sub["status"] == "paused":
-            current_totals[bucket]["paused"] += 1
-            if len(current_totals[bucket]["ids"]) < 8:
-                current_totals[bucket]["ids"].append(sub["id"])
-
-    rows = []
-    for pk, ps, pe, ds, de in periods:
-        new_counts = {name: {"new": 0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-        paused_period_counts = {name: {"paused": 0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-        for sub in records:
-            bucket = sub["bucket"] if sub["bucket"] in new_counts else "Other"
-            created = sub["created"]
-            if created and ds <= created <= de:
-                new_counts[bucket]["new"] += 1
-                if len(new_counts[bucket]["ids"]) < 8:
-                    new_counts[bucket]["ids"].append(sub["id"])
-            paused_date = sub["paused_date"]
-            if sub["status"] == "paused" and paused_date and ds <= paused_date <= de:
-                paused_period_counts[bucket]["paused"] += 1
-                if len(paused_period_counts[bucket]["ids"]) < 8:
-                    paused_period_counts[bucket]["ids"].append(sub["id"])
-
-        for bucket in SMARTRR_PRODUCT_BUCKETS:
-            active_total = current_totals[bucket]["active"]
-            paused_total = current_totals[bucket]["paused"]
-            current_total = active_total + paused_total
-            new_count = new_counts[bucket]["new"]
-            paused_in_period = paused_period_counts[bucket]["paused"]
-            sample_ids = new_counts[bucket]["ids"] or paused_period_counts[bucket]["ids"] or current_totals[bucket]["ids"]
-            rows.append([
-                now_str, brand_name, pk, ps, pe, bucket, "bucket",
-                new_count, new_count,
-                current_total, active_total, paused_total, paused_in_period,
-                0,
-                "Smartrr purchase-state v13",
-                "New/Paused in selected range; Current totals are global ACTIVE/PAUSED, not month-filtered",
-                "Product buckets only: The Premier Box / The Signature Box / Other",
-                "; ".join(sample_ids),
-            ])
-
-    print(
-        f"    smartrr_product_volume v13: records={len(records)} rows={len(rows)} "
-        f"current_active={sum(x['active'] for x in current_totals.values())} "
-        f"current_paused={sum(x['paused'] for x in current_totals.values())}"
-    )
-    for r in [x for x in rows if x[2] in ("mtd_2026-05", "2026-04", "q2_2026")][:9]:
-        print(f"      v13 product row: {r[5]} · new={r[8]} · current_total={r[9]} · active={r[10]} · paused_total={r[11]} · paused_period={r[12]} · period={r[2]}")
-    return rows
-
-
-def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start, end, orders):
-    # Only fallback for NEW when Smartrr states are missing. It never fills total columns.
-    if brand_name != "cavali":
-        return []
-    buckets = {name: {"qty": 0, "gross": 0.0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-    for o in orders or []:
-        for li in (o.get("line_items") or []):
-            qty = int(_to_number(li.get("quantity"), 0) or 0)
-            if qty <= 0:
-                continue
-            bucket = _smartrr_product_bucket(_shopify_line_product(li))
-            buckets[bucket]["qty"] += qty
-            buckets[bucket]["gross"] += _shopify_line_revenue(li)
-            lid = str(li.get("id") or li.get("admin_graphql_api_id") or "")[:80]
-            if lid and len(buckets[bucket]["ids"]) < 5:
-                buckets[bucket]["ids"].append(lid)
-    rows = []
-    for bucket in SMARTRR_PRODUCT_BUCKETS:
-        v = buckets[bucket]
-        rows.append([
-            now_str, brand_name, period, str(start), str(end), bucket, "bucket",
-            int(v["qty"]), int(v["qty"]), "", "", "", "", round(v["gross"], 2),
-            "Shopify fallback: period new/product quantities only",
-            "Shopify order processed date fallback; current totals blank because Smartrr state rows unavailable",
-            "Product buckets only: The Premier Box / The Signature Box / Other",
-            "; ".join(v["ids"]),
-        ])
-    return rows
-
-
-def merge_smartrr_product_volume_rows(order_rows, active_rows):
-    active_rows = active_rows or []
-    order_rows = order_rows or []
-    if active_rows:
-        print(f"    smartrr_product_volume merge v13: using {len(active_rows)} Smartrr subscription rows; Shopify fallback ignored for totals")
-        return active_rows
-    print(f"    smartrr_product_volume merge v13: Smartrr rows unavailable; using {len(order_rows)} Shopify fallback rows with blank totals")
-    return order_rows
-
-
-def build_smartrr_delivery_due_rows(now_str, brand_name, states, period_defs):
-    if brand_name != "cavali" or not states:
-        return []
-    periods = []
-    for pk, s, e in period_defs:
-        try:
-            periods.append((str(pk), str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
-        except Exception:
-            pass
-    records = _build_smartrr_subscription_records(states)
-    rows = []
-    for pk, ps, pe, ds, de in periods:
-        buckets = {name: {"count": 0, "ids": []} for name in SMARTRR_PRODUCT_BUCKETS}
-        for sub in records:
-            if sub["status"] != "active":
-                continue
-            nb = sub["next_billing"]
-            if not nb or not (ds <= nb <= de):
-                continue
-            bucket = sub["bucket"] if sub["bucket"] in buckets else "Other"
-            buckets[bucket]["count"] += 1
-            if len(buckets[bucket]["ids"]) < 8:
-                buckets[bucket]["ids"].append(sub["id"])
-        for bucket in SMARTRR_PRODUCT_BUCKETS:
-            rows.append([now_str, brand_name, pk, ps, pe, bucket, buckets[bucket]["count"], "; ".join(buckets[bucket]["ids"]), "Smartrr ACTIVE purchase-state", "Next Billing Date"])
-    print(f"    smartrr_delivery_due v13: {len(rows)} rows")
-    return rows
-
-
-# ─────────────────────────────────────────────────────────────────
-# MAIN v13
-# ─────────────────────────────────────────────────────────────────
-def main():
-    gc      = get_gc()
-    P       = get_periods()
-    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-
-    for brand_name, cfg in STORES.items():
-        print(f"\n{'='*60}\n  {brand_name.upper()}\n{'='*60}")
-        url, token = cfg["url"], cfg["token"]
-        kpi_rows, rs_rows, nvr_rows = [], [], []
-        smartrr_order_rows = []
-
-        periods_to_run = [
-            {"label": "MTD",          "cur": "mtd"},
-            {"label": "MTD_PREV",     "cur": "mtd_prev"},
-            {"label": "MTD_YOY",      "cur": "mtd_yoy"},
-            {"label": "WEEK",         "cur": "week"},
-            {"label": "MONTH",        "cur": "month"},
-            {"label": "QUARTER",      "cur": "quarter"},
-            {"label": "WEEK_PREV",    "cur": "week_prev"},
-            {"label": "MONTH_PREV",   "cur": "month_prev"},
-            {"label": "QUARTER_PREV", "cur": "quarter_prev"},
-        ]
-
-        for it in periods_to_run:
-            label, cur_k = it["label"], it["cur"]
-            s, e, pk = P[cur_k]
-            if pk is None:
-                continue
-            print(f"\n  [{label}] {s} → {e}  (period='{pk}')")
-            sal  = fetch_sales(url, token, s, e)
-            sess = fetch_sessions(url, token, s, e)
-            of   = fetch_orders_fulfilled(url, token, s, e)
-            ords = fetch_orders(url, token, s, e)
-            if brand_name == "cavali":
-                smartrr_order_rows.extend(build_smartrr_product_volume_from_orders(now_str, brand_name, pk, s, e, ords))
-            nvr  = fetch_new_vs_returning(url, token, s, e)
-            cur = build(sal, ords, nvr, sess, of)
-            kpi_rows.append(make_kpi_row(now_str, pk, s, e, cur))
-            rs = calc_rs(ords, sal.get("pct_gm", 0))
-            for ch, v in rs.items():
-                rs_rows.append([now_str, pk, ch, v["amount"], v["pct"], v["gross_profit"], v["gross_margin"], "", "", str(v["gp_is_estimate"])])
-            nvr_rows.append([now_str, pk, str(s), str(e), nvr.get("new_customers",0), nvr.get("returning_customers",0), nvr.get("new_revenue",0), nvr.get("returning_revenue",0), cur.get("new_gross_profit",0), cur.get("returning_gross_profit",0)])
-
-        write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
-
-        if brand_name == "cavali":
-            states = fetch_smartrr_active_purchase_states(brand_name)
-            period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
-            state_rows = build_smartrr_product_volume_rows(now_str, brand_name, states, period_defs)
-            rows = merge_smartrr_product_volume_rows(smartrr_order_rows, state_rows)
-            write_smartrr_product_volume(gc, cfg["sheet_id"], rows, [p[0] for p in period_defs])
-            delivery_rows = build_smartrr_delivery_due_rows(now_str, brand_name, states, period_defs)
-            write_smartrr_delivery_due(gc, cfg["sheet_id"], delivery_rows, [p[0] for p in period_defs])
-
-        print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
-        for row in kpi_rows:
-            print(f"    {row[1]:<24}  {row[2]} → {row[3]}  gross:{float(row[4] or 0):>12,.2f}  net:{float(row[5] or 0):>12,.2f}  gp:{float(row[6] or 0):>10,.2f}  new_cust:{int(row[20] or 0):>5}")
 
 
 if __name__ == "__main__":
