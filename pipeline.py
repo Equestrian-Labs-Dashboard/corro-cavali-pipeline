@@ -1088,21 +1088,43 @@ def fetch_smartrr_active_purchase_states(brand_name):
     return states
 
 
+def _smartrr_plan_text(sub):
+    """
+    Extract product/plan label from purchase-state root when stLineItems does not
+    expose usable product fields.
+    """
+    for fk in (
+        "planTitle", "plan_title",
+        "purchasableTitle", "purchasable_title",
+        "productTitle", "product_title",
+        "title", "name",
+        "planName", "plan_name",
+        "subscriptionTitle", "subscription_title",
+    ):
+        v = sub.get(fk) if isinstance(sub, dict) else ""
+        if v and str(v).strip() and re.search(r"[A-Za-z]", str(v)):
+            return str(v).strip()
+
+    for nested_k in ("plan", "purchasable", "subscription"):
+        nested = sub.get(nested_k) if isinstance(sub, dict) else None
+        if not isinstance(nested, dict):
+            continue
+        for fk in ("title", "name", "planTitle", "plan_title"):
+            v = nested.get(fk)
+            if v and str(v).strip() and re.search(r"[A-Za-z]", str(v)):
+                return str(v).strip()
+    return ""
+
+
 def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs):
     """
-    Build Smartrr rows for dashboard section 06.
+    Build Smartrr product rows for dashboard section 06.
 
-    For every selected period/product row:
-      - total_quantity / new_subscribers = active+paused line-items created inside that selected period.
-      - active_subscribers_to_date = ACTIVE line-items for that product created from the beginning
-        through the selected period end date.
-      - paused_subscribers_to_date = PAUSED line-items for that product created from the beginning
-        through the selected period end date.
+    Phase 1 (global totals): active/paused totals by product from current
+    purchase-state status (no date filter).
 
-    This lets the dashboard show, per product:
-      - New Subscribers in the selected filter.
-      - Active Subscribers total up to the filter end date.
-      - Paused Subscribers total up to the filter end date.
+    Phase 2 (period new): new subscribers in selected period using line/state
+    created date.
     """
     if brand_name != "cavali" or not active_states:
         return []
@@ -1110,15 +1132,14 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
     period_ranges = []
     for pk, s, e in period_defs:
         try:
-            period_ranges.append((pk, str(s), str(e), datetime.strptime(str(s), "%Y-%m-%d").date(), datetime.strptime(str(e), "%Y-%m-%d").date()))
+            period_ranges.append((
+                pk, str(s), str(e),
+                datetime.strptime(str(s), "%Y-%m-%d").date(),
+                datetime.strptime(str(e), "%Y-%m-%d").date(),
+            ))
         except Exception:
             pass
 
-    line_items = []
-    skipped_no_created = 0
-    seen_lines = set()
-
-    # Diagnostic: dump first state structure once to understand API shape
     if active_states:
         first = active_states[0]
         print(f"    smartrr debug: top-level keys = {list(first.keys())[:35]}")
@@ -1126,28 +1147,8 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             v = first.get(dbk)
             if isinstance(v, list) and v:
                 print(f"    smartrr debug: {dbk}[0] keys = {list(v[0].keys()) if isinstance(v[0], dict) else str(v[0])[:200]}")
-                inner = v[0]
-                for dbk2 in ("purchasable", "variant", "product", "purchasableVariant"):
-                    vv = inner.get(dbk2)
-                    if vv:
-                        print(f"    smartrr debug: {dbk}[0].{dbk2} keys = {list(vv.keys()) if isinstance(vv, dict) else str(vv)[:200]}")
 
     def _extract_product_name_from_st_line(st_line):
-        """
-        Extract product/variant name from a Smartrr stLineItem.
-        Smartrr nests the product under purchasable, purchasableVariant, or variant.
-        Field names observed: name, title, productTitle, variantTitle,
-        purchasableAndPurchasableVariantName, purchasable.name, purchasable.title,
-        purchasableVariant.name, purchasableVariant.title, variant.title, variant.name
-        """
-        def _valid_product_name(v):
-            s = str(v or "").strip()
-            if not s or s in ("??", "Default Title"):
-                return False
-            # Avoid numeric-only labels like "2.0" that are not product names.
-            return bool(re.search(r"[A-Za-z]", s))
-
-        # Direct fields on the line
         for fk in (
             "purchasableAndPurchasableVariantName",
             "purchasable_and_purchasable_variant_name",
@@ -1156,20 +1157,17 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             "title", "name",
         ):
             v = st_line.get(fk)
-            if v and str(v).strip() not in ("", "ø", "Default Title"):
+            if v and str(v).strip() not in ("", "?", "Default Title"):
                 return str(v).strip()
-
-        # Nested: purchasable / purchasableVariant / variant / product / vnt
         for nested_key in ("purchasable", "purchasableVariant", "variant", "product", "vnt"):
             nested = st_line.get(nested_key)
             if not isinstance(nested, dict):
                 continue
             for fk in ("name", "title", "productTitle", "product_title", "variantTitle", "variant_title",
-                        "purchasableAndPurchasableVariantName"):
+                       "purchasableAndPurchasableVariantName"):
                 v = nested.get(fk)
-                if v and str(v).strip() not in ("", "ø", "Default Title"):
+                if v and str(v).strip() not in ("", "?", "Default Title"):
                     return str(v).strip()
-
         return ""
 
     def _extract_sku_from_st_line(st_line):
@@ -1177,22 +1175,29 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             v = st_line.get(fk)
             if v and str(v).strip():
                 return str(v).strip()
-        for nested_key in ("purchasable", "purchasableVariant", "variant"):
+        for nested_key in ("purchasable", "purchasableVariant", "variant", "vnt"):
             nested = st_line.get(nested_key)
             if isinstance(nested, dict):
                 for fk in ("sku", "SKU"):
                     v = nested.get(fk)
                     if v and str(v).strip():
                         return str(v).strip()
-        return "ø"
+        return "?"
 
-    def _extract_price_from_st_line(st_line, qty):
+    def _extract_qty(st_line):
+        qty_raw = st_line.get("quantity") or st_line.get("qty") or 1
+        try:
+            return max(1, int(float(str(qty_raw))))
+        except Exception:
+            return 1
+
+    def _extract_price(st_line, qty):
         for fk in ("price", "linePrice", "line_price", "totalPrice", "total_price",
                    "unitPrice", "unit_price", "priceAfterDiscount", "price_after_discount"):
             v = st_line.get(fk)
             if v not in (None, ""):
                 return _money_to_usd(v) * qty
-        for nested_key in ("purchasable", "purchasableVariant", "variant"):
+        for nested_key in ("purchasable", "purchasableVariant", "variant", "vnt"):
             nested = st_line.get(nested_key)
             if isinstance(nested, dict):
                 for fk in ("price", "unitPrice", "unit_price"):
@@ -1201,15 +1206,91 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
                         return _money_to_usd(v) * qty
         return 0.0
 
+    def _get_state_created(sub):
+        for ck in ("createdDate", "created_date", "createdAt", "created_at",
+                   "externalSubscriptionCreatedDate", "external_subscription_created_date"):
+            v = sub.get(ck)
+            if v:
+                d = _parse_smartrr_date(v)
+                if d:
+                    return d
+        return None
+
+    def _get_products_from_state(sub):
+        results = []
+        st_lines = sub.get("stLineItems") or sub.get("lineItems") or sub.get("orderLineItems") or []
+
+        for st_line in (st_lines if isinstance(st_lines, list) else []):
+            if not isinstance(st_line, dict):
+                continue
+            if st_line.get("deletedAt") or st_line.get("deleted_at"):
+                continue
+            prod = _extract_product_name_from_st_line(st_line)
+            if not prod or not re.search(r"[A-Za-z]", prod):
+                continue
+            sku = _extract_sku_from_st_line(st_line)
+            qty = _extract_qty(st_line)
+            price = _extract_price(st_line, qty)
+            results.append((prod, sku, qty, price))
+
+        if not results:
+            for line in _candidate_line_dicts(sub):
+                if _line_deleted(line):
+                    continue
+                prod = _line_product(line)
+                if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", prod):
+                    continue
+                sku = _line_sku(line)
+                qty = _line_quantity(line)
+                price = _line_revenue(line, qty)
+                results.append((prod, sku, qty, price))
+
+        if not results:
+            prod = _smartrr_plan_text(sub)
+            if prod and re.search(r"[A-Za-z]", prod):
+                results.append((prod, "?", 1, 0.0))
+
+        return results
+
+    active_total = {}
+    paused_total = {}
+    no_product_count = 0
+
     for sub in active_states:
         state_group = _smartrr_status_group(sub)
         if state_group not in ("active", "paused"):
             continue
 
-        # -- PRIMARY: parse stLineItems (Smartrr's subscription line items) --
-        st_lines = sub.get("stLineItems") or sub.get("lineItems") or sub.get("orderLineItems") or []
-        extracted_from_st = False
+        products = _get_products_from_state(sub)
+        if not products:
+            no_product_count += 1
+            prod = f"[Sin nombre ? id={str(sub.get('id', '?'))[:20]}]"
+            products = [(prod, "?", 1, 0.0)]
 
+        for prod, sku, qty, _ in products:
+            key = (prod, sku)
+            if state_group == "active":
+                active_total[key] = active_total.get(key, 0) + qty
+            else:
+                paused_total[key] = paused_total.get(key, 0) + qty
+
+    total_active_global = sum(active_total.values())
+    total_paused_global = sum(paused_total.values())
+    print(f"    FASE 1 ? Totales globales: active={total_active_global} paused={total_paused_global} sin_producto={no_product_count}")
+
+    new_items = []
+    skipped_no_date = 0
+    seen_lines = set()
+
+    for sub in active_states:
+        state_group = _smartrr_status_group(sub)
+        if state_group not in ("active", "paused"):
+            continue
+
+        state_created = _get_state_created(sub)
+        st_lines = sub.get("stLineItems") or sub.get("lineItems") or sub.get("orderLineItems") or []
+
+        extracted_any = False
         for st_line in (st_lines if isinstance(st_lines, list) else []):
             if not isinstance(st_line, dict):
                 continue
@@ -1217,16 +1298,11 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
                 continue
 
             prod = _extract_product_name_from_st_line(st_line)
-            if not prod:
-                # Try deep search as last resort
-                prod = _line_product(st_line)
-            if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", str(prod)):
-                # Some Cavali payloads only expose product text on the parent subscription object.
+            if not prod or not re.search(r"[A-Za-z]", prod):
                 prod = _smartrr_plan_text(sub)
-            if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", str(prod)):
+            if not prod or not re.search(r"[A-Za-z]", prod):
                 continue
 
-            # Created date: prefer the st_line's own createdDate, fall back to state
             created = None
             for ck in ("createdDate", "created_date", "createdAt", "created_at"):
                 v = st_line.get(ck)
@@ -1235,143 +1311,89 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
                     if created:
                         break
             if not created:
-                # Fall back to purchase state's own createdDate
-                for ck in ("createdDate", "created_date", "createdAt", "created_at", "externalSubscriptionCreatedDate"):
-                    v = sub.get(ck)
-                    if v:
-                        created = _parse_smartrr_date(v)
-                        if created:
-                            break
+                created = state_created
             if not created:
-                skipped_no_created += 1
+                skipped_no_date += 1
                 continue
 
             sku = _extract_sku_from_st_line(st_line)
-            qty_raw = st_line.get("quantity") or st_line.get("qty") or 1
-            try:
-                qty = max(1, int(float(str(qty_raw))))
-            except Exception:
-                qty = 1
-            gross = _extract_price_from_st_line(st_line, qty)
-
-            lid = (str(st_line.get("id") or st_line.get("shopifyId") or "")[:80]
-                   or f"{state_group}|{prod}|{sku}|{created}|{qty}")
+            qty = _extract_qty(st_line)
+            gross = _extract_price(st_line, qty)
+            lid = str(st_line.get("id") or st_line.get("shopifyId") or "")[:80] or f"{state_group}|{prod}|{sku}|{created}|{qty}"
             dedupe = f"{state_group}|{lid}"
             if dedupe in seen_lines:
                 continue
             seen_lines.add(dedupe)
-            line_items.append({
-                "created": created,
-                "product": prod,
-                "sku": sku,
-                "qty": qty,
-                "gross": gross,
-                "id": str(lid)[:80],
-                "status": state_group,
-            })
-            extracted_from_st = True
+            new_items.append({"created": created, "product": prod, "sku": sku, "qty": qty, "gross": gross, "id": lid, "status": state_group})
+            extracted_any = True
 
-        # -- FALLBACK: if stLineItems gave nothing, try _candidate_line_dicts --
-        if not extracted_from_st:
+        if not extracted_any:
             for line in _candidate_line_dicts(sub):
                 if _line_deleted(line):
                     continue
-                created = _line_created_date(line)
-                if not created:
-                    skipped_no_created += 1
-                    continue
                 prod = _line_product(line)
-                if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", str(prod)):
+                if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", prod):
+                    continue
+                created = _line_created_date(line) or state_created
+                if not created:
+                    skipped_no_date += 1
                     continue
                 sku = _line_sku(line)
                 qty = _line_quantity(line)
                 gross = _line_revenue(line, qty)
-                lid = _line_id(line) or f"{state_group}|{prod}|{sku}|{created}|{qty}|{gross}"
+                lid = _line_id(line) or f"{state_group}|{prod}|{sku}|{created}|{qty}"
                 dedupe = f"{state_group}|{lid}"
                 if dedupe in seen_lines:
                     continue
                 seen_lines.add(dedupe)
-                line_items.append({
-                    "created": created,
-                    "product": prod,
-                    "sku": sku,
-                    "qty": qty,
-                    "gross": gross,
-                    "id": str(lid)[:80],
-                    "status": state_group,
-                })
+                new_items.append({"created": created, "product": prod, "sku": sku, "qty": qty, "gross": gross, "id": lid, "status": state_group})
+
+    print(f"    FASE 2 ? Line items con fecha: {len(new_items)} items ? sin_fecha={skipped_no_date}")
 
     rows = []
+    all_keys = set(active_total.keys()) | set(paused_total.keys())
+
     for pk, ps, pe, ds, de in period_ranges:
-        active_buckets = {}
-        paused_buckets = {}
         new_buckets = {}
-
-        for item in line_items:
-            key = (item["product"], item["sku"])
-
-            if item["created"] <= de:
-                if item["status"] == "active":
-                    rec = active_buckets.setdefault(key, {"active": 0, "ids": []})
-                    rec["active"] += item["qty"]
-                    if len(rec["ids"]) < 5:
-                        rec["ids"].append(item["id"])
-                elif item["status"] == "paused":
-                    rec = paused_buckets.setdefault(key, {"paused": 0, "ids": []})
-                    rec["paused"] += item["qty"]
-                    if len(rec["ids"]) < 5:
-                        rec["ids"].append(item["id"])
-
+        for item in new_items:
             if ds <= item["created"] <= de:
+                key = (item["product"], item["sku"])
                 rec = new_buckets.setdefault(key, {"new": 0, "gross": 0.0, "ids": []})
                 rec["new"] += item["qty"]
                 rec["gross"] += item["gross"]
                 if len(rec["ids"]) < 5:
                     rec["ids"].append(item["id"])
 
-        # Include every active/paused product with total_to_date > 0, even if new_subscribers is 0 in this period.
-        all_keys = set(active_buckets.keys()) | set(paused_buckets.keys()) | set(new_buckets.keys())
+        period_keys = all_keys | set(new_buckets.keys())
         for prod, sku in sorted(
-            all_keys,
-            key=lambda k: (-(active_buckets.get(k, {}).get("active", 0) + paused_buckets.get(k, {}).get("paused", 0)), k[0].lower()),
+            period_keys,
+            key=lambda k: (-(active_total.get(k, 0) + paused_total.get(k, 0) + new_buckets.get(k, {}).get("new", 0)), k[0].lower()),
         ):
-            active_to_date = active_buckets.get((prod, sku), {}).get("active", 0)
-            paused_to_date = paused_buckets.get((prod, sku), {}).get("paused", 0)
+            active_to_date = active_total.get((prod, sku), 0)
+            paused_to_date = paused_total.get((prod, sku), 0)
             new_count = new_buckets.get((prod, sku), {}).get("new", 0)
             gross = new_buckets.get((prod, sku), {}).get("gross", 0.0)
-            ids = (
-                new_buckets.get((prod, sku), {}).get("ids") or
-                active_buckets.get((prod, sku), {}).get("ids") or
-                paused_buckets.get((prod, sku), {}).get("ids") or []
-            )
+            ids = new_buckets.get((prod, sku), {}).get("ids") or []
+
             if active_to_date <= 0 and paused_to_date <= 0 and new_count <= 0:
                 continue
+
             rows.append([
                 now_str, brand_name, pk, ps, pe,
                 prod, sku,
                 new_count, new_count,
                 active_to_date, paused_to_date,
                 round(gross, 2),
-                "Smartrr purchase-state ACTIVE+PAUSED line items",
-                "Order Line Item Created Date",
+                "Smartrr purchase-state ACTIVE+PAUSED ? Fase1=totales globales Fase2=nuevos periodo",
+                "State createdAt / Order Line Item Created Date",
                 "purchaseStateStatus=ACTIVE/PAUSED; cancelled/deleted excluded",
                 "; ".join(ids),
             ])
 
-    print(f"    smartrr_product_volume: line_items={len(line_items)} rows={len(rows)} skipped_no_created_date={skipped_no_created}")
-    tests = [r for r in rows if r[2] in ("2026-04", "mtd_2026-05")][:10]
-    for r in tests[:8]:
-        print(
-            f"      smartrr product test: {r[5]} · sku={r[6]} · "
-            f"new={r[8]} · active_to_date={r[9]} · paused_to_date={r[10]} · gross={r[11]} · period={r[2]}"
-        )
+    print(f"    smartrr_product_volume FINAL: {len(new_items)} items de fecha ? {len(rows)} filas ? skipped_sin_fecha={skipped_no_date}")
     return rows
 
 
-
-
-
-# ─────────────────────────────────────────────────────────────────
 # SMARTRR fallback — period product rows from Shopify order line_items
 # ─────────────────────────────────────────────────────────────────
 
