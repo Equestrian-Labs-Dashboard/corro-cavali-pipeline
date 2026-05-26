@@ -75,7 +75,15 @@ HEADERS_KPIS = [
     "new_gross_profit", "returning_gross_profit",
 ]
 
-SMARTRR_HEADERS = [
+SMARTRR_SUBSCRIBERS_HEADERS = [
+    "updated_at", "brand",
+    "seasonal", "signature", "premier", "junior", "other", "total_subscribers",
+    "active_subscribers_current", "paused_subscribers_current",
+    "cancelled_subscriptions_to_date", "total_subscriptions_to_date",
+    "source", "error",
+]
+
+SMARTRR_PRODUCT_VOLUME_HEADERS = [
     "updated_at", "brand", "period", "period_start", "period_end",
     "product", "active_subscribers", "gross_revenue", "sku", "source", "error", "examples",
 ]
@@ -874,9 +882,50 @@ def _parse_shopify_dt(v):
         return None
 
 
+def _count_purchase_states_by_status(api_key, statuses):
+    """Count unique purchase states for the requested statuses."""
+    base_url = "https://api.smartrr.com/vendor/purchase-state"
+    out = {}
+    for st in statuses:
+        seen = set()
+        page_size = 250
+        page_number = 0
+        while page_number < 250:
+            params = {
+                "pageSize": page_size,
+                "pageNumber": page_number,
+                "filterEquals[purchaseStateStatus]": st,
+                "include": "items,lineItems,stLineItems,product,variant,subscriptionProgram,sellingPlan",
+            }
+            r = _smartrr_get(base_url, api_key, params=params)
+            if r.status_code >= 400:
+                break
+            payload = r.json()
+            items = _smartrr_items(payload)
+            total_hint = _smartrr_total_hint(payload)
+            if not items:
+                break
+            for sub in items:
+                sid = str(
+                    _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "purchase_state_id") or
+                    _dig(sub, "shopifyId") or _dig(sub, "shopify_id") or
+                    _dig(sub, "externalSubscriptionId") or _dig(sub, "external_subscription_id") or
+                    _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or ""
+                )
+                if sid:
+                    seen.add(sid)
+            if len(items) < page_size:
+                break
+            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
+                break
+            page_number += 1
+        out[st.lower()] = len(seen)
+    return out
+
+
 def _smartrr_empty_row(now_str, brand_name, source, reason):
-    """Write an explicit empty/error row. No hardcoded reviewed fallback values."""
-    return [now_str, brand_name, 0, 0, 0, 0, 0, 0, source, reason or ""]
+    """Write an explicit empty/error row aligned with SMARTRR_SUBSCRIBERS_HEADERS (14 cols)."""
+    return [now_str, brand_name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, source, reason or ""]
 
 
 def _find_contract_gid(obj, depth=0):
@@ -1098,10 +1147,25 @@ def fetch_smartrr_active_subs(brand_name, store_url=None, token=None):
             f"    smartrr: seasonal={counts['seasonal']} signature={counts['signature']} "
             f"premier={counts['premier']} junior={counts['junior']} other={counts['other']} total={total}"
         )
+        status_counts = _count_purchase_states_by_status(
+            key,
+            ["ACTIVE", "PAUSED", "CANCELLED", "CANCELED", "INACTIVE", "EXPIRED"],
+        )
+        active_current  = status_counts.get("active", total)
+        paused_current  = status_counts.get("paused", 0)
+        cancelled_total = (
+            status_counts.get("cancelled", 0)
+            + status_counts.get("canceled", 0)
+            + status_counts.get("inactive", 0)
+            + status_counts.get("expired", 0)
+        )
+        total_to_date = active_current + paused_current + cancelled_total
         return [
             now_str, brand_name,
             counts["seasonal"], counts["signature"], counts["premier"], counts["junior"],
-            counts["other"], total, source, error,
+            counts["other"], total,
+            active_current, paused_current, cancelled_total, total_to_date,
+            source, error,
         ]
 
     except Exception as e:
@@ -1117,10 +1181,10 @@ def write_smartrr(gc, sheet_id, smartrr_row):
     try:
         ws = sh.worksheet("smartrr_subscribers")
     except Exception:
-        ws = sh.add_worksheet("smartrr_subscribers", rows=50, cols=len(SMARTRR_HEADERS))
+        ws = sh.add_worksheet("smartrr_subscribers", rows=50, cols=len(SMARTRR_SUBSCRIBERS_HEADERS))
 
     ws.clear()
-    ws.append_row(SMARTRR_HEADERS)
+    ws.append_row(SMARTRR_SUBSCRIBERS_HEADERS)
     ws.append_row(smartrr_row, value_input_option="USER_ENTERED")
     print("    smartrr_subscribers: 1 row")
 
@@ -1229,14 +1293,14 @@ def write_smartrr_product_rows(gc, sheet_id, smartrr_rows):
         return
     sh = gc.open_by_key(sheet_id)
     try:
-        ws = sh.worksheet("smartrr_subscribers")
+        ws = sh.worksheet("smartrr_product_volume")
     except Exception:
-        ws = sh.add_worksheet("smartrr_subscribers", rows=max(100, len(smartrr_rows)+10), cols=len(SMARTRR_HEADERS))
+        ws = sh.add_worksheet("smartrr_product_volume", rows=max(100, len(smartrr_rows)+10), cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
     ws.clear()
-    ws.append_row(SMARTRR_HEADERS)
+    ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
     if smartrr_rows:
         ws.append_rows(smartrr_rows, value_input_option="USER_ENTERED")
-    print(f"    smartrr_subscribers: {len(smartrr_rows)} period/product rows")
+    print(f"    smartrr_product_volume: {len(smartrr_rows)} period/product rows")
 
 
 # MAIN
@@ -1513,6 +1577,10 @@ def main():
             print(f"  NVR batch {i//50+1} escrito")
 
         write_smartrr_product_rows(gc, sid, smartrr_rows)
+        if brand == "cavali":
+            # Write active subscriber snapshot (seasonal/signature/premier/junior breakdown)
+            smartrr_sub_row = fetch_smartrr_active_subs(brand, url, token)
+            write_smartrr(gc, sid, smartrr_sub_row)
         if brand == "cavali":
             totals = {}
             for rr in smartrr_rows:
