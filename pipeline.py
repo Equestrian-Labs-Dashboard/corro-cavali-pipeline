@@ -1159,8 +1159,8 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             if v and str(v).strip() not in ("", "ø", "Default Title"):
                 return str(v).strip()
 
-        # Nested: purchasable / purchasableVariant / variant
-        for nested_key in ("purchasable", "purchasableVariant", "variant", "product"):
+        # Nested: purchasable / purchasableVariant / variant / product / vnt
+        for nested_key in ("purchasable", "purchasableVariant", "variant", "product", "vnt"):
             nested = st_line.get(nested_key)
             if not isinstance(nested, dict):
                 continue
@@ -1220,6 +1220,9 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             if not prod:
                 # Try deep search as last resort
                 prod = _line_product(st_line)
+            if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", str(prod)):
+                # Some Cavali payloads only expose product text on the parent subscription object.
+                prod = _smartrr_plan_text(sub)
             if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", str(prod)):
                 continue
 
