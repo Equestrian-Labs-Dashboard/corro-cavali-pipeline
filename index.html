@@ -1262,26 +1262,7 @@ async function renderSubs() {
       </div>`;
   }).join('');
 
-  const deliveryMap = new Map();
-  (deliveryRows || []).forEach(r => {
-    const prod = String(r.product_bucket || r.product_variant || r.product || "").trim();
-    if (!prod || !/[A-Za-z]/.test(prod)) return;
-    deliveryMap.set(prod, (deliveryMap.get(prod) || 0) + _num(dueOf(r)));
-  });
-  const deliveryTotal = Array.from(deliveryMap.values()).reduce((a,b)=>a+b,0);
-  const deliveryCards = Array.from(deliveryMap.entries())
-    .sort((a,b)=>b[1]-a[1])
-    .slice(0, 12)
-    .map(([k, v]) => {
-    const col = palette[k] || "#72AEFF";
-    return `
-      <div class="kc delivery-card">
-        <div class="kc-bar" style="background:${col}"></div>
-        <div class="kc-lbl" style="color:${col}">${k}</div>
-        <div class="kc-val" style="color:${col}">${_num(v).toLocaleString()}</div>
-        <div class="delivery-note">${deliveryTabReady ? "Clients scheduled to receive subscription product in selected " + ptype + "." : "Run the updated pipeline to fill delivery counts."}<br>Basis: Next Billing Date</div>
-      </div>`;
-  }).join('');
+  const deliveryTotal = 0;
 
   el.innerHTML = `
     <div class="smartrr-total-card">
@@ -1296,7 +1277,7 @@ async function renderSubs() {
         <span>New subscribers in selected range: <strong>${totalNew.toLocaleString()}</strong></span>
         <span>Current subscribers total: <strong>${(totalToDateSummary || totalToDateKnown) ? totalToDateSummary.toLocaleString() : "—"}</strong> · Current active: <strong>${globalActiveKnown ? totalActive.toLocaleString() : "—"}</strong> · Current paused: <strong>${globalPausedKnown ? totalPaused.toLocaleString() : "—"}</strong> · Cancelled: <strong>${totalCancelled !== null && totalCancelled !== undefined ? _num(totalCancelled).toLocaleString() : "—"}</strong></span>
         <span>Paused subscriptions in selected range: <strong>${totalPausedInPeriod.toLocaleString()}</strong></span>
-        <span>Upcoming deliveries in selected range: <strong>${deliveryTotal.toLocaleString()}</strong> clients${deliveryTabReady ? "" : " · delivery tab not loaded yet"}</span>
+        <span>Upcoming deliveries in selected range: <strong>Hidden for Cavali</strong></span>
       </div>
     </div>
 
@@ -1306,8 +1287,7 @@ async function renderSubs() {
     <div class="smartrr-subtitle">Current subscriber totals and paused in selected range by product (full name)</div>
     <div class="sub-total-grid">${totalCards}</div>
 
-    <div class="smartrr-subtitle">Clients due to receive subscription product in this filter</div>
-    <div class="delivery-grid">${deliveryCards}</div>`;
+    `;
 }
 /* ══════════════════════════════════════════════════════
    Q1 2026 SNAPSHOT
