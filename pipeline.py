@@ -37,17 +37,17 @@ TIMEZONE    = pytz.timezone("America/Bogota")
 GQL_VERSION = "2025-10"
 
 STORES = {
-    "corro":  {
-        # Uses the same GitHub Secrets you already have. Defaults keep the old behavior intact.
-        "url":      os.environ.get("SHOPIFY_URL_CORRO", "equestrian-labs.myshopify.com"),
-        "token":    os.environ["SHOPIFY_TOKEN_CORRO"],
-        "sheet_id": os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU"),
-    },
     "cavali": {
         # Uses the same GitHub Secrets you already have. Defaults keep the old behavior intact.
         "url":      os.environ.get("SHOPIFY_URL_CAVALI", "cavali-club.myshopify.com"),
         "token":    os.environ["SHOPIFY_TOKEN_CAVALI"],
         "sheet_id": os.environ.get("SHEET_ID_CAVALI", "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig"),
+    },
+    "corro":  {
+        # Uses the same GitHub Secrets you already have. Defaults keep the old behavior intact.
+        "url":      os.environ.get("SHOPIFY_URL_CORRO", "equestrian-labs.myshopify.com"),
+        "token":    os.environ["SHOPIFY_TOKEN_CORRO"],
+        "sheet_id": os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU"),
     },
 }
 SCOPES = [
@@ -1174,9 +1174,17 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
         for dbk in ("stLineItems", "lineItems", "orderLineItems", "items"):
             v = first.get(dbk)
             if isinstance(v, list) and v:
-                print(f"    smartrr debug: {dbk}[0] keys = {list(v[0].keys()) if isinstance(v[0], dict) else str(v[0])[:200]}")
+                item0 = v[0]
+                print(f"    smartrr debug: {dbk}[0] keys = {list(item0.keys()) if isinstance(item0, dict) else str(item0)[:200]}")
+                if isinstance(item0, dict):
+                    vnt0 = item0.get("vnt")
+                    if isinstance(vnt0, dict):
+                        print(f"    smartrr debug: {dbk}[0].vnt keys = {list(vnt0.keys())[:30]}")
+                        print(f"    smartrr debug: {dbk}[0].vnt sample = { {k: str(vnt0[k])[:60] for k in list(vnt0.keys())[:12]} }")
+                    print(f"    smartrr debug: {dbk}[0] currentSku={item0.get('currentSku')} basePrice={item0.get('basePrice')} quantity={item0.get('quantity')}")
 
     def _extract_product_name_from_st_line(st_line):
+        # Direct top-level name fields
         for fk in (
             "purchasableAndPurchasableVariantName",
             "purchasable_and_purchasable_variant_name",
@@ -1187,26 +1195,42 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             v = st_line.get(fk)
             if v and str(v).strip() not in ("", "?", "Default Title"):
                 return str(v).strip()
-        for nested_key in ("purchasable", "purchasableVariant", "variant", "product", "vnt"):
+        # vnt first — it is the variant object confirmed in Smartrr's schema
+        for nested_key in ("vnt", "purchasable", "purchasableVariant", "variant", "product"):
             nested = st_line.get(nested_key)
             if not isinstance(nested, dict):
                 continue
-            for fk in ("name", "title", "productTitle", "product_title", "variantTitle", "variant_title",
-                       "purchasableAndPurchasableVariantName"):
+            for fk in (
+                "purchasableAndPurchasableVariantName",
+                "displayName", "display_name",
+                "productVariantName", "product_variant_name",
+                "name", "title",
+                "productTitle", "product_title",
+                "variantTitle", "variant_title",
+            ):
                 v = nested.get(fk)
                 if v and str(v).strip() not in ("", "?", "Default Title"):
                     return str(v).strip()
+            # One level deeper (product inside vnt)
+            for sub_key in ("product", "purchasable"):
+                sub = nested.get(sub_key)
+                if isinstance(sub, dict):
+                    for fk in ("name", "title", "productTitle", "displayName"):
+                        v = sub.get(fk)
+                        if v and str(v).strip() not in ("", "?", "Default Title"):
+                            return str(v).strip()
         return ""
 
     def _extract_sku_from_st_line(st_line):
-        for fk in ("sku", "SKU"):
+        # currentSku is confirmed in Smartrr debug output
+        for fk in ("currentSku", "sku", "SKU"):
             v = st_line.get(fk)
             if v and str(v).strip():
                 return str(v).strip()
-        for nested_key in ("purchasable", "purchasableVariant", "variant", "vnt"):
+        for nested_key in ("vnt", "purchasable", "purchasableVariant", "variant"):
             nested = st_line.get(nested_key)
             if isinstance(nested, dict):
-                for fk in ("sku", "SKU"):
+                for fk in ("sku", "SKU", "currentSku"):
                     v = nested.get(fk)
                     if v and str(v).strip():
                         return str(v).strip()
@@ -1220,7 +1244,8 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             return 1
 
     def _extract_price(st_line, qty):
-        for fk in ("price", "linePrice", "line_price", "totalPrice", "total_price",
+        for fk in ("priceAfterDiscounts", "price_after_discounts", "basePrice", "base_price",
+                   "price", "linePrice", "line_price", "totalPrice", "total_price",
                    "unitPrice", "unit_price", "priceAfterDiscount", "price_after_discount"):
             v = st_line.get(fk)
             if v not in (None, ""):
