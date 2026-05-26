@@ -1125,9 +1125,12 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
 
     Phase 2 (period new): new subscribers in selected period using line/state
     created date.
+
+    Returns (rows, active_total_by_norm, paused_total_by_norm) where the last
+    two dicts are keyed by _product_match_key(product) for loose matching.
     """
     if brand_name != "cavali" or not active_states:
-        return []
+        return [], {}, {}
 
     period_ranges = []
     for pk, s, e in period_defs:
@@ -1391,7 +1394,18 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             ])
 
     print(f"    smartrr_product_volume FINAL: {len(new_items)} items de fecha ? {len(rows)} filas ? skipped_sin_fecha={skipped_no_date}")
-    return rows
+
+    # Build normalized-key dicts so merge can match even when product names differ slightly
+    active_norm = {}
+    paused_norm = {}
+    for (prod, sku), qty in active_total.items():
+        nk = _product_match_key(prod)
+        active_norm[nk] = active_norm.get(nk, 0) + qty
+    for (prod, sku), qty in paused_total.items():
+        nk = _product_match_key(prod)
+        paused_norm[nk] = paused_norm.get(nk, 0) + qty
+
+    return rows, active_norm, paused_norm
 
 
 # SMARTRR fallback — period product rows from Shopify order line_items
@@ -1496,11 +1510,15 @@ def _is_blank_number(v):
     return v in (None, "", "None", "null", "ø")
 
 
-def merge_smartrr_product_volume_rows(order_rows, active_rows):
+def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None, paused_norm=None):
     """
     Prefer period rows from Shopify orders for New Subscribers, because this matches
     the selected Week / MTD / Month / Quarter range. Enrich with Smartrr ACTIVE and
     PAUSED totals-to-date when Smartrr exposes usable product line data.
+
+    active_norm / paused_norm: global totals keyed by _product_match_key(product).
+    These are injected into ALL rows (including fallback) so the dashboard always
+    shows real current totals per product even when the Shopify fallback is used.
 
     Key detail: match by normalized product name first, not only exact product+SKU,
     because Smartrr and Shopify can label the same item differently.
@@ -1595,6 +1613,28 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows):
                 merged.append(row)
         except Exception:
             merged.append(r)
+
+    # ── Phase 3: inject global Smartrr totals into ALL rows that still have
+    #    blank or fallback-derived active/paused counts.  This ensures the
+    #    "Current Totals" product cards always show real data even when the
+    #    Shopify order fallback was used for new-subscriber counts.
+    if active_norm or paused_norm:
+        for row in merged:
+            try:
+                nk = _product_match_key(str(row[IDX_PRODUCT]))
+                src = str(row[IDX_SOURCE] if len(row) > IDX_SOURCE else "").lower()
+                is_fallback = "fallback" in src and "active/paused" not in src
+                a_real = active_norm.get(nk)
+                p_real = paused_norm.get(nk, 0)
+                if a_real is not None and (_is_blank_number(row[IDX_ACTIVE]) or is_fallback):
+                    row[IDX_ACTIVE] = a_real
+                    row[IDX_PAUSED] = p_real
+                    # Remove "fallback" stigma so dashboard JS accepts the totals
+                    row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED totals + period product rows"
+                    row[IDX_DATE_BASIS] = "State createdAt / Order Line Item Created Date"
+            except Exception:
+                pass
+        print(f"    smartrr_product_volume phase3: global totals injected into rows using active_norm({len(active_norm)} products)")
 
     if active_rows:
         print(f"    smartrr_product_volume merge: {len(order_rows)} order rows + {len(active_rows)} active/paused rows => {len(merged)} rows")
@@ -1937,8 +1977,8 @@ def main():
             # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
             active_states = fetch_smartrr_active_purchase_states(brand_name)
             period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
-            active_rows = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
-            smartrr_rows = merge_smartrr_product_volume_rows(smartrr_order_rows, active_rows)
+            active_rows, active_norm, paused_norm = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
+            smartrr_rows = merge_smartrr_product_volume_rows(smartrr_order_rows, active_rows, active_norm, paused_norm)
             write_smartrr_product_volume(gc, cfg["sheet_id"], smartrr_rows, [p[0] for p in period_defs])
 
         print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
