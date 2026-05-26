@@ -679,8 +679,8 @@ SMARTRR_PRODUCT_VOLUME_HEADERS = [
     "updated_at", "brand", "period", "period_start", "period_end",
     "product_variant", "sku",
     "total_quantity", "new_subscribers",
-    # Named *_current so the dashboard JS reads them via activeOf / pausedOf
-    "active_subscribers_current", "paused_subscribers_current",
+    # Named *_current so the dashboard JS reads them via activeOf / pausedOf / cancelledOf
+    "active_subscribers_current", "paused_subscribers_current", "cancelled_subscribers_current",
     "gross_revenue", "source", "date_basis", "active_filter", "sample_line_ids",
 ]
 
@@ -1048,8 +1048,8 @@ def fetch_smartrr_active_purchase_states(brand_name):
     page_size = 250
 
     # User requirement: keep new subscribers for the selected period, but also show
-    # current ACTIVE and PAUSED subscriber totals per product up to the selected end date.
-    for requested_status in ("ACTIVE", "PAUSED"):
+    # current ACTIVE, PAUSED, and CANCELLED subscriber totals per product.
+    for requested_status in ("ACTIVE", "PAUSED", "CANCELLED"):
         page_number = 0
         total_hint = None
         fetched_for_status = 0
@@ -1077,7 +1077,7 @@ def fetch_smartrr_active_purchase_states(brand_name):
                     sub = dict(sub)
                     sub["_smartrr_status_hint"] = requested_status.lower()
 
-                if not _smartrr_is_active_or_paused(sub):
+                if not _smartrr_is_active_or_paused(sub) and requested_status != "CANCELLED":
                     continue
 
                 sid = str(
@@ -1175,13 +1175,12 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             v = first.get(dbk)
             if isinstance(v, list) and v:
                 item0 = v[0]
-                print(f"    smartrr debug: {dbk}[0] keys = {list(item0.keys()) if isinstance(item0, dict) else str(item0)[:200]}")
+                print(f"    smartrr debug: {dbk}[0] FULL = {json.dumps(item0, default=str)[:800]}")
                 if isinstance(item0, dict):
                     vnt0 = item0.get("vnt")
-                    if isinstance(vnt0, dict):
-                        print(f"    smartrr debug: {dbk}[0].vnt keys = {list(vnt0.keys())[:30]}")
-                        print(f"    smartrr debug: {dbk}[0].vnt sample = { {k: str(vnt0[k])[:60] for k in list(vnt0.keys())[:12]} }")
-                    print(f"    smartrr debug: {dbk}[0] currentSku={item0.get('currentSku')} basePrice={item0.get('basePrice')} quantity={item0.get('quantity')}")
+                    print(f"    smartrr debug: {dbk}[0].vnt type={type(vnt0).__name__} value={json.dumps(vnt0, default=str)[:400] if vnt0 else 'NULL'}")
+        # Also dump the first state's top-level for name fields
+        print(f"    smartrr debug: first state FULL (no stLineItems) = {json.dumps({k:v for k,v in first.items() if k not in ('stLineItems','lineItems','orderLineItems','items','orders','discounts')}, default=str)[:600]}")
 
     def _extract_product_name_from_st_line(st_line):
         # Direct top-level name fields
@@ -1272,6 +1271,8 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
     def _get_products_from_state(sub):
         results = []
         st_lines = sub.get("stLineItems") or sub.get("lineItems") or sub.get("orderLineItems") or []
+        # Fallback name from parent state (plan title, subscription title, etc.)
+        parent_name = _smartrr_plan_text(sub)
 
         for st_line in (st_lines if isinstance(st_lines, list) else []):
             if not isinstance(st_line, dict):
@@ -1279,6 +1280,9 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             if st_line.get("deletedAt") or st_line.get("deleted_at"):
                 continue
             prod = _extract_product_name_from_st_line(st_line)
+            # If no name from line item fields, use parent state name
+            if not prod or not re.search(r"[A-Za-z]", prod):
+                prod = parent_name
             if not prod or not re.search(r"[A-Za-z]", prod):
                 continue
             sku = _extract_sku_from_st_line(st_line)
@@ -1292,26 +1296,28 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
                     continue
                 prod = _line_product(line)
                 if not prod or prod == "Unknown Product" or not re.search(r"[A-Za-z]", prod):
+                    prod = parent_name
+                if not prod or not re.search(r"[A-Za-z]", prod):
                     continue
                 sku = _line_sku(line)
                 qty = _line_quantity(line)
                 price = _line_revenue(line, qty)
                 results.append((prod, sku, qty, price))
 
-        if not results:
-            prod = _smartrr_plan_text(sub)
-            if prod and re.search(r"[A-Za-z]", prod):
-                results.append((prod, "?", 1, 0.0))
+        # Final fallback: use parent plan name directly with qty=1
+        if not results and parent_name and re.search(r"[A-Za-z]", parent_name):
+            results.append((parent_name, "?", 1, 0.0))
 
         return results
 
     active_total = {}
     paused_total = {}
+    cancelled_total = {}
     no_product_count = 0
 
     for sub in active_states:
         state_group = _smartrr_status_group(sub)
-        if state_group not in ("active", "paused"):
+        if state_group not in ("active", "paused", "inactive"):
             continue
 
         products = _get_products_from_state(sub)
@@ -1324,12 +1330,15 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
             key = (prod, sku)
             if state_group == "active":
                 active_total[key] = active_total.get(key, 0) + qty
-            else:
+            elif state_group == "paused":
                 paused_total[key] = paused_total.get(key, 0) + qty
+            else:
+                cancelled_total[key] = cancelled_total.get(key, 0) + qty
 
     total_active_global = sum(active_total.values())
     total_paused_global = sum(paused_total.values())
-    print(f"    FASE 1 ? Totales globales: active={total_active_global} paused={total_paused_global} sin_producto={no_product_count}")
+    total_cancelled_global = sum(cancelled_total.values())
+    print(f"    FASE 1 — Totales globales: active={total_active_global} paused={total_paused_global} cancelled={total_cancelled_global} sin_producto={no_product_count}")
 
     new_items = []
     skipped_no_date = 0
@@ -1424,38 +1433,43 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
         ):
             active_to_date = active_total.get((prod, sku), 0)
             paused_to_date = paused_total.get((prod, sku), 0)
+            cancelled_to_date = cancelled_total.get((prod, sku), 0)
             new_count = new_buckets.get((prod, sku), {}).get("new", 0)
             gross = new_buckets.get((prod, sku), {}).get("gross", 0.0)
             ids = new_buckets.get((prod, sku), {}).get("ids") or []
 
-            if active_to_date <= 0 and paused_to_date <= 0 and new_count <= 0:
+            if active_to_date <= 0 and paused_to_date <= 0 and cancelled_to_date <= 0 and new_count <= 0:
                 continue
 
             rows.append([
                 now_str, brand_name, pk, ps, pe,
                 prod, sku,
                 new_count, new_count,
-                active_to_date, paused_to_date,
+                active_to_date, paused_to_date, cancelled_to_date,
                 round(gross, 2),
-                "Smartrr purchase-state ACTIVE+PAUSED ? Fase1=totales globales Fase2=nuevos periodo",
+                "Smartrr purchase-state ACTIVE+PAUSED+CANCELLED — Fase1=totales globales Fase2=nuevos periodo",
                 "State createdAt / Order Line Item Created Date",
-                "purchaseStateStatus=ACTIVE/PAUSED; cancelled/deleted excluded",
+                "purchaseStateStatus=ACTIVE/PAUSED/CANCELLED",
                 "; ".join(ids),
             ])
 
-    print(f"    smartrr_product_volume FINAL: {len(new_items)} items de fecha ? {len(rows)} filas ? skipped_sin_fecha={skipped_no_date}")
+    print(f"    smartrr_product_volume FINAL: {len(new_items)} items de fecha — {len(rows)} filas — skipped_sin_fecha={skipped_no_date}")
 
     # Build normalized-key dicts so merge can match even when product names differ slightly
     active_norm = {}
     paused_norm = {}
+    cancelled_norm = {}
     for (prod, sku), qty in active_total.items():
         nk = _product_match_key(prod)
         active_norm[nk] = active_norm.get(nk, 0) + qty
     for (prod, sku), qty in paused_total.items():
         nk = _product_match_key(prod)
         paused_norm[nk] = paused_norm.get(nk, 0) + qty
+    for (prod, sku), qty in cancelled_total.items():
+        nk = _product_match_key(prod)
+        cancelled_norm[nk] = cancelled_norm.get(nk, 0) + qty
 
-    return rows, active_norm, paused_norm
+    return rows, active_norm, paused_norm, cancelled_norm
 
 
 # SMARTRR fallback — period product rows from Shopify order line_items
@@ -1563,8 +1577,8 @@ def _is_blank_number(v):
 def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None, paused_norm=None):
     """
     Prefer period rows from Shopify orders for New Subscribers, because this matches
-    the selected Week / MTD / Month / Quarter range. Enrich with Smartrr ACTIVE and
-    PAUSED totals-to-date when Smartrr exposes usable product line data.
+    the selected Week / MTD / Month / Quarter range. Enrich with Smartrr ACTIVE,
+    PAUSED and CANCELLED totals-to-date when Smartrr exposes usable product line data.
 
     active_norm / paused_norm: global totals keyed by _product_match_key(product).
     These are injected into ALL rows (including fallback) so the dashboard always
@@ -1582,13 +1596,14 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
     IDX_SKU = 6
     IDX_TOTAL_QTY = 7
     IDX_NEW = 8
-    IDX_ACTIVE = 9   # active_subscribers_current
-    IDX_PAUSED = 10  # paused_subscribers_current
-    IDX_GROSS = 11
-    IDX_SOURCE = 12
-    IDX_DATE_BASIS = 13
-    IDX_FILTER = 14
-    IDX_SAMPLE = 15
+    IDX_ACTIVE = 9    # active_subscribers_current
+    IDX_PAUSED = 10   # paused_subscribers_current
+    IDX_CANCELLED = 11  # cancelled_subscribers_current  ← NEW
+    IDX_GROSS = 12
+    IDX_SOURCE = 13
+    IDX_DATE_BASIS = 14
+    IDX_FILTER = 15
+    IDX_SAMPLE = 16
 
     active_exact = {}
     active_product = {}
@@ -1597,7 +1612,6 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
             exact_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
             active_exact[exact_key] = r
             loose_key = (str(r[IDX_PERIOD]), _product_match_key(r[IDX_PRODUCT]))
-            # Keep the row with the largest active+paused total for the product.
             prev = active_product.get(loose_key)
             r_total = _to_number(r[IDX_ACTIVE], 0) + _to_number(r[IDX_PAUSED], 0)
             p_total = (_to_number(prev[IDX_ACTIVE], 0) + _to_number(prev[IDX_PAUSED], 0)) if prev else -1
@@ -1620,31 +1634,29 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
 
             if a:
                 used_active.add((str(a[IDX_PERIOD]), str(a[IDX_PRODUCT]), str(a[IDX_SKU])))
-                # Keep exact period new/gross from Shopify/Smartrr period rows,
-                # but use ACTIVE and PAUSED total-to-date from Smartrr when available.
                 if len(a) > IDX_ACTIVE and not _is_blank_number(a[IDX_ACTIVE]):
                     row[IDX_ACTIVE] = a[IDX_ACTIVE]
                 if len(a) > IDX_PAUSED and not _is_blank_number(a[IDX_PAUSED]):
                     row[IDX_PAUSED] = a[IDX_PAUSED]
+                if len(a) > IDX_CANCELLED and not _is_blank_number(a[IDX_CANCELLED]):
+                    row[IDX_CANCELLED] = a[IDX_CANCELLED]
                 if len(a) > IDX_FILTER and a[IDX_FILTER] not in (None, ""):
                     row[IDX_FILTER] = a[IDX_FILTER]
                 if len(a) > IDX_SAMPLE and a[IDX_SAMPLE] not in (None, ""):
                     row[IDX_SAMPLE] = a[IDX_SAMPLE]
-                row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED totals + period product rows"
+                row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED/CANCELLED totals + period product rows"
                 row[IDX_DATE_BASIS] = "Order Line Item Created Date / Shopify processed date fallback"
 
-            # Never infer "current active" from selected-period NEW rows.
-            # If Smartrr active totals are unavailable for this fallback row, keep 0
-            # so the dashboard does not confuse MTD new subscribers with current totals.
             if len(row) > IDX_ACTIVE and _is_blank_number(row[IDX_ACTIVE]):
                 row[IDX_ACTIVE] = 0
             if len(row) > IDX_PAUSED and _is_blank_number(row[IDX_PAUSED]):
                 row[IDX_PAUSED] = 0
+            if len(row) > IDX_CANCELLED and _is_blank_number(row[IDX_CANCELLED]):
+                row[IDX_CANCELLED] = 0
             merged.append(row)
         except Exception:
             merged.append(r)
 
-    # Add active/paused products with 0 new subscribers in this period, so every subscribed product can still show.
     for r in active_rows:
         try:
             active_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
@@ -1660,14 +1672,14 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
                     row[IDX_ACTIVE] = 0
                 if _is_blank_number(row[IDX_PAUSED]):
                     row[IDX_PAUSED] = 0
+                if _is_blank_number(row[IDX_CANCELLED]):
+                    row[IDX_CANCELLED] = 0
                 merged.append(row)
         except Exception:
             merged.append(r)
 
-    # ── Phase 3: inject global Smartrr totals into ALL rows that still have
-    #    blank or fallback-derived active/paused counts.  This ensures the
-    #    "Current Totals" product cards always show real data even when the
-    #    Shopify order fallback was used for new-subscriber counts.
+    # Phase 3: inject global Smartrr totals into ALL rows that still have
+    # blank or fallback-derived active/paused counts.
     if active_norm or paused_norm:
         for row in merged:
             try:
@@ -1675,12 +1687,11 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
                 src = str(row[IDX_SOURCE] if len(row) > IDX_SOURCE else "").lower()
                 is_fallback = "fallback" in src and "active/paused" not in src
                 a_real = active_norm.get(nk)
-                p_real = paused_norm.get(nk, 0)
+                p_real = paused_norm.get(nk, 0) if paused_norm else 0
                 if a_real is not None and (_is_blank_number(row[IDX_ACTIVE]) or is_fallback):
                     row[IDX_ACTIVE] = a_real
                     row[IDX_PAUSED] = p_real
-                    # Remove "fallback" stigma so dashboard JS accepts the totals
-                    row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED totals + period product rows"
+                    row[IDX_SOURCE] = "Smartrr ACTIVE/PAUSED/CANCELLED totals + period product rows"
                     row[IDX_DATE_BASIS] = "State createdAt / Order Line Item Created Date"
             except Exception:
                 pass
@@ -2027,7 +2038,7 @@ def main():
             # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
             active_states = fetch_smartrr_active_purchase_states(brand_name)
             period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
-            active_rows, active_norm, paused_norm = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
+            active_rows, active_norm, paused_norm, cancelled_norm = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs)
             smartrr_rows = merge_smartrr_product_volume_rows(smartrr_order_rows, active_rows, active_norm, paused_norm)
             write_smartrr_product_volume(gc, cfg["sheet_id"], smartrr_rows, [p[0] for p in period_defs])
 
