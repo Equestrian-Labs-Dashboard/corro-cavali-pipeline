@@ -806,36 +806,53 @@ def _smartrr_status(subscription):
 
 
 def _smartrr_status_group(subscription):
-    """Return active / paused / inactive for Smartrr purchase states."""
+    """Return active / paused / inactive for Smartrr purchase states.
+
+    Priority order:
+    1. Explicit cancelled/deleted markers → inactive (regardless of hint)
+    2. Explicit paused markers or status → paused
+    3. Hint (set from the API filter used) when status field is empty/missing
+    4. Explicit active status → active
+    5. Empty status with no hint → active (fallback, rare)
+    """
     status = _smartrr_status(subscription)
     hint = str(subscription.get("_smartrr_status_hint", "") if isinstance(subscription, dict) else "").strip().lower()
-    if not status and hint:
-        status = hint
 
+    # 1 — Hard cancelled/deleted signals always win (even if hint says active/paused)
     cancelled = (
         _dig(subscription, "cancelledAt") or _dig(subscription, "cancelled_at") or
-        _dig(subscription, "deletedAt") or _dig(subscription, "deleted_at")
+        _dig(subscription, "deletedAt")   or _dig(subscription, "deleted_at")
     )
     if cancelled or status in ("cancelled", "canceled", "inactive", "expired", "deleted"):
         return "inactive"
 
+    # 2 — Explicit paused fields
     paused_marker = (
-        _dig(subscription, "pausedAt") or _dig(subscription, "paused_at") or
-        _dig(subscription, "pauseStartedAt") or _dig(subscription, "pause_started_at") or
-        _dig(subscription, "pausedUntil") or _dig(subscription, "paused_until")
+        _dig(subscription, "pausedAt")        or _dig(subscription, "paused_at") or
+        _dig(subscription, "pauseStartedAt")  or _dig(subscription, "pause_started_at") or
+        _dig(subscription, "pausedUntil")     or _dig(subscription, "paused_until")
     )
     if paused_marker or status in ("paused", "pause", "pausing", "suspended"):
         return "paused"
 
-    if status in ("", "active", "activated"):
+    # 3 — When the status field returned nothing, trust the API filter hint.
+    #     (Smartrr sometimes omits purchaseStateStatus in the payload body even
+    #      though we filtered by it — the hint carries the requested_status value.)
+    if not status and hint:
+        if hint in ("paused", "pause", "pausing", "suspended"):
+            return "paused"
+        if hint in ("active", "activated"):
+            return "active"
+
+    # 4 — Explicit active
+    if status in ("active", "activated"):
         return "active"
 
-    # Some Smartrr payloads omit status fields even when the endpoint is filtered.
-    if hint in ("active", "activated"):
+    # 5 — Empty status, no hint → default active (was already the behaviour)
+    if status == "":
         return "active"
-    if hint in ("paused", "pause"):
-        return "paused"
 
+    # Any other unrecognised value → inactive
     return "inactive"
 
 
@@ -1084,7 +1101,15 @@ def fetch_smartrr_active_purchase_states(brand_name):
 
     active_count = sum(1 for s in states if _smartrr_status_group(s) == "active")
     paused_count = sum(1 for s in states if _smartrr_status_group(s) == "paused")
-    print(f"    smartrr active+paused purchase states fetched: active={active_count} paused={paused_count} total={len(states)}")
+    inactive_count = sum(1 for s in states if _smartrr_status_group(s) == "inactive")
+    paused_no_status = sum(
+        1 for s in states
+        if str(s.get("_smartrr_status_hint","")).strip().lower() == "paused"
+        and not _smartrr_status(s)
+    )
+    print(f"    smartrr active+paused purchase states fetched: active={active_count} paused={paused_count} inactive_filtered={inactive_count} total={len(states)}")
+    if paused_no_status:
+        print(f"    ⚠ smartrr: {paused_no_status} PAUSED records had empty purchaseStateStatus — classified via API filter hint")
     return states
 
 
