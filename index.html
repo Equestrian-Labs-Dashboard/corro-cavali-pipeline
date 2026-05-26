@@ -482,8 +482,9 @@ function filterRowsForCurrentPeriod(rows, opt) {
   const stN = normDate(st);
   const enN = normDate(en);
   return (rows || []).filter(r => {
-    const rb = String(r.brand || "cavali").toLowerCase();
-    if (rb && rb !== "cavali") return false;
+    const rb = String(r.brand || brand || "").toLowerCase();
+    const targetBrand = String(brand || "").toLowerCase();
+    if (targetBrand && rb && rb !== targetBrand) return false;
     if (!keys.includes(String(r.period || "").trim())) return false;
     const rs = normDate(r.period_start);
     const re = normDate(r.period_end);
@@ -534,12 +535,17 @@ function mtdRange(y, month1, dayLimit) {
 }
 function exactRow(rows, pk, start, end) {
   if (!rows?.length) return null;
-  const st = String(start || "").trim(), en = String(end || "").trim();
-  let m = rows.filter(r => (r.period || "").trim() === pk && (r.period_start || "").trim() === st && (r.period_end || "").trim() === en);
+  const normDate = (v) => {
+    const s = String(v || "").trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : s;
+  };
+  const st = normDate(start), en = normDate(end);
+  let m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_start) === st && normDate(r.period_end) === en);
   if (m.length) return bestRow(m);
-  m = rows.filter(r => (r.period || "").trim() === pk && (r.period_end || "").trim() === en);
+  m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_end) === en);
   if (m.length) return bestRow(m);
-  m = rows.filter(r => (r.period_start || "").trim() === st && (r.period_end || "").trim() === en && String(r.period || "").startsWith("mtd_"));
+  m = rows.filter(r => normDate(r.period_start) === st && normDate(r.period_end) === en && String(r.period || "").startsWith("mtd_"));
   return m.length ? bestRow(m) : null;
 }
 function isFullMonthOpt(opt) {
@@ -1192,10 +1198,10 @@ async function renderSubs() {
   let totalCancelled = null;
   let globalActiveKnown = activeKnown;
   let globalPausedKnown = pausedKnown;
-  const subSnap = bestRow((allSubscriberRows || []).filter(r => String(r.brand || "cavali").toLowerCase() === "cavali"));
+  const subSnap = bestRow((allSubscriberRows || []).filter(r => String(r.brand || brand || "").toLowerCase() === String(brand || "").toLowerCase()));
   if (subSnap) {
-    const snapActive = firstNumber([subSnap.active_subscribers, subSnap.active, subSnap.current_active]);
-    const snapPaused = firstNumber([subSnap.paused_subscribers, subSnap.paused, subSnap.current_paused]);
+    const snapActive = firstNumber([subSnap.active_subscribers_current, subSnap.active_subscribers, subSnap.active, subSnap.current_active, subSnap.active_subscriptions]);
+    const snapPaused = firstNumber([subSnap.paused_subscribers_current, subSnap.paused_subscribers, subSnap.paused, subSnap.current_paused, subSnap.paused_subscriptions]);
     const snapCancelled = firstNumber([subSnap.cancelled_subscriptions, subSnap.canceled_subscriptions, subSnap.cancelled, subSnap.canceled]);
     const snapTotal = firstNumber([subSnap.total_subscriptions_to_date, subSnap.total_subscriptions, subSnap.total_subscribers, subSnap.new_subscriptions]);
     if (snapActive !== null) { totalActive = _num(snapActive); globalActiveKnown = true; }
@@ -1219,7 +1225,7 @@ async function renderSubs() {
     const snapTotal = firstNumber([subSnap.total_subscriptions_to_date, subSnap.total_subscriptions, subSnap.total_subscribers, subSnap.new_subscriptions]);
     if (snapTotal !== null) totalToDateSummary = _num(snapTotal);
   }
-  if ((totalCancelled === null || totalCancelled === undefined) && totalToDateSummary > 0 && totalActive >= 0 && totalPaused >= 0) {
+  if ((totalCancelled === null || totalCancelled === undefined) && globalActiveKnown && globalPausedKnown && totalToDateSummary > 0 && totalActive >= 0 && totalPaused >= 0) {
     totalCancelled = Math.max(0, totalToDateSummary - totalActive - totalPaused);
   }
   const totalGross = sorted.reduce((a,r)=>a + _num(r.gross_revenue), 0);
