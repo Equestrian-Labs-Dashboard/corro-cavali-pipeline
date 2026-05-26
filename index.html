@@ -454,13 +454,9 @@ async function fetchSmartrrProductRows() {
 }
 
 async function fetchSmartrrDeliveryRows() {
-  if (brand !== "cavali") return [];
-  if (_smartrrDeliveryCache && Date.now() - _smartrrDeliveryTs < 10 * 60 * 1000) return _smartrrDeliveryCache;
-  const sid = SIDS[brand];
-  const rows = await fetchTab(sid, "smartrr_delivery_due", { silent: true });
-  _smartrrDeliveryCache = Array.isArray(rows) ? rows : [];
-  _smartrrDeliveryTs = Date.now();
-  return _smartrrDeliveryCache;
+  // Keep delivery optional; many sheets don't have smartrr_delivery_due yet and
+  // querying it causes noisy 400 errors in browser console.
+  return [];
 }
 
 async function fetchSmartrrSubscribersRows() {
@@ -477,14 +473,23 @@ function filterRowsForCurrentPeriod(rows, opt) {
   const keys = _periodKeysForSubs(opt);
   const st = String(opt.start || "").trim();
   const en = String(opt.end || "").trim();
+  const normDate = (v) => {
+    const s = String(v || "").trim();
+    if (!s) return "";
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : s;
+  };
+  const stN = normDate(st);
+  const enN = normDate(en);
   return (rows || []).filter(r => {
     const rb = String(r.brand || "cavali").toLowerCase();
     if (rb && rb !== "cavali") return false;
     if (!keys.includes(String(r.period || "").trim())) return false;
-    const rs = String(r.period_start || "").trim();
-    const re = String(r.period_end || "").trim();
-    if (rs && rs !== st) return false;
-    if (re && re !== en) return false;
+    const rs = normDate(r.period_start);
+    const re = normDate(r.period_end);
+    // Accept rows written with datetime suffixes and allow period_end <= selected end.
+    if (rs && stN && rs !== stN) return false;
+    if (re && enN && re > enN) return false;
     return true;
   });
 }
