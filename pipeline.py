@@ -1413,7 +1413,7 @@ def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period
     print(f"    FASE 2 ? Line items con fecha: {len(new_items)} items ? sin_fecha={skipped_no_date}")
 
     rows = []
-    all_keys = set(active_total.keys()) | set(paused_total.keys())
+    all_keys = set(active_total.keys()) | set(paused_total.keys()) | set(cancelled_total.keys())
 
     for pk, ps, pe, ds, de in period_ranges:
         new_buckets = {}
@@ -1561,16 +1561,43 @@ def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start,
     if rows:
         print(f"    smartrr_product_volume fallback rows from Shopify orders for {period}: {len(rows)}")
         for r in rows[:6]:
-            print(f"      fallback product row: {r[5]} · sku={r[6]} · new={r[8]} · active_min={r[9]} · paused={r[10]} · gross={r[11]}")
+            print(f"      fallback product row: {r[5]} · sku={r[6]} · new={r[8]} · active_min={r[9]} · paused={r[10]} · gross={r[12]}")
     return rows
 
 
 
 def _product_match_key(product):
-    """Loose match key so 'The Premier Box' and 'The Premier Box Subscription' merge."""
-    p = str(product or "").lower()
-    p = p.replace("subscription", "")
-    p = p.replace("default title", "")
+    """Loose match key so Smartrr and Shopify product labels merge reliably.
+
+    Examples:
+      - "The Premier Box Subscription" -> "premierbox"
+      - "THE SIGNATURE BOX / Quarterly" -> "signaturebox"
+      - "Cavali Club Membership - Annual" -> "cavaliclubmembership"
+    """
+    raw = str(product or "").lower()
+    if "signature" in raw:
+        return "signaturebox"
+    if "premier" in raw:
+        return "premierbox"
+    if "junior" in raw and "membership" in raw:
+        return "cavaliclubjuniormembership"
+    if "cavali club" in raw and "membership" in raw:
+        return "cavaliclubmembership"
+    if "welcome" in raw and "box" in raw:
+        return "welcomebox"
+    if "sona" in raw and "bundle" in raw:
+        return "sonabundle"
+    if "cheese" in raw and "kniv" in raw:
+        return "cavaliclubcheeseknives"
+    if "kriste" in raw or "training course" in raw:
+        return "kristekehoetrainingcourse"
+    if "fly spray" in raw:
+        return "stopbuggnflyspray16oz"
+    if "spicy pony" in raw or "candle" in raw:
+        return "stablestylespicyponycandle"
+    p = raw
+    for word in ("subscription", "default title", "quarterly", "monthly", "annual", "yearly"):
+        p = p.replace(word, "")
     p = re.sub(r"[^a-z0-9]+", "", p)
     return p
 
