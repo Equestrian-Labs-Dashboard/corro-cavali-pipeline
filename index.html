@@ -1137,9 +1137,9 @@ async function renderSubs() {
   ]);
   const hasSmartrrCurrentTotals = (r) => {
     const src = String(r.source || "").toLowerCase();
-    const hasSourceFlag = src.includes("active/paused") || src.includes("smartrr active");
-    const isFallback = src.includes("fallback");
-    return hasSourceFlag && !isFallback;
+    const isPlainFallback = src.includes("fallback") && !src.includes("active/paused") && !src.includes("cancelled");
+    if (isPlainFallback) return false;
+    return activeOf(r) !== null || pausedOf(r) !== null || totalOf(r) !== null;
   };
   const dueOf = (r) => firstNumber([r.clients_due_to_receive, r.clients_to_receive, r.delivery_due]);
   const showCount = (v) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toLocaleString();
@@ -1253,12 +1253,12 @@ async function renderSubs() {
       <div class="kc-sub sm-sub-small">
         <div class="kc-bar"></div>
         <div class="kc-lbl" style="color:${col}">${product}</div>
-        <div class="sub-mini-label">Current totals</div>
+        <div class="sub-mini-label">Current active subscribers</div>
         <div class="sub-total-box-row">
-          <div class="sub-total-box"><div class="sub-total-lbl">Current<br>total</div><div class="sub-total-val total">${showCount(totalVal)}</div></div>
-          <div class="sub-total-box"><div class="sub-total-lbl">Paused in<br>period</div><div class="sub-total-val paused">${showCount(r.paused_subscribers_in_period)}</div></div>
+          <div class="sub-total-box"><div class="sub-total-lbl">Current<br>active</div><div class="sub-total-val active">${showCount(r.active_subscribers_to_date)}</div></div>
+          <div class="sub-total-box"><div class="sub-total-lbl">Current<br>paused</div><div class="sub-total-val paused">${showCount(r.paused_subscribers_to_date)}</div></div>
         </div>
-        <div class="kc-note">Current active: ${showCount(r.active_subscribers_to_date)} · Current paused: ${showCount(r.paused_subscribers_to_date)}</div>
+        <div class="kc-note">Current total: ${showCount(totalVal)} · Paused in period: ${showCount(r.paused_subscribers_in_period)}</div>
       </div>`;
   }).join('');
 
@@ -1284,7 +1284,7 @@ async function renderSubs() {
     <div class="smartrr-subtitle">New subscribers by product (full name)</div>
     <div class="smartrr-product-grid">${newCards}</div>
 
-    <div class="smartrr-subtitle">Current subscriber totals and paused in selected range by product (full name)</div>
+    <div class="smartrr-subtitle">Current active subscribers by product (full name)</div>
     <div class="sub-total-grid">${totalCards}</div>
 
     `;
