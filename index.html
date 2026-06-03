@@ -1923,8 +1923,8 @@ setBrand("cavali");
   const AUTH = {
     // Deploy apps_script_login_proxy_v64.gs and paste the Web App URL here.
     appsScriptUrl: "https://script.google.com/macros/s/AKfycbwQhJqcncm1edIm8g_31PGerxiyOeYBJ59mFKeBimvR6Eb3u1-SznjigCGjZN5YDrf-/exec",
-    // Optional fallback only works if the registry sheet is published to the web.
-    csvUrl: "https://docs.google.com/spreadsheets/d/1j2bwwk8u0IS4_JpAej0hleIrXyGmbfRy6F4WmaqvtdU/export?format=csv&gid=201110324",
+    // Google Sheet is private. The dashboard must validate ONLY through Apps Script.
+    // Do not call docs.google.com/spreadsheets directly from the browser.
     storageKey: "corro_dashboard_auth_v2"
   };
 
@@ -2010,20 +2010,16 @@ setBrand("cavali");
       s.onerror=()=>{delete window[cb];s.remove();reject(new Error("Apps Script auth request failed"));};
       s.src=AUTH.appsScriptUrl+sep+"email="+encodeURIComponent(email)+"&callback="+encodeURIComponent(cb);
       document.head.appendChild(s);
-      setTimeout(()=>{if(window[cb]){delete window[cb];s.remove();reject(new Error("Apps Script auth timeout"));}},12000);
+      setTimeout(()=>{if(window[cb]){delete window[cb];s.remove();reject(new Error("Apps Script auth timeout"));}},30000);
     });
   }
-  async function csvAuth(email){
-    const res=await fetch(AUTH.csvUrl+"&cacheBust="+Date.now(),{cache:"no-store"});
-    if(!res.ok) throw new Error("Could not read User Access Registry CSV");
-    const users=rowsToUsers(parseCsv(await res.text()));
-    const u=users.find(x=>x.email===email);
-    if(!u) return {ok:false,error:"Email is not registered."};
-    if(u.access.tokens.includes("blocked")) return {ok:false,error:"Access is disabled for this email."};
-    return {ok:true,user:u.name||email,email:u.email,accessRaw:u.accessRaw,access:u.access.tokens,comments:u.comments};
-  }
   async function validate(email){
-    try{return await jsonpAuth(email);}catch(e){return await csvAuth(email);}
+    try{
+      return await jsonpAuth(email);
+    }catch(e){
+      console.warn("Apps Script login request failed:", e);
+      return {ok:false,error:"Could not reach login service. Please refresh and try again."};
+    }
   }
 
   function classifyNavElement(el){
