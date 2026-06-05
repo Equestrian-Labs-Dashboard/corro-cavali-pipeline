@@ -768,26 +768,10 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
         await __sleep(800 * (attempt + 1));
       }
     }
-    // Fallback: load each tab individually. This avoids losing all data if batchGet rejects one range.
-    for (const tab of need) {
-      try {
-        const oneUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
-        const one = await fetch(oneUrl, { cache: "no-store" });
-        if (one.ok) {
-          const jd = await one.json();
-          const rows = __rowsToObjects(jd.values || []);
-          cache[`${sid}__${tab}`] = rows;
-          __saveTabLocal(sid, tab, rows);
-          out[tab] = rows;
-          continue;
-        }
-        if (!opts.silent) console.warn(`Sheets tab ${tab} HTTP ${one.status}`);
-      } catch(e) {
-        if (!opts.silent) console.warn(`Sheets tab ${tab} fetch failed`, e);
-      }
+    need.forEach(tab => {
       __tabError[`${sid}__${tab}`] = 'Sheets API limit, missing tab, or network error';
       out[tab] = cache[`${sid}__${tab}`] || __loadTabLocal(sid, tab, 24 * 60 * 60 * 1000) || [];
-    }
+    });
     return out;
   })();
 
@@ -1654,7 +1638,7 @@ async function fetchMarketingRows(force=false){
   const tab = encodeURIComponent(MARKETING_SHEET_TAB);
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${tab}?key=${AKEY}`;
   const r = await fetch(url,{cache:"no-store"});
-  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}. If this remains, share Total Shopify sheet as viewer or proxy it through Apps Script.`);
+  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}. Remove API cacheBust fixed; if this remains, share Total Shopify sheet as viewer or proxy it through Apps Script.`);
   const d = await r.json();
   __marketingRowsCache = __rowsToObjects(d.values||[]);
   return __marketingRowsCache;
@@ -1671,7 +1655,10 @@ function _mkMonthKey(row){
     const monthName=m[1].toLowerCase();
     const idx=MN.findIndex(x=>x.toLowerCase().startsWith(monthName.slice(0,3)));
     let y=parseInt(m[2],10);
-    if(y<100) y=2000+y;
+    // Source labels use January-5, February-6, etc. to mean 2025/2026.
+    // Do not convert January-5 into 2005.
+    if(y<10) y=2020+y;
+    else if(y<100) y=2000+y;
     if(idx>=0) return `${y}-${String(idx+1).padStart(2,'0')}`;
   }
   const d=new Date(raw+'T12:00');
@@ -1696,17 +1683,30 @@ function _mkOverlapDays(a1,a2,b1,b2){
 function calcMarketingFromTotalShopify(rows,opt){
   const byMonth={};
   (rows||[]).forEach(r=>{ const k=_mkMonthKey(r); if(k) byMonth[k]=r; });
+
+  let months=[];
+  if(ptype==="quarter"){
+    const startY=parseInt(opt.start.slice(0,4),10), startM=parseInt(opt.start.slice(5,7),10);
+    const endY=parseInt(opt.end.slice(0,4),10), endM=parseInt(opt.end.slice(5,7),10);
+    let y=startY, m=startM;
+    while(y<endY || (y===endY && m<=endM)){
+      months.push(`${y}-${String(m).padStart(2,'0')}`);
+      m++; if(m>12){m=1;y++;}
+    }
+  }else{
+    // Month / MTD reads the exact month row from Total Shopify.
+    // The source sheet already stores the correct MTD/month value, so do not prorate by days.
+    months=[opt.start.slice(0,7)];
+  }
+
   let spend=0, orders=0, sales=0, matched=[];
-  Object.entries(byMonth).forEach(([ym,r])=>{
-    const md=_mkMonthDays(ym);
-    const ps=`${ym}-01`, pe=`${ym}-${String(md).padStart(2,'0')}`;
-    const od=_mkOverlapDays(opt.start,opt.end,ps,pe);
-    if(od<=0) return;
-    const factor=od/md;
-    spend += _mkMetric(r,["Spend","Ad Spend","Google+Meta Spend","Google + META Spend"]) * factor;
-    orders += _mkMetric(r,["Orders","Transactions"]) * factor;
-    sales += _mkMetric(r,["Total Sales","Sales","Net Sales"]) * factor;
-    matched.push(`${ym}${factor<.999?` (${od}/${md})`:""}`);
+  months.forEach(ym=>{
+    const r=byMonth[ym];
+    if(!r) return;
+    spend += _mkMetric(r,["Spend","Ad Spend","Google+Meta Spend","Google + META Spend"]);
+    orders += _mkMetric(r,["Orders","Transactions"]);
+    sales += _mkMetric(r,["Total Sales","Sales","Net Sales"]);
+    matched.push(ym);
   });
   const roas = spend>0 ? sales/spend : null;
   const cos  = sales>0 ? spend/sales*100 : null;
