@@ -737,7 +737,7 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
 
   __tabInflight[batchKey] = (async () => {
     const ranges = need.map(t => `ranges=${encodeURIComponent(t)}`).join('&');
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}&cacheBust=${Date.now()}`;
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 25000);
@@ -768,10 +768,26 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
         await __sleep(800 * (attempt + 1));
       }
     }
-    need.forEach(tab => {
+    // Fallback: load each tab individually. This avoids losing all data if batchGet rejects one range.
+    for (const tab of need) {
+      try {
+        const oneUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
+        const one = await fetch(oneUrl, { cache: "no-store" });
+        if (one.ok) {
+          const jd = await one.json();
+          const rows = __rowsToObjects(jd.values || []);
+          cache[`${sid}__${tab}`] = rows;
+          __saveTabLocal(sid, tab, rows);
+          out[tab] = rows;
+          continue;
+        }
+        if (!opts.silent) console.warn(`Sheets tab ${tab} HTTP ${one.status}`);
+      } catch(e) {
+        if (!opts.silent) console.warn(`Sheets tab ${tab} fetch failed`, e);
+      }
       __tabError[`${sid}__${tab}`] = 'Sheets API limit, missing tab, or network error';
       out[tab] = cache[`${sid}__${tab}`] || __loadTabLocal(sid, tab, 24 * 60 * 60 * 1000) || [];
-    });
+    }
     return out;
   })();
 
@@ -1636,9 +1652,9 @@ let __marketingRowsCache = null;
 async function fetchMarketingRows(force=false){
   if(__marketingRowsCache && !force) return __marketingRowsCache;
   const tab = encodeURIComponent(MARKETING_SHEET_TAB);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${tab}?key=${AKEY}&cacheBust=${Date.now()}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${tab}?key=${AKEY}`;
   const r = await fetch(url,{cache:"no-store"});
-  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}`);
+  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}. If this remains, share Total Shopify sheet as viewer or proxy it through Apps Script.`);
   const d = await r.json();
   __marketingRowsCache = __rowsToObjects(d.values||[]);
   return __marketingRowsCache;
