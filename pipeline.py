@@ -261,13 +261,37 @@ def fetch_sales(url, token, s, e):
 # FETCH: SESSIONS
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(url, token, s, e):
+    """Traffic block source.
+
+    Required dashboard formulas:
+      - Traffic = sessions
+      - Unique Visitors = new users / unique users when the API returns it
+      - CR% = transactions / sessions
+
+    ShopifyQL stores differ in which traffic columns they expose, so this tries
+    richer queries first and falls back to sessions only. We no longer estimate
+    unique visitors as 85% of sessions.
+    """
     e_ql = _until(e)
-    row  = ql_row(url, token, f"FROM sessions SHOW sessions SINCE {s} UNTIL {e_ql}")
+    candidates = [
+        f"FROM sessions SHOW sessions, new_users SINCE {s} UNTIL {e_ql}",
+        f"FROM sessions SHOW sessions, visitors SINCE {s} UNTIL {e_ql}",
+        f"FROM sessions SHOW sessions, unique_visitors SINCE {s} UNTIL {e_ql}",
+        f"FROM sessions SHOW sessions SINCE {s} UNTIL {e_ql}",
+    ]
+    row = None
+    for q in candidates:
+        row = ql_row(url, token, q)
+        if row:
+            break
     if not row:
-        return 0
-    v = int(abs(_m(row.get("sessions", 0))))
-    print(f"    sessions: {v:,}")
-    return v
+        return {"sessions": 0, "unique_visitors": 0}
+    sessions = int(abs(_m(row.get("sessions", 0))))
+    unique = int(abs(_m(
+        row.get("new_users") or row.get("visitors") or row.get("unique_visitors") or 0
+    )))
+    print(f"    sessions: {sessions:,}  unique/new users: {unique:,}")
+    return {"sessions": sessions, "unique_visitors": unique}
 
 # ─────────────────────────────────────────────────────────────────
 # FETCH: ORDERS FULFILLED
@@ -535,8 +559,14 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
     upo   = round(units / nb, 2) if nb   else 0
     pdisc = round(d / g * 100, 2) if g   else 0
     pret  = round(r / g * 100, 2) if g   else 0
-    sess  = int(sessions or 0)
-    uv    = round(sess * 0.85)    if sess else 0
+    if isinstance(sessions, dict):
+        sess = int(sessions.get("sessions") or 0)
+        uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
+    else:
+        sess = int(sessions or 0)
+        uv   = 0
+    # CR% = Transactions / Sessions. We use fulfilled orders when available,
+    # otherwise Shopify orders, matching the dashboard's transactions proxy.
     cr    = round(nb / sess * 100, 4) if sess else 0
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
