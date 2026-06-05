@@ -428,6 +428,8 @@ const SIDS = {
   cavali: "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig",
 };
 const AKEY = "AIzaSyD8oIf_TyxchEkU_MpKJXngrjrMVyV81oY";
+const MARKETING_SHEET_ID = "1ROTaII-_S_0VntYvOZj8GFCoUnkQVcr1rPES0p-14mI";
+const MARKETING_SHEET_TAB = "Total Shopify";
 
 const CAVALI_RENAME = {
   "Others":           "Subscriptions",
@@ -726,8 +728,8 @@ async function __sleep(ms) { return new Promise(resolve => setTimeout(resolve, m
 
 async function fetchTabsBatch(sid, tabs, opts = {}) {
   const uniqueTabs = [...new Set((tabs || []).filter(Boolean))];
-  const out = Object.fromEntries(uniqueTabs.map(t => [t, cache[`${sid}__${t}`] || __loadTabLocal(sid, t) || []]));
-  const need = uniqueTabs.filter(t => !cache[`${sid}__${t}`]);
+  const out = Object.fromEntries(uniqueTabs.map(t => [t, opts.force ? [] : (cache[`${sid}__${t}`] || __loadTabLocal(sid, t) || [])]));
+  const need = opts.force ? uniqueTabs : uniqueTabs.filter(t => !cache[`${sid}__${t}`]);
   if (!need.length) return out;
 
   const batchKey = `${sid}__batch__${need.join('|')}`;
@@ -735,12 +737,12 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
 
   __tabInflight[batchKey] = (async () => {
     const ranges = need.map(t => `ranges=${encodeURIComponent(t)}`).join('&');
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}`;
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}&cacheBust=${Date.now()}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 25000);
       try {
-        const r = await fetch(url, { signal: controller.signal });
+        const r = await fetch(url, { signal: controller.signal, cache: "no-store" });
         clearTimeout(timer);
         if (r.status === 429) {
           console.warn(`Sheets API 429; retry ${attempt + 1}/3`);
@@ -927,8 +929,8 @@ function resolveGrossProfit(row) {
 const DEFS = {
   web: [
     { k:"sessions",         l:"Sessions",         f:"",  n:"Via ShopifyQL" },
-    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"85% of sessions" },
-    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"Orders ÷ Sessions" },
+    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"New users / unique users when available" },
+    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"Transactions ÷ Sessions" },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
@@ -1624,6 +1626,105 @@ function calcDerived() {
 function safeSet(id, val) { const el=document.getElementById(id); if(el) el.textContent=val; }
 function safeHTML(id, val) { const el=document.getElementById(id); if(el) el.innerHTML=val; }
 
+
+
+/* ══════════════════════════════════════════════════════
+   EXTERNAL MARKETING SHEET — Total Shopify
+   Section 04 uses this sheet for Month/MTD and Quarter only.
+══════════════════════════════════════════════════════ */
+let __marketingRowsCache = null;
+async function fetchMarketingRows(force=false){
+  if(__marketingRowsCache && !force) return __marketingRowsCache;
+  const tab = encodeURIComponent(MARKETING_SHEET_TAB);
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${tab}?key=${AKEY}&cacheBust=${Date.now()}`;
+  const r = await fetch(url,{cache:"no-store"});
+  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}`);
+  const d = await r.json();
+  __marketingRowsCache = __rowsToObjects(d.values||[]);
+  return __marketingRowsCache;
+}
+function _mkNum(v){
+  const s=String(v??"").replace(/[$,%]/g,"").replace(/,/g,"").trim();
+  const n=parseFloat(s); return isNaN(n)?0:n;
+}
+function _mkMonthKey(row){
+  const raw=String(row.Date||row.date||row.Month||row.month||"").trim();
+  if(!raw) return "";
+  const m=raw.match(/^([A-Za-z]+)\s*-\s*(\d{1,4})$/);
+  if(m){
+    const monthName=m[1].toLowerCase();
+    const idx=MN.findIndex(x=>x.toLowerCase().startsWith(monthName.slice(0,3)));
+    let y=parseInt(m[2],10);
+    if(y<100) y=2000+y;
+    if(idx>=0) return `${y}-${String(idx+1).padStart(2,'0')}`;
+  }
+  const d=new Date(raw+'T12:00');
+  if(!isNaN(d)) return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+  return "";
+}
+function _mkMetric(row, names){
+  for(const n of names){ if(row[n]!==undefined && row[n]!=="") return _mkNum(row[n]); }
+  const keys=Object.keys(row||{});
+  for(const n of names){
+    const key=keys.find(k=>k.toLowerCase().replace(/[^a-z0-9]/g,'')===n.toLowerCase().replace(/[^a-z0-9]/g,''));
+    if(key) return _mkNum(row[key]);
+  }
+  return 0;
+}
+function _mkMonthDays(ym){ return new Date(parseInt(ym.slice(0,4)),parseInt(ym.slice(5,7)),0).getDate(); }
+function _mkOverlapDays(a1,a2,b1,b2){
+  const s1=new Date(a1+'T12:00'), e1=new Date(a2+'T12:00'), s2=new Date(b1+'T12:00'), e2=new Date(b2+'T12:00');
+  const st=s1>s2?s1:s2, en=e1<e2?e1:e2;
+  const d=Math.floor((en-st)/86400000)+1; return d>0?d:0;
+}
+function calcMarketingFromTotalShopify(rows,opt){
+  const byMonth={};
+  (rows||[]).forEach(r=>{ const k=_mkMonthKey(r); if(k) byMonth[k]=r; });
+  let spend=0, orders=0, sales=0, matched=[];
+  Object.entries(byMonth).forEach(([ym,r])=>{
+    const md=_mkMonthDays(ym);
+    const ps=`${ym}-01`, pe=`${ym}-${String(md).padStart(2,'0')}`;
+    const od=_mkOverlapDays(opt.start,opt.end,ps,pe);
+    if(od<=0) return;
+    const factor=od/md;
+    spend += _mkMetric(r,["Spend","Ad Spend","Google+Meta Spend","Google + META Spend"]) * factor;
+    orders += _mkMetric(r,["Orders","Transactions"]) * factor;
+    sales += _mkMetric(r,["Total Sales","Sales","Net Sales"]) * factor;
+    matched.push(`${ym}${factor<.999?` (${od}/${md})`:""}`);
+  });
+  const roas = spend>0 ? sales/spend : null;
+  const cos  = sales>0 ? spend/sales*100 : null;
+  const cac  = orders>0 ? spend/orders : null;
+  const aov  = orders>0 ? sales/orders : null;
+  return {spend,orders,sales,roas,cos,cac,aov,matched};
+}
+async function renderMarketingFromTotalShopify(opt, force=false){
+  if(ptype==="week"){
+    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">Month / MTD or Quarter only</div><div class="kc-note">Section 04 uses the Total Shopify monthly sheet, so weekly marketing KPIs are disabled.</div></div>`);
+    renderCAC(0,0,"Total Shopify sheet");
+    return true;
+  }
+  try{
+    const rows=await fetchMarketingRows(force);
+    const m=calcMarketingFromTotalShopify(rows,opt);
+    const note=m.matched.length?`Total Shopify: ${m.matched.join(', ')}`:"No month rows matched selected range";
+    const dc=(l,v,f,c,n)=>`<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div><div class="kc-note">${n||note}</div></div>`;
+    safeHTML("s-mkt",
+      dc("Ad Spend", m.spend>0?m.spend:null, "$", "var(--gd)", note)+
+      dc("ROAS", m.roas, "x", m.roas?"var(--gr)":"var(--bd)", "Total Sales ÷ Spend")+
+      dc("CAC", m.cac, "$", "var(--gd)", "Spend ÷ Orders")+
+      dc("AOV", m.aov, "$", "var(--pu)", "Total Sales ÷ Orders")+
+      dc("COS", m.cos, "%", "var(--am)", "Spend ÷ Total Sales")
+    );
+    renderCAC(m.cac||0,0,"Total Shopify sheet");
+    return true;
+  }catch(e){
+    console.warn("Marketing Total Shopify fetch failed", e);
+    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--rd)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">—</div><div class="kc-note">Could not read Total Shopify sheet.</div></div>`);
+    return true;
+  }
+}
+
 /* ══════════════════════════════════════════════════════
    MAIN RENDER
 ══════════════════════════════════════════════════════ */
@@ -1692,166 +1793,15 @@ async function render() {
   // New vs Returning
   renderNVR(nvrR, row);
 
-  // Marketing KPIs
-  const mo   = (opt.start||"").slice(0,7);
-  const brandAdRows = (adR||[]).filter(r => !r.brand || r.brand === brand);
-
-  function _num(v) {
-    const n = parseFloat(String(v ?? "").replace(/,/g,""));
-    return isNaN(n) ? 0 : n;
-  }
-  function _date(s) { return new Date((s || "") + "T12:00"); }
-  function _daysInclusive(a,b) {
-    try {
-      const x=_date(a), y=_date(b);
-      const d=Math.floor((y-x)/86400000)+1;
-      return d > 0 ? d : 0;
-    } catch(e) { return 0; }
-  }
-  function _monthDays(ym) {
-    try { return new Date(parseInt(ym.slice(0,4)), parseInt(ym.slice(5,7)), 0).getDate(); }
-    catch(e) { return 30; }
-  }
-  function _overlapDays(a1,a2,b1,b2) {
-    try {
-      const s1=_date(a1), e1=_date(a2), s2=_date(b1), e2=_date(b2);
-      const st = s1 > s2 ? s1 : s2;
-      const en = e1 < e2 ? e1 : e2;
-      const d = Math.floor((en-st)/86400000)+1;
-      return d > 0 ? d : 0;
-    } catch(e) { return 0; }
-  }
-  function _latestPositiveSpend(rows) {
-    return (rows||[])
-      .filter(r => _num(r.ad_spend) > 0 && String(r.period||"").match(/^\d{4}-\d{2}$/))
-      .sort((a,b) => String(b.period).localeCompare(String(a.period)))[0] || null;
-  }
-
-  const m = manualData[mKey()]||{};
-  const hasManualSpend = (m.spend||0) > 0;
-  const nsVal          = (m.ns||0) > 0 ? m.ns : (row ? _num(row.net_sales) : 0);
-  const nbVal          = row ? _num(row.nb_orders) : 0;
-  const newCustRow     = row ? _num(row.new_customers) : 0;
-  const periodDays     = _daysInclusive(opt.start, opt.end) || 1;
-
-  // Exact/prorated spend from the ad_spend tab.
-  // - Full month: full month spend.
-  // - Week / MTD / current partial month: prorated by selected days.
-  // - Quarter: sums overlapping monthly spend, prorated for partial months.
-  let sheetSpend = 0;
-  let sheetSpendExact = false;
-  let cacAuto = null;
-  let adF = [];
-
-  if (ptype === "quarter") {
-    adF = brandAdRows.filter(r => String(r.period||"").match(/^\d{4}-\d{2}$/));
-    adF.forEach(r => {
-      const p = String(r.period||"").trim();
-      const ps = `${p}-01`;
-      const pe = `${p}-${String(_monthDays(p)).padStart(2,'0')}`;
-      const od = _overlapDays(opt.start, opt.end, ps, pe);
-      if (od > 0) sheetSpend += _num(r.ad_spend) * (od / _monthDays(p));
-    });
-  } else {
-    adF = brandAdRows.filter(r => String(r.period||"").trim() === mo);
-    const monthSpend = adF.reduce((a,r)=>a+_num(r.ad_spend),0);
-    const mdays = _monthDays(mo);
-    const odays = _overlapDays(opt.start, opt.end, `${mo}-01`, `${mo}-${String(mdays).padStart(2,'0')}`) || periodDays;
-    const fullMonthSelected = odays >= mdays && ptype === "month";
-    sheetSpend = fullMonthSelected ? monthSpend : monthSpend * (odays / mdays);
-    sheetSpendExact = monthSpend > 0 && fullMonthSelected;
-    if (adF.length === 1 && adF[0].cac_auto && adF[0].cac_auto !== "") cacAuto = _num(adF[0].cac_auto);
-  }
-
-  const latestSpendRow = _latestPositiveSpend(brandAdRows);
-  let activeSpend = 0;
-  let spendNote = "";
-  let spendWarn = true;
-  let spendSource = "";
-  let spendIsEstimated = false;
-
-  if (hasManualSpend) {
-    activeSpend = m.spend;
-    spendNote = "Google+Meta manual";
-    spendSource = "Google+Meta";
-    spendWarn = false;
-  } else if (sheetSpend > 0) {
-    activeSpend = sheetSpend;
-    spendNote = sheetSpendExact ? "Sheets spend" : "Sheets spend prorated to selected range";
-    spendSource = sheetSpendExact ? "Sheets" : "Sheets prorated";
-    spendWarn = !sheetSpendExact;
-  } else if (latestSpendRow && _num(latestSpendRow.ad_spend) > 0) {
-    const refMo = String(latestSpendRow.period||"").trim();
-    const daily = _num(latestSpendRow.ad_spend) / _monthDays(refMo);
-    activeSpend = daily * periodDays;
-    spendNote = `Reference estimate from ${refMo} spend`;
-    spendSource = "Reference estimate";
-    spendIsEstimated = true;
-    spendWarn = true;
-  } else if (newCustRow > 0) {
-    activeSpend = DEFAULT_CAC_REF * newCustRow;
-    spendNote = "Reference estimate: CAC $47 × new customers";
-    spendSource = "CAC reference estimate";
-    spendIsEstimated = true;
-    spendWarn = true;
-  } else if (nbVal > 0) {
-    activeSpend = DEFAULT_CAC_REF * nbVal;
-    spendNote = "Reference estimate: CAC $47 × orders";
-    spendSource = "CAC reference estimate";
-    spendIsEstimated = true;
-    spendWarn = true;
-  } else {
-    activeSpend = 0;
-    spendNote = "No spend/new-customer data yet";
-    spendSource = "No source";
-    spendWarn = true;
-  }
-
-  let roasV = (activeSpend > 0 && nsVal > 0) ? nsVal / activeSpend : null;
-  let roasSrc = roasV ? (hasManualSpend ? "Net Sales ÷ G+M spend" : `Net Sales ÷ ${spendSource}`) : "Needs spend or sales";
-
-  const ltvOverride = _num(m.ltv);
-  const ltvForRatio = ltvOverride > 0 ? ltvOverride : DEFAULT_LTV_12M;
-  const manualCac = _num(m.cacOv);
-  let cacActual = null;
-  let cacSrc = "Reference fallback";
-
-  if (manualCac > 0) {
-    cacActual = manualCac;
-    cacSrc = "Manual override";
-  } else if (activeSpend > 0 && newCustRow > 0) {
-    cacActual = activeSpend / newCustRow;
-    cacSrc = `${spendSource} ÷ new customers`;
-  } else if (cacAuto > 0) {
-    cacActual = cacAuto;
-    cacSrc = "Sheets CAC";
-  }
-
-  const cacDisplay = cacActual || DEFAULT_CAC_REF;
-  const ltvCacV = ltvForRatio > 0 && cacDisplay > 0 ? ltvForRatio / cacDisplay : null;
-
-  function mktCard(lbl, val, note, color, warnTxt) {
-    return `<div class="kc"><div class="kc-bar" style="background:${color || 'var(--bd)'}"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${warnTxt ? badgeAmber(warnTxt) : ""}</div>${note ? `<div class="kc-note">${note}</div>` : ""}</div>`;
-  }
-
-  safeHTML("s-mkt",
-    mktCard("Ad Spend", activeSpend > 0 ? fv(activeSpend,"$") : "—", spendNote, "var(--gd)", spendWarn && activeSpend > 0 ? (spendIsEstimated ? "estimated" : "prorated") : "") +
-    mktCard("ROAS", roasV ? fv(roasV,"x") : "—", roasSrc, roasV ? "var(--gr)" : "var(--bd)", spendWarn && roasV ? "estimated" : "") +
-    mktCard("CAC", fv(cacDisplay,"$"), cacSrc, "var(--gd)", cacActual ? "" : "fallback") +
-    mktCard("LTV / CAC", ltvCacV ? fv(ltvCacV,"x") : "—", `LTV ${fv(ltvForRatio,"$")} ÷ CAC`, ltvCacV >= 3 ? "var(--gr)" : (ltvCacV >= 2 ? "var(--am)" : "var(--rd)"), "")
-  );
+  // Marketing KPIs — Section 04 now comes only from external "Total Shopify" sheet.
+  await renderMarketingFromTotalShopify(opt, false);
 
   const ftManual = document.getElementById("ft-manual");
-  if (ftManual) ftManual.style.display = hasManualSpend ? "inline-flex" : "none";
+  if (ftManual) ftManual.style.display = "none";
   const ftRoas = document.getElementById("ft-roas");
-  if (ftRoas) {
-    ftRoas.textContent = roasV ? `ROAS: ${fv(roasV,"x")}${spendWarn ? " ⚠" : ""}` : "ROAS: —";
-    ftRoas.style.color = spendWarn ? "var(--am)" : "var(--gr)";
-  }
+  if (ftRoas) { ftRoas.textContent = "ROAS: Total Shopify"; ftRoas.style.color = "var(--gd)"; }
   const roasWarnEl = document.getElementById("roas-warn");
-  if (roasWarnEl) roasWarnEl.classList.toggle("show", spendWarn);
-
-  renderCAC(cacActual || 0, ltvOverride, cacSrc);
+  if (roasWarnEl) roasWarnEl.classList.remove("show");
 
   if (brand==="cavali") await renderSubs();
 
@@ -1872,7 +1822,8 @@ async function render() {
 ══════════════════════════════════════════════════════ */
 function togglePanel(id) { const el=document.getElementById(id); if(el) el.classList.toggle("open"); }
 function forceRefresh() {
-  cache = {}; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
+  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
+  try { Object.keys(localStorage).filter(k=>k.startsWith("el_sheet_cache__")).forEach(k=>localStorage.removeItem(k)); } catch(e) {}
   const btn = document.querySelector(".rf-btn");
   if (btn) btn.style.opacity = ".5";
   render().then(()=>{ if(btn) btn.style.opacity="1"; });
