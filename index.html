@@ -1631,59 +1631,113 @@ function safeHTML(id, val) { const el=document.getElementById(id); if(el) el.inn
 /* ══════════════════════════════════════════════════════
    EXTERNAL MARKETING SHEET — Total Shopify
    Section 04 uses this sheet for Month/MTD and Quarter only.
+   Source: 1ROTaII-_S_0VntYvOZj8GFCoUnkQVcr1rPES0p-14mI / 'Total Shopify'
 ══════════════════════════════════════════════════════ */
 let __marketingRowsCache = null;
 async function fetchMarketingRows(force=false){
   if(__marketingRowsCache && !force) return __marketingRowsCache;
-  const tab = encodeURIComponent(MARKETING_SHEET_TAB);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${tab}?key=${AKEY}`;
+
+  // IMPORTANT: sheet tabs with spaces must be requested as a real A1 range:
+  // 'Total Shopify'!A:Z. Requesting only Total%20Shopify can return HTTP 400.
+  const tabEsc = String(MARKETING_SHEET_TAB).replace(/'/g,"''");
+  const range = encodeURIComponent(`'${tabEsc}'!A:Z`);
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${range}?key=${AKEY}`;
   const r = await fetch(url,{cache:"no-store"});
-  if(!r.ok) throw new Error(`Marketing sheet HTTP ${r.status}. Remove API cacheBust fixed; if this remains, share Total Shopify sheet as viewer or proxy it through Apps Script.`);
+  if(!r.ok){
+    const txt = await r.text().catch(()=>"");
+    throw new Error(`Marketing sheet HTTP ${r.status}: ${txt.slice(0,180)}`);
+  }
   const d = await r.json();
-  __marketingRowsCache = __rowsToObjects(d.values||[]);
+  __marketingRowsCache = __marketingValuesToRows(d.values||[]);
+  console.info("Marketing Total Shopify rows loaded", __marketingRowsCache.length, __marketingRowsCache.slice(0,3));
   return __marketingRowsCache;
 }
+function __mkCleanHeader(v){return String(v||"").trim().toLowerCase().replace(/[^a-z0-9]/g,"");}
+function __marketingValuesToRows(values){
+  if(!Array.isArray(values) || !values.length) return [];
+  let headerIdx = -1;
+  for(let i=0;i<Math.min(values.length,40);i++){
+    const cleaned=(values[i]||[]).map(__mkCleanHeader);
+    const hasDate=cleaned.includes("date") || cleaned.includes("month");
+    const hasSpend=cleaned.includes("spend") || cleaned.includes("adspend");
+    const hasOrders=cleaned.includes("orders");
+    const hasSales=cleaned.includes("totalsales") || cleaned.includes("sales");
+    if(hasDate && (hasSpend || hasOrders || hasSales)){headerIdx=i;break;}
+  }
+  if(headerIdx<0) headerIdx=0;
+  const headers=(values[headerIdx]||[]).map(h=>String(h||"").trim());
+  const rows=[];
+  for(let i=headerIdx+1;i<values.length;i++){
+    const arr=values[i]||[];
+    if(!arr.some(x=>String(x||"").trim())) continue;
+    const obj={};
+    headers.forEach((h,j)=>{ if(h) obj[h]=arr[j]!==undefined?arr[j]:""; });
+    rows.push(obj);
+  }
+  return rows;
+}
 function _mkNum(v){
-  const s=String(v??"").replace(/[$,%]/g,"").replace(/,/g,"").trim();
+  const s=String(v??"").replace(/[\$,%]/g,"").replace(/,/g,"").trim();
   const n=parseFloat(s); return isNaN(n)?0:n;
 }
-function _mkMonthKey(row){
-  const raw=String(row.Date||row.date||row.Month||row.month||"").trim();
-  if(!raw) return "";
-  const m=raw.match(/^([A-Za-z]+)\s*-\s*(\d{1,4})$/);
-  if(m){
-    const monthName=m[1].toLowerCase();
-    const idx=MN.findIndex(x=>x.toLowerCase().startsWith(monthName.slice(0,3)));
-    let y=parseInt(m[2],10);
-    // Source labels use January-5, February-6, etc. to mean 2025/2026.
-    // Do not convert January-5 into 2005.
-    if(y<10) y=2020+y;
-    else if(y<100) y=2000+y;
-    if(idx>=0) return `${y}-${String(idx+1).padStart(2,'0')}`;
-  }
-  const d=new Date(raw+'T12:00');
-  if(!isNaN(d)) return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-  return "";
+function _mkMonthIndex(name){
+  const s=String(name||"").trim().toLowerCase().slice(0,3);
+  return MN.findIndex(x=>x.toLowerCase().slice(0,3)===s);
+}
+function _mkYearFromSuffix(v){
+  let y=parseInt(v,10);
+  if(isNaN(y)) return null;
+  if(y<10) y=2020+y;
+  else if(y<100) y=2000+y;
+  return y;
 }
 function _mkMetric(row, names){
   for(const n of names){ if(row[n]!==undefined && row[n]!=="") return _mkNum(row[n]); }
   const keys=Object.keys(row||{});
   for(const n of names){
-    const key=keys.find(k=>k.toLowerCase().replace(/[^a-z0-9]/g,'')===n.toLowerCase().replace(/[^a-z0-9]/g,''));
-    if(key) return _mkNum(row[key]);
+    const nk=n.toLowerCase().replace(/[^a-z0-9]/g,'');
+    const key=keys.find(k=>k.toLowerCase().replace(/[^a-z0-9]/g,'')===nk);
+    if(key && row[key]!==undefined && row[key]!=="") return _mkNum(row[key]);
   }
   return 0;
 }
-function _mkMonthDays(ym){ return new Date(parseInt(ym.slice(0,4)),parseInt(ym.slice(5,7)),0).getDate(); }
-function _mkOverlapDays(a1,a2,b1,b2){
-  const s1=new Date(a1+'T12:00'), e1=new Date(a2+'T12:00'), s2=new Date(b1+'T12:00'), e2=new Date(b2+'T12:00');
-  const st=s1>s2?s1:s2, en=e1<e2?e1:e2;
-  const d=Math.floor((en-st)/86400000)+1; return d>0?d:0;
+function _mkRowsByMonth(rows){
+  const byMonth={};
+  let currentYear=null;
+  (rows||[]).forEach(r=>{
+    const raw=String(r.Date||r.date||r.Month||r.month||"").trim();
+    if(!raw) return;
+
+    // Matches January-5 / January-6 / January-25 / January-2026.
+    let m=raw.match(/^([A-Za-z]+)\s*-\s*(\d{1,4})$/);
+    if(m){
+      const idx=_mkMonthIndex(m[1]);
+      const y=_mkYearFromSuffix(m[2]);
+      if(idx>=0 && y){
+        currentYear=y;
+        byMonth[`${y}-${String(idx+1).padStart(2,'0')}`]=r;
+      }
+      return;
+    }
+
+    // Matches rows like February, March, April after January-6; keep the last explicit year.
+    m=raw.match(/^([A-Za-z]+)$/);
+    if(m && currentYear){
+      const idx=_mkMonthIndex(m[1]);
+      if(idx>=0){
+        byMonth[`${currentYear}-${String(idx+1).padStart(2,'0')}`]=r;
+        return;
+      }
+    }
+
+    // Fallback for real date values.
+    const d=new Date(raw+'T12:00');
+    if(!isNaN(d)) byMonth[`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`]=r;
+  });
+  return byMonth;
 }
 function calcMarketingFromTotalShopify(rows,opt){
-  const byMonth={};
-  (rows||[]).forEach(r=>{ const k=_mkMonthKey(r); if(k) byMonth[k]=r; });
-
+  const byMonth=_mkRowsByMonth(rows);
   let months=[];
   if(ptype==="quarter"){
     const startY=parseInt(opt.start.slice(0,4),10), startM=parseInt(opt.start.slice(5,7),10);
@@ -1694,8 +1748,6 @@ function calcMarketingFromTotalShopify(rows,opt){
       m++; if(m>12){m=1;y++;}
     }
   }else{
-    // Month / MTD reads the exact month row from Total Shopify.
-    // The source sheet already stores the correct MTD/month value, so do not prorate by days.
     months=[opt.start.slice(0,7)];
   }
 
@@ -1712,7 +1764,7 @@ function calcMarketingFromTotalShopify(rows,opt){
   const cos  = sales>0 ? spend/sales*100 : null;
   const cac  = orders>0 ? spend/orders : null;
   const aov  = orders>0 ? sales/orders : null;
-  return {spend,orders,sales,roas,cos,cac,aov,matched};
+  return {spend,orders,sales,roas,cos,cac,aov,matched,available:Object.keys(byMonth).sort()};
 }
 async function renderMarketingFromTotalShopify(opt, force=false){
   if(ptype==="week"){
@@ -1723,7 +1775,7 @@ async function renderMarketingFromTotalShopify(opt, force=false){
   try{
     const rows=await fetchMarketingRows(force);
     const m=calcMarketingFromTotalShopify(rows,opt);
-    const note=m.matched.length?`Total Shopify: ${m.matched.join(', ')}`:"No month rows matched selected range";
+    const note=m.matched.length?`Total Shopify: ${m.matched.join(', ')}`:`No month rows matched. Available: ${m.available.slice(-8).join(', ')}`;
     const dc=(l,v,f,c,n)=>`<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div><div class="kc-note">${n||note}</div></div>`;
     safeHTML("s-mkt",
       dc("Ad Spend", m.spend>0?m.spend:null, "$", "var(--gd)", note)+
@@ -1736,7 +1788,7 @@ async function renderMarketingFromTotalShopify(opt, force=false){
     return true;
   }catch(e){
     console.warn("Marketing Total Shopify fetch failed", e);
-    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--rd)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">—</div><div class="kc-note">Could not read Total Shopify sheet.</div></div>`);
+    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--rd)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">—</div><div class="kc-note">Could not read Total Shopify sheet. Check API key access or share the Stats sheet as viewer.</div></div>`);
     return true;
   }
 }
