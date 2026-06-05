@@ -1779,7 +1779,7 @@ async function renderMarketingFromTotalShopify(opt, force=false){
     const dc=(l,v,f,c,n)=>`<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div><div class="kc-note">${n||note}</div></div>`;
     safeHTML("s-mkt",
       dc("Ad Spend", m.spend>0?m.spend:null, "$", "var(--gd)", note)+
-      dc("ROAS", m.roas, "x", m.roas?"var(--gr)":"var(--bd)", "Total Sales ÷ Spend")+
+      dc("ROAS", m.roas!==null&&m.roas!==undefined ? m.roas*100 : null, "%", m.roas?"var(--gr)":"var(--bd)", "Total Sales ÷ Spend")+
       dc("CAC", m.cac, "$", "var(--gd)", "Spend ÷ Orders")+
       dc("AOV", m.aov, "$", "var(--pu)", "Total Sales ÷ Orders")+
       dc("COS", m.cos, "%", "var(--am)", "Spend ÷ Total Sales")
