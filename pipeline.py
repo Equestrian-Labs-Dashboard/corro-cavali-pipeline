@@ -261,48 +261,44 @@ def fetch_sales(url, token, s, e):
 # FETCH: SESSIONS
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(url, token, s, e):
-    """Website KPI traffic source.
-
-    Formula requested by Emma/Corro report:
-      - Traffic = Sessions
-      - Unique Visitors = New users when available
-      - CR% = Transactions / Sessions
-
-    Bot filters requested from the reference report:
-      - Exclude browser = YaBrowser
-      - Exclude screen resolution = 800x600
-
-    ShopifyQL availability is store/API dependent. We first try the filtered query.
-    If ShopifyQL does not expose browser/screen_resolution dimensions, we fall back
-    to unfiltered sessions instead of breaking the pipeline. Unique Visitors remains
-    0 unless a real new-user field is available; the pipeline no longer fabricates
-    it as a percentage of sessions.
     """
-    e_ql = _until(e)
+    Section 01 source: Shopify only.
 
-    filtered_query = (
-        f"FROM sessions SHOW sessions "
-        f"WHERE browser != 'YaBrowser' AND screen_resolution != '800x600' "
-        f"SINCE {s} UNTIL {e_ql}"
-    )
-    row = ql_row(url, token, filtered_query)
-    source = "ShopifyQL filtered: exclude YaBrowser + 800x600"
+    Formulas written to the dashboard:
+      - Traffic = sessions
+      - Unique Visitors = online_store_visitors
+      - CR% = Transactions / Sessions, calculated in build()
+
+    We do NOT query GA/Looker-only fields such as browser, screen_resolution,
+    or new_users. ShopifyQL confirmed those are not available here.
+
+    When available, Shopify's own bot classification is applied:
+      WHERE human_or_bot_session != 'human_bot'
+    If that field is not available for any store/range, the function falls back
+    to Shopify sessions + online_store_visitors without that filter so the
+    pipeline keeps running.
+    """
+    e_ql = (dt.date.fromisoformat(e) + dt.timedelta(days=1)).isoformat()
+    source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
+    row = ql_row(url, token,
+        f"FROM sessions SHOW online_store_visitors, sessions "
+        f"WHERE human_or_bot_session != 'human_bot' "
+        f"SINCE {s} UNTIL {e_ql}")
 
     if not row:
-        row = ql_row(url, token, f"FROM sessions SHOW sessions SINCE {s} UNTIL {e_ql}")
-        source = "ShopifyQL unfiltered fallback"
+        source = "ShopifyQL sessions + online_store_visitors"
+        row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions SINCE {s} UNTIL {e_ql}")
 
     if not row:
+        print("    sessions: 0  online_store_visitors: 0  [ShopifyQL]")
         return {"sessions": 0, "unique_visitors": 0, "traffic_source": source}
 
     sessions = int(abs(_m(row.get("sessions", 0))))
-    unique = 0
-    print(f"    sessions: {sessions:,}  unique/new users: {unique:,}  [{source}]")
+    unique = int(abs(_m(row.get("online_store_visitors", 0))))
+    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  [{source}]")
     return {"sessions": sessions, "unique_visitors": unique, "traffic_source": source}
 
-# ─────────────────────────────────────────────────────────────────
-# FETCH: ORDERS FULFILLED
-# ─────────────────────────────────────────────────────────────────
 def fetch_orders_fulfilled(url, token, s, e):
     e_ql = _until(e)
     row  = ql_row(url, token,
