@@ -278,7 +278,7 @@ def fetch_sessions(url, token, s, e):
     to Shopify sessions + online_store_visitors without that filter so the
     pipeline keeps running.
     """
-    e_ql = (dt.date.fromisoformat(e) + dt.timedelta(days=1)).isoformat()
+    e_ql = (date.fromisoformat(e) + timedelta(days=1)).isoformat()
     source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
     row = ql_row(url, token,
         f"FROM sessions SHOW online_store_visitors, sessions "
