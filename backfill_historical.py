@@ -364,12 +364,37 @@ def fetch_sales(store_url, token, start, end):
 # FETCH: SESSIONS
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(store_url, token, start, end):
+    """Website KPI traffic source: Shopify only.
+
+    Formulas:
+      - Traffic = sessions
+      - Unique Visitors = online_store_visitors
+      - CR% = Transactions / Sessions in build()
+
+    We do not query GA/Looker-only fields like browser, screen_resolution or
+    new_users. ShopifyQL confirmed those are not available here. When available,
+    Shopify's own bot classification is applied with:
+      WHERE human_or_bot_session != 'human_bot'
+    and we safely fall back to the unfiltered Shopify query if needed.
+    """
     e_ql = _until(end)
-    row  = run_ql(store_url, token,
-        f"FROM sessions SHOW sessions SINCE {start} UNTIL {e_ql}")
+    source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
+    row = run_ql(store_url, token,
+        f"FROM sessions SHOW online_store_visitors, sessions "
+        f"WHERE human_or_bot_session != 'human_bot' "
+        f"SINCE {start} UNTIL {e_ql}")
+
     if not row:
-        return 0
-    return int(abs(money(row.get("sessions", 0))))
+        source = "ShopifyQL sessions + online_store_visitors"
+        row = run_ql(store_url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions SINCE {start} UNTIL {e_ql}")
+
+    if not row:
+        return {"sessions": 0, "unique_visitors": 0, "traffic_source": source}
+
+    sessions = int(abs(money(row.get("sessions", 0))))
+    unique = int(abs(money(row.get("online_store_visitors", 0))))
+    return {"sessions": sessions, "unique_visitors": unique, "traffic_source": source}
 
 # ─────────────────────────────────────────────────────────────────
 # FETCH: ORDERS FULFILLED
@@ -589,7 +614,12 @@ def build(ql, orders, sessions=0, orders_fulfilled=None):
     upo   = round(units / nb, 2) if nb   else 0
     pdisc = round(d / g * 100, 2) if g   else 0
     pret  = round(r / g * 100, 2) if g   else 0
-    sess  = int(sessions or 0)
+    if isinstance(sessions, dict):
+        sess = int(sessions.get("sessions") or 0)
+        uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
+    else:
+        sess = int(sessions or 0)
+        uv   = 0
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
     new_gp  = round(nvr["new_revenue"]       * gm_rate, 2)
@@ -610,7 +640,7 @@ def build(ql, orders, sessions=0, orders_fulfilled=None):
         "aov":                    aov,
         "units_per_order":        upo,
         "sessions":               sess,
-        "unique_visitors":        round(sess * 0.85) if sess else 0,
+        "unique_visitors":        uv,
         "conversion_rate":        round(nb / sess * 100, 4) if sess else 0,
         "new_customers":          nvr["new_customers"],
         "returning_customers":    nvr["returning_customers"],
@@ -1365,6 +1395,38 @@ def write_smartrr_product_rows(gc, sheet_id, smartrr_rows):
     print(f"    smartrr_product_volume: {len(cleaned)} period/product rows")
 
 
+def enrich_smartrr_rows_with_subscribers(now_str, brand_name, store_url, token, kpi_rows, smartrr_order_rows):
+    """Add Smartrr subscriber-created rows to historical/safe backfill output.
+
+    Backfill already builds Shopify order-volume rows. This function imports the
+    corrected daily pipeline Smartrr logic so historical months also get:
+      - row_type=smartrr_subscribers
+      - new_subscribers from purchase-state/subscription created date
+      - current active/paused/cancelled totals
+    Without this, backfill clears smartrr_product_volume and leaves only sales
+    volume rows, making older months show 0 New Subscribers.
+    """
+    if brand_name != "cavali":
+        return smartrr_order_rows or []
+    try:
+        import importlib
+        daily = importlib.import_module("pipeline")
+        active_states = daily.fetch_smartrr_active_purchase_states(brand_name)
+        period_defs = [(r[1], r[2], r[3]) for r in (kpi_rows or []) if r and len(r) > 3 and r[1] and r[2] and r[3]]
+        active_rows, active_norm, paused_norm, cancelled_norm = daily.build_smartrr_product_volume_rows(
+            now_str, brand_name, active_states, period_defs, store_url, token
+        )
+        merged = daily.merge_smartrr_product_volume_rows(
+            smartrr_order_rows or [], active_rows, active_norm, paused_norm, cancelled_norm
+        )
+        print(f"    smartrr_product_volume historical merge: {len(smartrr_order_rows or [])} sales rows + {len(active_rows or [])} subscriber rows => {len(merged)} rows")
+        return merged
+    except Exception as e:
+        print(f"    ❌ smartrr historical subscriber merge failed; keeping existing dashboard safer by returning NO overwrite rows: {e}")
+        # Returning [] prevents old sales-only subscriber rows from replacing valid daily Smartrr subscriber rows.
+        return []
+
+
 # MAIN
 # ─────────────────────────────────────────────────────────────────
 def main():
@@ -1649,7 +1711,9 @@ def main():
             ws_nvr.append_rows(nvr_rows[i:i+50])
             print(f"  NVR batch {i//50+1} escrito")
 
-        # Smartrr: historial de volumen por producto/período (todas las granularidades)
+        # Smartrr: historical product volume + real subscriber-created rows.
+        # This must run before writing because write_smartrr_product_rows clears the tab.
+        smartrr_rows = enrich_smartrr_rows_with_subscribers(now_str, brand, url, token, kpi_rows, smartrr_rows)
         write_smartrr_product_rows(gc, sid, smartrr_rows)
         if brand == "cavali" and smartrr_rows:
             # SMARTRR_PRODUCT_VOLUME_HEADERS order:
