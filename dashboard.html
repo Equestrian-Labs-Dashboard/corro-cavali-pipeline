@@ -5,6 +5,60 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Equestrian Labs — Analytics</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet">
+
+<script>
+/* Dashboard guard — portal session required.
+   This does not replace server-side security, but it prevents direct dashboard
+   access from browsers that have not logged in through index.html. */
+(function(){
+  const KEY = "corro_dashboard_auth_v3";
+  const TTL_DAYS = 90;
+  const qs = new URLSearchParams(location.search);
+  const requestedBrand = (qs.get("brand") || "").toLowerCase();
+
+  function readSession(){
+    for (const store of [sessionStorage, localStorage]) {
+      try {
+        const s = JSON.parse(store.getItem(KEY) || "null");
+        if (s && s.ok && s.email && s.ts && (Date.now() - Number(s.ts)) < TTL_DAYS*24*60*60*1000) return s;
+      } catch(e) {}
+    }
+    return null;
+  }
+  function tokensOf(s){
+    const raw = String(s && (s.accessRaw || (Array.isArray(s.access) ? s.access.join(",") : s.access)) || "");
+    const low = raw.toLowerCase();
+    if (s && (s.all === true || low === "all" || low.includes("all reports") || low.includes("todos"))) return ["all"];
+    if (Array.isArray(s && s.access)) return s.access.map(x => String(x).toLowerCase());
+    return raw.split(/[;,|\/]+|\s+and\s+|\s+y\s+/i).map(x => x.trim().toLowerCase()).filter(Boolean);
+  }
+  function has(tokens, key){
+    if (tokens.includes("all")) return true;
+    if (key === "dashboard") return tokens.includes("dashboard") || tokens.includes("main dashboard");
+    if (key === "corro") return tokens.includes("corro") || tokens.includes("dashboard_corro") || tokens.includes("dashboard corro") || has(tokens,"dashboard");
+    if (key === "cavali") return tokens.includes("cavali") || tokens.includes("dashboard_cavali") || tokens.includes("dashboard cavali") || has(tokens,"dashboard");
+    return tokens.includes(key);
+  }
+  function goPortal(reason){
+    const next = location.pathname.split("/").pop() + location.search;
+    location.replace("./index.html?reason=" + encodeURIComponent(reason || "login_required") + "&next=" + encodeURIComponent(next));
+  }
+
+  const session = readSession();
+  if (!session) return goPortal("login_required");
+
+  const tokens = tokensOf(session);
+  const canDashboard = has(tokens,"dashboard") || has(tokens,"corro") || has(tokens,"cavali");
+  if (!canDashboard) return goPortal("not_allowed");
+
+  if ((requestedBrand === "corro" || requestedBrand === "cavali") && !has(tokens, requestedBrand)) {
+    return goPortal("brand_not_allowed");
+  }
+
+  window.__PORTAL_SESSION__ = session;
+})();
+</script>
+
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 [data-theme="light"]{
