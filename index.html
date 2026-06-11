@@ -218,7 +218,7 @@ document.getElementById("loginForm").addEventListener("submit",async ev=>{
     const session={ok:true,email,user:data.user||data.name||email,accessRaw:parsed.raw,access:parsed.tokens,ts:Date.now()};
     saveSession(session); showMenu(session);
   }catch(e){
-    msg.textContent="Could not reach login service. Refresh or try disabling extensions in this browser.";
+    msg.textContent=e && e.message ? e.message : "Could not reach login service. Refresh or try disabling extensions in this browser.";
     console.warn("Apps Script login failed:",e);
   }finally{btn.disabled=false;}
 });
