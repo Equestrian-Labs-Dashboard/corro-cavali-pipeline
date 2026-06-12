@@ -203,7 +203,12 @@ function showMenu(session){
     for(const [key,label,desc,color,url] of allowed){
       const btn=document.createElement("button"); btn.className="opt"+(!url?" disabled":"");
       btn.innerHTML=`${!url?'<span class="badge">Link pending</span>':''}<div class="opt-top"><span class="dot" style="background:${color}"></span>${label}</div><div class="desc">${desc}</div>`;
-      if(url) btn.onclick=()=>{ location.href=url; };
+      if(url) {
+        btn.onclick = () => {
+          const win = window.open(url, "_blank", "noopener,noreferrer");
+          if (win) win.opener = null;
+        };
+      }
       grid.appendChild(btn);
     }
     root.appendChild(wrap);
