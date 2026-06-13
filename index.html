@@ -107,8 +107,11 @@ const REPORTS={
   monthly:{label:"Monthly Discounts", aliases:["monthly","discounts","monthly discounts","nontlhy"]},
   wellington:{label:"Wellington", aliases:["wellington","commissions wellington"]},
   hits:{label:"Hits", aliases:["hits","hit"]},
-  upsell:{label:"Upsell", aliases:["upsell","up sell"]},
-  sales_reports:{label:"Sales Reports", aliases:["sales","sales reports"]},
+  upsell:{label:"Upsell", aliases:["upsell","up sell","upsell report","up-sell"]},
+  sales_reports:{label:"Sales Reports", aliases:["sales","sales reports","sales report"]},
+  other_sales_channel:{label:"Other Sales Channel", aliases:["other sales channel","other sales","sales channel"]},
+  product_sales:{label:"Product Sales", aliases:["product sales","product sale"]},
+  mud_fever:{label:"Corro Mud Fever", aliases:["corro mud fever","mud fever","corro_mud_fever"]},
   financials_sales_channel:{label:"Financials per Sales Channel", aliases:["financials","financials per sales channel","financials sales channel"]},
   yagya:{label:"Yagya", aliases:["yagya","yaya"]},
   athletics:{label:"Athletics", aliases:["athletics","atletix","athletix"]}
@@ -133,7 +136,8 @@ const MENU_GROUPS=[
   {title:"Financials", items:[
     ["financials_sales_channel","Financials per Sales Channel","Financials grouped by sales channel.","#e6c985",""]
   ]},
-  {title:"Vendors", items:[
+  {title:"Product Sales", items:[
+    ["mud_fever","Corro Mud Fever","Open Corro Mud Fever product sales report.","#4259de","https://script.google.com/macros/s/AKfycbz_RGQG7LuCnRs4J4FSgLJJM05awnzg-dbsVxziBMW7q1ZaYHs150N5yBFbGOygtDcW/exec"],
     ["yagya","Yagya","Open Yagya report.","#7ad890","https://script.google.com/macros/s/AKfycbyliUs7RKIqxGI7GoDI3GZPgrN211qFEVVy-2j5P-AJleYO29zpBLoSX6ueKND_dJESEQ/exec"],
     ["athletics","Atletix","Open Atletix report.","#c071ff","https://script.google.com/macros/s/AKfycbxEAnM4nSdgPN1J92kzjRAzapR9456wKaF8tw4BikfN4hYOZVQZIoo1vscLGX91A3z2/exec"]
   ]}
@@ -160,6 +164,8 @@ function hasAccess(access,key){ const a=typeof access==="object"?access:parseAcc
 function canSee(itemKey, access){
   if(hasAccess(access,itemKey)) return true;
   if(["dashboard","corro","cavali"].includes(itemKey) && (hasAccess(access,"dashboard") || hasAccess(access,"corro") || hasAccess(access,"cavali"))) return true;
+  if(["hits","upsell","sales_reports"].includes(itemKey) && hasAccess(access,"other_sales_channel")) return true;
+  if(["mud_fever","yagya","athletics"].includes(itemKey) && hasAccess(access,"product_sales")) return true;
   return false;
 }
 function validSession(s){
