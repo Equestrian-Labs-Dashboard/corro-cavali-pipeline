@@ -117,6 +117,71 @@ def get_gc():
         json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
+
+# ─────────────────────────────────────────────────────────────────
+# GOOGLE SHEETS — retry wrapper for transient 429/5xx errors
+# ─────────────────────────────────────────────────────────────────
+GOOGLE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _gspread_status_code(exc):
+    """Return HTTP status code from gspread/API exceptions when available."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    if code is not None:
+        try:
+            return int(code)
+        except Exception:
+            pass
+    # Some google/gspread errors expose code/status as string/int attributes.
+    for attr in ("code", "status"):
+        val = getattr(exc, attr, None)
+        if val is not None:
+            try:
+                return int(val)
+            except Exception:
+                pass
+    # Last defensive fallback: parse the exception string, e.g. "APIError: [503]".
+    m = re.search(r"\[(\d{3})\]", str(exc))
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _is_google_retryable(exc):
+    code = _gspread_status_code(exc)
+    if code in GOOGLE_RETRY_STATUS_CODES:
+        return True
+    return isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+
+
+def google_retry(fn, label="Google Sheets request", max_retries=7):
+    """Retry transient Google Sheets/gspread errors, especially 503 service unavailable."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_google_retryable(exc) or attempt >= max_retries:
+                raise
+            sleep_for = min(90.0, (2 ** attempt) + random.uniform(0.35, 1.75))
+            code = _gspread_status_code(exc) or "?"
+            print(f"    ⏳ Google Sheets transient HTTP {code} during {label}; retry {attempt + 1}/{max_retries} in {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+    if last_exc:
+        raise last_exc
+
+
+def get_or_create_ws(sh, title, rows, cols):
+    try:
+        return google_retry(lambda: sh.worksheet(title), f"open worksheet {title}")
+    except gspread.exceptions.WorksheetNotFound:
+        return google_retry(lambda: sh.add_worksheet(title, rows=rows, cols=cols), f"create worksheet {title}")
+
 # ─────────────────────────────────────────────────────────────────
 # SHOPIFY GQL — raw request
 # ─────────────────────────────────────────────────────────────────
@@ -1896,13 +1961,10 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
 
 def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
     """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet("smartrr_product_volume")
-    except Exception:
-        ws = sh.add_worksheet("smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
+    sh = google_retry(lambda: gc.open_by_key(sheet_id), f"open spreadsheet {sheet_id}")
+    ws = get_or_create_ws(sh, "smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
 
-    vals = ws.get_all_values()
+    vals = google_retry(lambda: ws.get_all_values(), "read smartrr_product_volume")
     keep = []
     replace = {str(p).strip() for p in periods_to_replace if p}
     if len(vals) >= 2:
@@ -1936,10 +1998,10 @@ def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
         )
     )
 
-    ws.clear()
-    ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
+    google_retry(lambda: ws.clear(), "clear smartrr_product_volume")
+    google_retry(lambda: ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS), "write smartrr_product_volume header")
     if merged:
-        ws.append_rows(merged, value_input_option="USER_ENTERED")
+        google_retry(lambda: ws.append_rows(merged, value_input_option="USER_ENTERED"), "write smartrr_product_volume rows")
     print(f"    smartrr_product_volume: {len(cleaned_rows)} refreshed rows; {len(merged)} total rows")
 
 
@@ -1986,13 +2048,12 @@ def _map_to_row(headers, m):
 # WRITE — upsert (no borra datos históricos)
 # ─────────────────────────────────────────────────────────────────
 def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
-    sh = gc.open_by_key(sheet_id)
+    sh = google_retry(lambda: gc.open_by_key(sheet_id), f"open spreadsheet {sheet_id}")
 
     # ── kpis_daily ──────────────────────────────────────────────
-    try:    ws = sh.worksheet("kpis_daily")
-    except: ws = sh.add_worksheet("kpis_daily", rows=600, cols=40)
+    ws = get_or_create_ws(sh, "kpis_daily", rows=600, cols=40)
 
-    existing_vals = ws.get_all_values()
+    existing_vals = google_retry(lambda: ws.get_all_values(), "read smartrr_product_volume")
     existing = {}
     if len(existing_vals) >= 2:
         ex_h = existing_vals[0]
@@ -2005,15 +2066,14 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         existing[str(r[1]).strip()] = r
 
     merged = sorted(existing.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
-    ws.clear()
-    ws.append_row(HEADERS)
+    google_retry(lambda: ws.clear(), "clear kpis_daily")
+    google_retry(lambda: ws.append_row(HEADERS), "write kpis_daily header")
     if merged:
-        ws.append_rows(merged, value_input_option="USER_ENTERED")
+        google_retry(lambda: ws.append_rows(merged, value_input_option="USER_ENTERED"), "write kpis_daily rows")
     print(f"    kpis_daily: {len(merged)} rows")
 
     # ── revenue_share ────────────────────────────────────────────
-    try:    ws_rs = sh.worksheet("revenue_share")
-    except: ws_rs = sh.add_worksheet("revenue_share", rows=600, cols=12)
+    ws_rs = get_or_create_ws(sh, "revenue_share", rows=600, cols=12)
 
     rs_headers = [
         "updated_at", "period", "channel",
@@ -2022,7 +2082,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         "pct_prev", "pct_chg",
         "gp_is_estimate",
     ]
-    rs_vals = ws_rs.get_all_values()
+    rs_vals = google_retry(lambda: ws_rs.get_all_values(), "read revenue_share")
     existing_rs = {}
     if len(rs_vals) >= 2:
         ex_h = rs_vals[0]
@@ -2076,15 +2136,14 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         r[8] = pct_chg  if pct_chg  is not None else ""
 
     merged_rs = sorted(existing_rs.values(), key=lambda r: (str(r[1]), str(r[2])))
-    ws_rs.clear()
-    ws_rs.append_row(rs_headers)
+    google_retry(lambda: ws_rs.clear(), "clear revenue_share")
+    google_retry(lambda: ws_rs.append_row(rs_headers), "write revenue_share header")
     if merged_rs:
-        ws_rs.append_rows(merged_rs, value_input_option="USER_ENTERED")
+        google_retry(lambda: ws_rs.append_rows(merged_rs, value_input_option="USER_ENTERED"), "write revenue_share rows")
     print(f"    revenue_share: {len(merged_rs)} rows")
 
     # ── new_vs_returning ─────────────────────────────────────────
-    try:    ws_nvr = sh.worksheet("new_vs_returning")
-    except: ws_nvr = sh.add_worksheet("new_vs_returning", rows=300, cols=12)
+    ws_nvr = get_or_create_ws(sh, "new_vs_returning", rows=300, cols=12)
 
     nvr_headers = [
         "updated_at", "period", "period_start", "period_end",
@@ -2092,7 +2151,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         "new_revenue", "returning_revenue",
         "new_gross_profit", "returning_gross_profit",
     ]
-    nvr_vals = ws_nvr.get_all_values()
+    nvr_vals = google_retry(lambda: ws_nvr.get_all_values(), "read new_vs_returning")
     existing_nvr = {}
     if len(nvr_vals) >= 2:
         ex_h = nvr_vals[0]
@@ -2105,15 +2164,14 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         existing_nvr[str(r[1]).strip()] = r
 
     merged_nvr = sorted(existing_nvr.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
-    ws_nvr.clear()
-    ws_nvr.append_row(nvr_headers)
+    google_retry(lambda: ws_nvr.clear(), "clear new_vs_returning")
+    google_retry(lambda: ws_nvr.append_row(nvr_headers), "write new_vs_returning header")
     if merged_nvr:
-        ws_nvr.append_rows(merged_nvr, value_input_option="USER_ENTERED")
+        google_retry(lambda: ws_nvr.append_rows(merged_nvr, value_input_option="USER_ENTERED"), "write new_vs_returning rows")
     print(f"    new_vs_returning: {len(merged_nvr)} rows")
 
     # ── ad_spend ─────────────────────────────────────────────────
-    try:    ws_ad = sh.worksheet("ad_spend")
-    except: ws_ad = sh.add_worksheet("ad_spend", rows=200, cols=10)
+    ws_ad = get_or_create_ws(sh, "ad_spend", rows=200, cols=10)
 
     ad_headers = [
         "updated_at", "brand", "period", "period_start", "period_end",
@@ -2146,10 +2204,10 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
             spend, vals.get("roas", 0), vals.get("cos", 0), cac_auto,
         ])
 
-    ws_ad.clear()
-    ws_ad.append_row(ad_headers)
+    google_retry(lambda: ws_ad.clear(), "clear ad_spend")
+    google_retry(lambda: ws_ad.append_row(ad_headers), "write ad_spend header")
     if ad_rows:
-        ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED")
+        google_retry(lambda: ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED"), "write ad_spend rows")
     print(f"    ad_spend: {len(ad_rows)} months")
 
 # ─────────────────────────────────────────────────────────────────
