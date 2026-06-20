@@ -380,22 +380,60 @@ def fetch_orders_fulfilled(url, token, s, e):
 # FETCH: REST ORDERS (new vs returning)
 # ─────────────────────────────────────────────────────────────────
 def rest(store_url, token, endpoint, params):
+    """
+    Shopify REST pagination with rate-limit protection.
+
+    Used by new_vs_returning and order line-items. If Shopify returns HTTP 429
+    during large periods, wait and retry instead of failing the whole pipeline.
+    """
     url     = f"https://{store_url}/admin/api/2024-01/{endpoint}"
     headers = {"X-Shopify-Access-Token": token}
     results = []
+    page_num = 0
+
     while url:
-        r = requests.get(url, headers=headers, params=params, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        key  = list(data.keys())[0]
-        results.extend(data[key])
-        link = r.headers.get("Link", "")
-        url  = None
-        params = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
+        page_num += 1
+        for attempt in range(12):
+            r = requests.get(url, headers=headers, params=params, timeout=60)
+
+            if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep_for = float(retry_after)
+                    except Exception:
+                        sleep_for = 4.0
+                else:
+                    sleep_for = min(90.0, 4.0 + attempt * 3.0 + random.uniform(0.25, 1.25))
+                print(f"    Shopify REST {r.status_code} on {endpoint} page {page_num}; retry {attempt + 1}/12 in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                continue
+
+            r.raise_for_status()
+
+            lim = r.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+            try:
+                used, cap = [int(x) for x in lim.split("/", 1)]
+                if cap and used / cap >= 0.75:
+                    time.sleep(1.25)
+            except Exception:
+                pass
+
+            data = r.json()
+            key  = list(data.keys())[0]
+            results.extend(data[key])
+            link = r.headers.get("Link", "")
+            url  = None
+            params = {}
+            if 'rel="next"' in link:
+                for part in link.split(","):
+                    if 'rel="next"' in part:
+                        url = part.split(";")[0].strip().strip("<>")
+            break
+        else:
+            print(f"    ⚠ Shopify REST gave repeated 429 on {endpoint} page {page_num}; using partial REST data collected so far")
+            return results
+
     return results
 
 
@@ -405,7 +443,7 @@ CUSTOMER_ORDER_COUNT_CACHE = {}
 CUSTOMER_FIRST_ORDER_DATE_CACHE = {}
 
 
-def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, max_retries=7):
+def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, max_retries=10):
     """Small REST GET helper for customer enrichment, with 429/5xx retry."""
     url = f"https://{store_url}/admin/api/2024-01/{endpoint}"
     headers = {"X-Shopify-Access-Token": token}
@@ -422,7 +460,7 @@ def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, m
                 except Exception:
                     sleep_for = 2.0
             else:
-                sleep_for = min(45, (2 ** attempt) + random.random())
+                sleep_for = min(90, 4.0 + attempt * 3.0 + random.random())
             print(f"    Shopify REST {r.status_code} on {endpoint}; retrying in {sleep_for:.1f}s")
             time.sleep(sleep_for)
             continue
