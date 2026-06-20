@@ -910,8 +910,10 @@ function findCmp(rows, opt) {
 function fv(v, f) {
   if (v===null||v===undefined||v==="") return "—";
   const n = parseFloat(v); if (isNaN(n)) return "—";
+  if (f==="int") return Math.round(n).toLocaleString();
   if (f==="$") { if(Math.abs(n)>=1e6) return "$"+(n/1e6).toFixed(2)+"M"; if(Math.abs(n)>=1000) return "$"+(n/1000).toFixed(1)+"K"; return "$"+n.toFixed(0); }
   if (f==="%") return n.toFixed(1)+"%";
+  if (f==="pct2") return n.toFixed(2)+"%";
   if (f==="x") return n.toFixed(2)+"x";
   if (Math.abs(n)>=1e6) return (n/1e6).toFixed(1)+"M";
   if (Math.abs(n)>=1000) return (n/1000).toFixed(1)+"K";
@@ -955,10 +957,10 @@ function resolveGrossProfit(row) {
 
 const DEFS = {
   web: [
-    { k:"sessions",         l:"Sessions",         f:"",  n:"ShopifyQL direct" },
-    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"online_store_visitors from ShopifyQL" },
-    { k:"pageviews",        l:"Pageviews",        f:"",  n:"pageviews from ShopifyQL" },
-    { k:"conversion_rate",  l:"Conv. Rate",       f:"%", n:"conversion_rate from ShopifyQL" },
+    { k:"sessions",         l:"Sessions",         f:"int",  n:"ShopifyQL direct" },
+    { k:"unique_visitors",  l:"Unique Visitors",  f:"int",  n:"online_store_visitors from ShopifyQL" },
+    { k:"pageviews",        l:"Pageviews",        f:"int",  n:"pageviews from ShopifyQL" },
+    { k:"conversion_rate",  l:"Conv. Rate",       f:"pct2", n:"conversion_rate from ShopifyQL" },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
