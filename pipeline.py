@@ -61,7 +61,7 @@ HEADERS = [
     "total_returns", "cogs",
     "pct_discount", "pct_returns", "pct_gm",
     "nb_orders", "nb_units", "aov", "units_per_order",
-    "sessions", "unique_visitors", "conversion_rate",
+    "sessions", "unique_visitors", "pageviews", "conversion_rate",
     "new_customers", "returning_customers",
     "new_revenue", "returning_revenue",
     "new_gross_profit", "returning_gross_profit",
@@ -327,42 +327,41 @@ def fetch_sales(url, token, s, e):
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(url, token, s, e):
     """
-    Section 01 source: Shopify only.
+    Website KPIs must match Shopify Analytics / ShopifyQL directly.
 
-    Formulas written to the dashboard:
-      - Traffic = sessions
-      - Unique Visitors = online_store_visitors
-      - CR% = Transactions / Sessions, calculated in build()
+    Exact source requested:
+      FROM sessions
+      SHOW sessions, online_store_visitors, pageviews, conversion_rate
+      SINCE {start} UNTIL {end}
 
-    We do NOT query GA/Looker-only fields such as browser, screen_resolution,
-    or new_users. ShopifyQL confirmed those are not available here.
-
-    When available, Shopify's own bot classification is applied:
-      WHERE human_or_bot_session != 'human_bot'
-    If that field is not available for any store/range, the function falls back
-    to Shopify sessions + online_store_visitors without that filter so the
-    pipeline keeps running.
+    Important:
+      - No human_or_bot_session filter here.
+      - No dashboard-side formula for conversion_rate.
+      - No _until(e) + 1 for this query; use the selected period end exactly.
     """
-    e_ql = _until(e)
-    source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
+    e_ql = e
+    source = "ShopifyQL sessions direct: sessions, online_store_visitors, pageviews, conversion_rate"
     row = ql_row(url, token,
-        f"FROM sessions SHOW online_store_visitors, sessions "
-        f"WHERE human_or_bot_session != 'human_bot' "
+        f"FROM sessions SHOW sessions, online_store_visitors, pageviews, conversion_rate "
         f"SINCE {s} UNTIL {e_ql}")
 
     if not row:
-        source = "ShopifyQL sessions + online_store_visitors"
-        row = ql_row(url, token,
-            f"FROM sessions SHOW online_store_visitors, sessions SINCE {s} UNTIL {e_ql}")
-
-    if not row:
-        print("    sessions: 0  online_store_visitors: 0  [ShopifyQL]")
-        return {"sessions": 0, "unique_visitors": 0, "traffic_source": source}
+        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  [ShopifyQL direct; UNTIL {e_ql}]")
+        return {"sessions": 0, "unique_visitors": 0, "pageviews": 0, "conversion_rate": 0, "traffic_source": source}
 
     sessions = int(abs(_m(row.get("sessions", 0))))
     unique = int(abs(_m(row.get("online_store_visitors", 0))))
-    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  [{source}]")
-    return {"sessions": sessions, "unique_visitors": unique, "traffic_source": source}
+    pageviews = int(abs(_m(row.get("pageviews", 0))))
+    cr = _gm(row.get("conversion_rate"))
+
+    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  conversion_rate: {cr:.2f}%  [{source}; UNTIL {e_ql}]")
+    return {
+        "sessions": sessions,
+        "unique_visitors": unique,
+        "pageviews": pageviews,
+        "conversion_rate": cr,
+        "traffic_source": source,
+    }
 
 def fetch_orders_fulfilled(url, token, s, e):
     e_ql = _until(e)
@@ -630,14 +629,16 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
     if isinstance(sessions, dict):
         sess = int(sessions.get("sessions") or 0)
         uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
+        pv   = int(sessions.get("pageviews") or 0)
+        cr   = float(sessions.get("conversion_rate") or 0)
     else:
         sess = int(sessions or 0)
         uv   = 0
-    # CR% = Transactions / Sessions. Use Shopify sales orders as the
-    # closest available transaction count; fulfilled orders can be higher/lower
-    # because it measures operations, not checkout transactions.
+        pv   = 0
+        cr   = 0
+    # CR% comes directly from ShopifyQL sessions.conversion_rate.
+    # Do not calculate it as orders/sessions in the dashboard pipeline.
     transactions = int(sales.get("orders", 0) or nb or 0)
-    cr    = round(transactions / sess * 100, 4) if sess else 0
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
     new_gp  = round(nvr.get("new_revenue",       0) * gm_rate, 2)
@@ -659,6 +660,7 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         "units_per_order":        upo,
         "sessions":               sess,
         "unique_visitors":        uv,
+        "pageviews":              pv,
         "conversion_rate":        cr,
         "transactions":           transactions,
         "new_customers":          nvr.get("new_customers",       0),
@@ -688,6 +690,7 @@ def make_kpi_row(now_str, period_key, s, e, cur):
         cur.get("units_per_order",        0),
         cur.get("sessions",               0),
         cur.get("unique_visitors",        0),
+        cur.get("pageviews",              0),
         cur.get("conversion_rate",        0),
         cur.get("new_customers",          0),
         cur.get("returning_customers",    0),
