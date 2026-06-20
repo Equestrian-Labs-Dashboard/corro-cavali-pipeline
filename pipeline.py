@@ -327,53 +327,30 @@ def fetch_sales(url, token, s, e):
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(url, token, s, e):
     """
-    Website KPIs must match Shopify Analytics / BI totals.
+    Website KPIs from ShopifyQL direct, without extra filters.
 
-    Source now mirrors the Shopify BI table the team is using:
-      FROM sessions
-      SHOW sessions, conversion_rate, bounce_rate, added_to_cart_rate,
-           online_store_visitors, pageviews
-      GROUP BY referring_channel WITH TOTALS
-      SINCE {start} UNTIL {end}
-
-    We then take the TOTALS/Summary row. This avoids using our own formulas and
-    avoids bot filters that make the dashboard differ from Shopify Analytics.
+    Safe restore:
+      - Does NOT touch sales/gross/net/cogs logic.
+      - No bot-filter applied.
+      - No grouped BI query applied.
+      - Uses the selected period end exactly for sessions.
+      - conversion_rate is read from ShopifyQL, not calculated.
     """
     e_ql = e
-    source = "ShopifyQL BI totals: sessions grouped by referring_channel WITH TOTALS"
-
-    q = (
-        f"FROM sessions "
-        f"SHOW sessions, conversion_rate, bounce_rate, added_to_cart_rate, online_store_visitors, pageviews "
-        f"GROUP BY referring_channel WITH TOTALS "
-        f"SINCE {s} UNTIL {e_ql}"
-    )
-    rows = ql_run(url, token, q)
-
-    def _pick_totals_row(rows_):
-        if not rows_:
-            return None
-        # Shopify may label the total row as Summary/Total, or may return a row
-        # without referring_channel. Prefer that row if present.
-        for r in rows_:
-            ch = str(r.get("referring_channel") or r.get("Referring channel") or r.get("referringChannel") or "").strip().lower()
-            if ch in ("summary", "total", "totals", "all", ""):
-                return r
-        # Defensive fallback: the totals row has the largest sessions count.
-        return max(rows_, key=lambda r: _m(r.get("sessions", 0)))
-
-    row = _pick_totals_row(rows)
-
-    # Fallback to ungrouped direct query only if BI totals query returns nothing.
-    if not row:
-        source = "ShopifyQL sessions direct fallback"
-        row = ql_row(url, token,
-            f"FROM sessions SHOW sessions, online_store_visitors, pageviews, conversion_rate "
-            f"SINCE {s} UNTIL {e_ql}")
+    source = "ShopifyQL direct sessions/pageviews/conversion_rate"
+    row = ql_row(url, token,
+        f"FROM sessions SHOW sessions, online_store_visitors, pageviews, conversion_rate "
+        f"SINCE {s} UNTIL {e_ql}")
 
     if not row:
-        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  [ShopifyQL BI totals; UNTIL {e_ql}]")
-        return {"sessions": 0, "unique_visitors": 0, "pageviews": 0, "conversion_rate": 0, "traffic_source": source}
+        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  [ShopifyQL direct; UNTIL {e_ql}]")
+        return {
+            "sessions": 0,
+            "unique_visitors": 0,
+            "pageviews": 0,
+            "conversion_rate": 0,
+            "traffic_source": source,
+        }
 
     sessions = int(abs(_m(row.get("sessions", 0))))
     unique = int(abs(_m(row.get("online_store_visitors", 0))))
@@ -663,7 +640,7 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         pv   = 0
         cr   = 0
     # CR% comes directly from ShopifyQL sessions.conversion_rate.
-    # Do not calculate it as orders/sessions in the dashboard pipeline.
+    # Do not calculate it as orders/sessions.
     transactions = int(sales.get("orders", 0) or nb or 0)
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
