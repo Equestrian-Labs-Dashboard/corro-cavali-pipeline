@@ -33,7 +33,7 @@ import re
 #   ❌ should NOT print the old Smartrr subscriber-summary tab logs
 #   ❌ should NOT request Shopify subscription contracts
 
-TIMEZONE    = pytz.timezone("America/Bogota")
+TIMEZONE    = pytz.timezone("America/New_York")
 GQL_VERSION = "2025-10"
 
 STORES = {
@@ -290,6 +290,15 @@ def _until(e):
     if e >= today:
         return e + timedelta(days=1)
     return e
+
+
+def _tz_offset(d):
+    """Return UTC offset for TIMEZONE on a date, e.g. -04:00 / -05:00."""
+    if isinstance(d, str):
+        d = date.fromisoformat(d)
+    local_dt = TIMEZONE.localize(datetime(d.year, d.month, d.day, 0, 0, 0))
+    z = local_dt.strftime("%z")
+    return z[:3] + ":" + z[3:]
 
 # ─────────────────────────────────────────────────────────────────
 # FETCH: SALES
@@ -552,8 +561,8 @@ def fetch_new_vs_returning(url, token, s, e):
     orders = rest(url, token, "orders.json", {
         "status":           "any",
         "financial_status": "paid,partially_paid,partially_refunded,refunded",
-        "created_at_min":   f"{s}T00:00:00-05:00",
-        "created_at_max":   f"{e}T23:59:59-05:00",
+        "created_at_min":   f"{s}T00:00:00{_tz_offset(s)}",
+        "created_at_max":   f"{e}T23:59:59{_tz_offset(e)}",
         "limit":            250,
         "fields":           "id,subtotal_price,created_at,customer",
     })
@@ -598,8 +607,8 @@ def fetch_orders(url, token, s, e):
     orders = rest(url, token, "orders.json", {
         "status":           "any",
         "financial_status": "paid,partially_paid,partially_refunded,refunded",
-        "created_at_min":   f"{s}T00:00:00-05:00",
-        "created_at_max":   f"{e}T23:59:59-05:00",
+        "created_at_min":   f"{s}T00:00:00{_tz_offset(s)}",
+        "created_at_max":   f"{e}T23:59:59{_tz_offset(e)}",
         "limit":            250,
         "fields":           "id,subtotal_price,created_at,line_items,source_name,tags,customer",
     })
