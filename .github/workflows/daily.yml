@@ -2,12 +2,10 @@ name: Daily Dashboard Pipeline
 
 on:
   schedule:
-    # GitHub Actions usa UTC, no zona horaria local.
-    # 21:45 UTC = 23:45 Netherlands en verano (CEST).
-    # 22:45 UTC = 23:45 Netherlands en invierno (CET).
-    # Dejamos ambos para que corra automáticamente al cierre del día europeo todo el año.
-    - cron: '45 21 * * *'
-    - cron: '45 22 * * *'
+    # GitHub Actions cron runs in UTC.
+    # 05:15 UTC = 00:15 New York in winter / 01:15 New York in summer.
+    # This guarantees the daily run happens AFTER North America / Eastern midnight.
+    - cron: '15 5 * * *'
   workflow_dispatch:
 
 jobs:
