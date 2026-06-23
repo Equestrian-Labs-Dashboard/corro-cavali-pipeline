@@ -583,7 +583,12 @@ function filterSmartrrRowsForCurrentPeriod(rows, opt) {
    DATE HELPERS
 ══════════════════════════════════════════════════════ */
 
-const NOW = new Date(), CY = NOW.getFullYear(), CM = NOW.getMonth();
+function nowInDashboardTZ() {
+  // Keep dashboard period selectors aligned with the automated pipeline.
+  // GitHub Actions runs after North America / Eastern midnight.
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+const NOW = nowInDashboardTZ(), CY = NOW.getFullYear(), CM = NOW.getMonth();
 const MN  = ["January","February","March","April","May","June",
               "July","August","September","October","November","December"];
 const DEFAULT_LTV_12M = 178;
