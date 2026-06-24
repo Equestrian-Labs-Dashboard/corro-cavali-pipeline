@@ -3,8 +3,9 @@ name: Daily Dashboard Pipeline
 on:
   schedule:
     # GitHub Actions cron runs in UTC.
-    # 05:15 UTC = 00:15 New York in winter / 01:15 New York in summer.
-    # This guarantees the daily run happens AFTER North America / Eastern midnight.
+    # 05:15 UTC = after North America / Eastern midnight.
+    # In winter this is 00:15 New York; in summer it is 01:15 New York.
+    # One automatic run per day only.
     - cron: '15 5 * * *'
   workflow_dispatch:
 
