@@ -62,6 +62,8 @@ HEADERS = [
     "pct_discount", "pct_returns", "pct_gm",
     "nb_orders", "nb_units", "aov", "units_per_order",
     "sessions", "unique_visitors", "pageviews", "conversion_rate",
+    "sessions_reached_checkout", "sessions_completed_checkout",
+    "checkout_abandonments", "checkout_abandonment_rate",
     "new_customers", "returning_customers",
     "new_revenue", "returning_revenue",
     "new_gross_profit", "returning_gross_profit",
@@ -338,12 +340,12 @@ def fetch_sessions(url, token, s, e):
     """
     Website KPIs from ShopifyQL direct, without extra filters.
 
-    Safe restore:
-      - Does NOT touch sales/gross/net/cogs logic.
-      - No bot-filter applied.
-      - No grouped BI query applied.
-      - Uses the selected period end exactly for sessions.
-      - conversion_rate is read from ShopifyQL, not calculated.
+    Checkout Abandonment Rate formula:
+      reached = sessions_that_reached_checkout
+      completed = sessions_that_reached_and_completed_checkout
+      abandonment_rate = (reached - completed) / reached
+
+    Stored as percent points for dashboard display, e.g. 45.0 means 45%.
     """
     e_ql = e
     source = "ShopifyQL direct sessions/pageviews/conversion_rate"
@@ -352,12 +354,16 @@ def fetch_sessions(url, token, s, e):
         f"SINCE {s} UNTIL {e_ql}")
 
     if not row:
-        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  [ShopifyQL direct; UNTIL {e_ql}]")
+        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  checkout_abandonment_rate: 0  [ShopifyQL direct; UNTIL {e_ql}]")
         return {
             "sessions": 0,
             "unique_visitors": 0,
             "pageviews": 0,
             "conversion_rate": 0,
+            "sessions_reached_checkout": 0,
+            "sessions_completed_checkout": 0,
+            "checkout_abandonments": 0,
+            "checkout_abandonment_rate": 0,
             "traffic_source": source,
         }
 
@@ -366,12 +372,32 @@ def fetch_sessions(url, token, s, e):
     pageviews = int(abs(_m(row.get("pageviews", 0))))
     cr = _gm(row.get("conversion_rate"))
 
-    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  conversion_rate: {cr:.2f}%  [{source}; UNTIL {e_ql}]")
+    # Keep this as a separate ShopifyQL call so the main Website KPIs do not fail
+    # if a store/range does not expose checkout funnel fields.
+    funnel_source = "ShopifyQL checkout funnel"
+    funnel = ql_row(url, token,
+        f"FROM sessions SHOW sessions_that_reached_checkout, sessions_that_reached_and_completed_checkout "
+        f"SINCE {s} UNTIL {e_ql}")
+
+    reached = int(abs(_m((funnel or {}).get("sessions_that_reached_checkout", 0))))
+    completed = int(abs(_m((funnel or {}).get("sessions_that_reached_and_completed_checkout", 0))))
+    abandoned = max(reached - completed, 0)
+    checkout_abandonment_rate = round((abandoned / reached * 100), 2) if reached else 0
+
+    print(
+        f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  "
+        f"conversion_rate: {cr:.2f}%  checkout_abandonment_rate: {checkout_abandonment_rate:.2f}% "
+        f"(reached={reached:,}, completed={completed:,})  [{source}; {funnel_source}; UNTIL {e_ql}]"
+    )
     return {
         "sessions": sessions,
         "unique_visitors": unique,
         "pageviews": pageviews,
         "conversion_rate": cr,
+        "sessions_reached_checkout": reached,
+        "sessions_completed_checkout": completed,
+        "checkout_abandonments": abandoned,
+        "checkout_abandonment_rate": checkout_abandonment_rate,
         "traffic_source": source,
     }
 
@@ -681,11 +707,19 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
         pv   = int(sessions.get("pageviews") or 0)
         cr   = float(sessions.get("conversion_rate") or 0)
+        reached_checkout = int(sessions.get("sessions_reached_checkout") or 0)
+        completed_checkout = int(sessions.get("sessions_completed_checkout") or 0)
+        checkout_abandonments = int(sessions.get("checkout_abandonments") or 0)
+        checkout_abandonment_rate = float(sessions.get("checkout_abandonment_rate") or 0)
     else:
         sess = int(sessions or 0)
         uv   = 0
         pv   = 0
         cr   = 0
+        reached_checkout = 0
+        completed_checkout = 0
+        checkout_abandonments = 0
+        checkout_abandonment_rate = 0
     # CR% comes directly from ShopifyQL sessions.conversion_rate.
     # Do not calculate it as orders/sessions.
     transactions = int(sales.get("orders", 0) or nb or 0)
@@ -712,6 +746,10 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         "unique_visitors":        uv,
         "pageviews":              pv,
         "conversion_rate":        cr,
+        "sessions_reached_checkout": reached_checkout,
+        "sessions_completed_checkout": completed_checkout,
+        "checkout_abandonments":  checkout_abandonments,
+        "checkout_abandonment_rate": checkout_abandonment_rate,
         "transactions":           transactions,
         "new_customers":          nvr.get("new_customers",       0),
         "returning_customers":    nvr.get("returning_customers", 0),
@@ -742,6 +780,10 @@ def make_kpi_row(now_str, period_key, s, e, cur):
         cur.get("unique_visitors",        0),
         cur.get("pageviews",              0),
         cur.get("conversion_rate",        0),
+        cur.get("sessions_reached_checkout", 0),
+        cur.get("sessions_completed_checkout", 0),
+        cur.get("checkout_abandonments",  0),
+        cur.get("checkout_abandonment_rate", 0),
         cur.get("new_customers",          0),
         cur.get("returning_customers",    0),
         cur.get("new_revenue",            0),
