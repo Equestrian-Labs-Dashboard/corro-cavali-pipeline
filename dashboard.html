@@ -1000,6 +1000,7 @@ const DEFS = {
     { k:"unique_visitors",  l:"Unique Visitors",  f:"int",  n:"online_store_visitors from ShopifyQL" },
     { k:"pageviews",        l:"Pageviews",        f:"int",  n:"pageviews from ShopifyQL" },
     { k:"conversion_rate",  l:"Conv. Rate",       f:"pct2", n:"conversion_rate from ShopifyQL" },
+    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"pct2", n:"(Reached checkout − completed checkout) ÷ reached checkout" },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
@@ -1880,7 +1881,7 @@ async function render(force=false) {
   if (root) root.classList.toggle("is-cavali", brand==="cavali");
   safeSet("mi-num", brand==="cavali" ? "07" : "06");
 
-  const skelIds = { "s-web": 4, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
+  const skelIds = { "s-web": 5, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
 
   const ovEl  = document.getElementById("ov");
