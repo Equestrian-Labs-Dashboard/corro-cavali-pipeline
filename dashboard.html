@@ -1997,13 +1997,29 @@ function setBrand(b) {
   brand = b;
   document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
   safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0; render();
+  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
+  cache = {};
+  render(true);
 }
 function setPT(p, el) {
+  const changed = ptype !== p;
   ptype = p;
+
+  // When switching tabs, always show the latest/current option for that tab.
+  // This prevents Week from staying on an old saved/previous week such as Jun 22–Jun 28
+  // after the pipeline has already written the current week Jun 29–Jun 30.
+  if (changed) {
+    if (p === "week") selW = WEEKS[0]?.val || selW;
+    if (p === "mtd") selMTD = MTDS[0]?.val || selMTD;
+    if (p === "month") selMo = MONTHS[0]?.val || selMo;
+    if (p === "quarter") selQ = QUARTERS[0]?.val || selQ;
+  }
+
   document.querySelectorAll(".period-btn").forEach(x=>x.classList.remove("on"));
   if (el) el.classList.add("on");
-  render();
+  cache = {};
+  renderSelbar();
+  render(true);
 }
 function toggleTheme() {
   const h=document.documentElement, dk=h.getAttribute("data-theme")==="dark";
