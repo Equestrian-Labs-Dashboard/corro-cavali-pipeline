@@ -875,10 +875,20 @@ function findRow(rows, opt) {
   }
   if (ptype==="month") {
     const pk=(opt.start||"").slice(0,7);
+
+    // Current month in the Month / MTD selector must always read mtd_YYYY-MM.
+    // Even if today is the last day of the month, do not use stale period="YYYY-MM" rows.
+    if (opt.cur) {
+      const mtd = exactRow(rows, `mtd_${pk}`, opt.start, opt.end);
+      if (mtd) return mtd;
+      m = rows.filter(r => String(r.period || "").trim() === `mtd_${pk}` && r.period_start === opt.start);
+      if (m.length) return bestRow(m);
+      return null;
+    }
+
     if (!isFullMonthOpt(opt)) {
       const mtd = exactRow(rows, `mtd_${pk}`, opt.start, opt.end);
       if (mtd) return mtd;
-      // Mes actual parcial: no usar filas viejas period="YYYY-MM" con period_end anterior.
       m=rows.filter(r=>r.period===pk && r.period_start===opt.start && r.period_end===opt.end);
       if(m.length) return bestRow(m);
       return null;
@@ -917,13 +927,16 @@ function findCmp(rows, opt) {
     const yr=parseInt((opt.start||"").slice(0,4)), mo=parseInt((opt.start||"").slice(5,7));
     if (!isNaN(yr) && !isNaN(mo)) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
-      if (!isFullMonthOpt(opt)) {
+
+      // Current month behaves as MTD, even on the last day of the month.
+      if (opt.cur || !isFullMonthOpt(opt)) {
         const dayLimit = dateFromISO(opt.end).getDate();
         const rg = mtdRange(py, pmo, dayLimit);
         const pk = `mtd_${py}-${String(pmo).padStart(2,'0')}`;
         const row = exactRow(rows, pk, rg.start, rg.end);
         return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
       }
+
       const pk=`${py}-${String(pmo).padStart(2,'0')}`;
       const lbl=new Date(py,pmo-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
       return { row:bestRow(rows.filter(r=>r.period===pk))||null, lbl:prev?lbl:`${lbl} (YOY)` };
