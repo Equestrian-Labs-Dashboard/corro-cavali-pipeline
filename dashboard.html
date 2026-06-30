@@ -947,10 +947,13 @@ function findCmp(rows, opt) {
     try {
       const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
       const me=new Date(opt.end+'T12:00');   me.setDate(me.getDate()-days);
-      const pk=`week_${iso(ms)}`;
-      let m=rows.filter(r=>r.period===pk);
-      if (!m.length) m=rows.filter(r=>r.period_start===iso(ms)&&r.period_end===iso(me));
-      return { row:bestRow(m)||null, lbl:`${fmtD(iso(ms))} – ${fmtD(iso(me))}${prev?'':' (YOY)'}` };
+      const st = iso(ms), en = iso(me), pk=`week_${st}`;
+
+      // Weekly comparison must be exact date-to-date.
+      // Do not use a full historical week when the current selected week is partial.
+      let m = rows.filter(r => r.period_start === st && r.period_end === en && String(r.period || "").startsWith("week_"));
+      if (!m.length) m = rows.filter(r => r.period === pk && r.period_start === st && r.period_end === en);
+      return { row:bestRow(m)||null, lbl:`${fmtD(st)} – ${fmtD(en)}${prev?'':' (YOY)'}` };
     } catch(e) {}
   }
   return { row:null, lbl:"" };
@@ -977,8 +980,7 @@ function pctChg(c, p) {
   return ((cv-pv)/Math.abs(pv)*100).toFixed(1);
 }
 function badge(pct, lbl, inv) {
-  // If comparison data does not exist for this KPI, do not show a fake YOY badge.
-  if (pct===null||pct===undefined) return "";
+  if (pct===null||pct===undefined) return `<span class="bdg bdg-neu"><span class="bdg-lbl">${lbl||"vs"}</span>—</span>`;
   const n=parseFloat(pct), up=n>=0, good=inv?!up:up;
   const arr = up
     ? `<svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M4 6V2M2 4l2-2 2 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`
@@ -1917,11 +1919,8 @@ async function render(force=false) {
   // Website
   safeHTML("s-web", DEFS.web.map(s => {
     const val = row ? fv(row[s.k], s.f) : "—";
-    const curVal = row ? parseFloat(row[s.k]) : NaN;
-    const cmpVal = cmpRow ? parseFloat(cmpRow[s.k]) : NaN;
-    const hasCmpMetric = cmpRow && !isNaN(curVal) && !isNaN(cmpVal) && cmpVal !== 0 && String(cmpRow[s.k] ?? "").trim() !== "";
-    const pct = hasCmpMetric ? pctChg(row[s.k], cmpRow[s.k]) : null;
-    return kcard(s.l, val, pct, hasCmpMetric ? cmpShort : "", s.n||"", undefined, false);
+    const pct = row&&cmpRow ? pctChg(row[s.k], cmpRow[s.k]) : null;
+    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
   }).join(''));
 
   // Financial
