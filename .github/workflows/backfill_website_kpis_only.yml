@@ -1,0 +1,51 @@
+name: Backfill Website KPIs Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      brands:
+        description: 'Brands to run: corro,cavali / corro / cavali'
+        required: false
+        default: 'corro,cavali'
+      fill_from:
+        description: 'Optional start date filter, e.g. 2024-01-01'
+        required: false
+        default: ''
+      fill_to:
+        description: 'Optional end date filter, e.g. 2026-12-31'
+        required: false
+        default: ''
+      update_existing:
+        description: 'Overwrite existing website KPI values? false recommended'
+        required: false
+        default: 'false'
+
+jobs:
+  backfill-website-kpis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests gspread google-auth
+
+      - name: Fill only Pageviews + Checkout Abandonment history
+        env:
+          SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
+          SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          RUN_BRANDS: ${{ github.event.inputs.brands }}
+          FILL_FROM: ${{ github.event.inputs.fill_from }}
+          FILL_TO: ${{ github.event.inputs.fill_to }}
+          UPDATE_EXISTING_WEBSITE_KPIS: ${{ github.event.inputs.update_existing }}
+        run: |
+          python -u backfill_WEBSITE_KPIS_ONLY.py
