@@ -949,10 +949,13 @@ function findCmp(rows, opt) {
       const me=new Date(opt.end+'T12:00');   me.setDate(me.getDate()-days);
       const st = iso(ms), en = iso(me), pk=`week_${st}`;
 
-      // Weekly comparison must be exact date-to-date.
-      // Do not use a full historical week when the current selected week is partial.
+      // Weekly comparison: use exact date-to-date when the row exists.
+      // Until the targeted week-YOY backfill is run, fall back to the available
+      // historical week row so YOY badges do not disappear.
       let m = rows.filter(r => r.period_start === st && r.period_end === en && String(r.period || "").startsWith("week_"));
       if (!m.length) m = rows.filter(r => r.period === pk && r.period_start === st && r.period_end === en);
+      if (!m.length) m = rows.filter(r => r.period === pk);
+      if (!m.length) m = rows.filter(r => r.period_start === st && String(r.period || "").startsWith("week_"));
       return { row:bestRow(m)||null, lbl:`${fmtD(st)} – ${fmtD(en)}${prev?'':' (YOY)'}` };
     } catch(e) {}
   }
