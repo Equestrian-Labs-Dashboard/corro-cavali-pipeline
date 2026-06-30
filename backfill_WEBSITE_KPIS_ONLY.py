@@ -11,12 +11,14 @@ API_VERSION = "2024-10"
 
 STORES = {
     "corro": {
-        "url": os.environ.get("SHOPIFY_STORE_CORRO", "corroshop.com"),
+        # Use SHOPIFY_URL_CORRO first to match pipeline.py.
+        # Default must be corroshop.com; equestrian-labs.myshopify.com returns 404.
+        "url": os.environ.get("SHOPIFY_URL_CORRO") or os.environ.get("SHOPIFY_STORE_CORRO") or "corroshop.com",
         "token": os.environ.get("SHOPIFY_TOKEN_CORRO", ""),
         "sheet_id": os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU"),
     },
     "cavali": {
-        "url": os.environ.get("SHOPIFY_STORE_CAVALI", "cavali-club.myshopify.com"),
+        "url": os.environ.get("SHOPIFY_URL_CAVALI") or os.environ.get("SHOPIFY_STORE_CAVALI") or "cavali-club.myshopify.com",
         "token": os.environ.get("SHOPIFY_TOKEN_CAVALI", ""),
         "sheet_id": os.environ.get("SHEET_ID_CAVALI", "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig"),
     },
@@ -226,7 +228,14 @@ def main():
                 continue
 
             print(f"    row {row_num}: {period} {start} → {end}")
-            data = fetch_website_extra(cfg["url"], cfg["token"], start, end)
+            try:
+                data = fetch_website_extra(cfg["url"], cfg["token"], start, end)
+            except Exception as exc:
+                # Do not fail the whole presentation backfill for one old period/API gap.
+                print(f"    ⚠ skipped row {row_num} {period}: {exc}")
+                skipped += 1
+                continue
+
             for col in TARGET_COLUMNS:
                 ci = idx[col] + 1
                 updates.append({
