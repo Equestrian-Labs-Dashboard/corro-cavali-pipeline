@@ -857,7 +857,7 @@ def get_periods():
         "mtd_yoy":      (yoy_mtd_s,    yoy_mtd_e,     yoy_mtd_pk),
         "week":         (wk_s,         wk_e,           wk_pk),
         "week_prev":    (pwk_s,        pwk_e,          pwk_pk),
-        "week_yoy":     (yoy_wk_s,     yoy_wk_e,       None),
+        "week_yoy":     (yoy_wk_s,     yoy_wk_e,       f"week_{yoy_wk_s}"),
         "month":        (mo_s,         mo_e,            mo_pk),
         "month_prev":   (pmo_s,        pmo_e,           pmo_pk),
         "month_yoy":    (yoy_mo_s,     yoy_mo_e,        None),
@@ -2326,6 +2326,8 @@ def main():
             {"label": "MTD_PREV",     "cur": "mtd_prev",     "is_snapshot": True},
             {"label": "MTD_YOY",      "cur": "mtd_yoy",      "is_snapshot": True},
             {"label": "WEEK",         "cur": "week",         "is_snapshot": False},
+            # Exact date-to-date weekly YOY row, required for weekly comparison badges.
+            {"label": "WEEK_YOY",     "cur": "week_yoy",     "is_snapshot": True},
             {"label": "MONTH",        "cur": "month",        "is_snapshot": False},
             {"label": "QUARTER",      "cur": "quarter",      "is_snapshot": False},
             {"label": "WEEK_PREV",    "cur": "week_prev",    "is_snapshot": True},
@@ -2391,7 +2393,7 @@ def main():
                   f"  gross:{float(row[4] or 0):>12,.2f}"
                   f"  net:{float(row[5] or 0):>12,.2f}"
                   f"  gp:{float(row[6] or 0):>10,.2f}"
-                  f"  new_cust:{int(row[20] or 0):>5}")
+                  f"  new_cust:{int(row[24] or 0):>5}")
 
 
 if __name__ == "__main__":
