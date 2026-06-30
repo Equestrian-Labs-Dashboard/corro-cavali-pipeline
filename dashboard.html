@@ -977,7 +977,8 @@ function pctChg(c, p) {
   return ((cv-pv)/Math.abs(pv)*100).toFixed(1);
 }
 function badge(pct, lbl, inv) {
-  if (pct===null||pct===undefined) return `<span class="bdg bdg-neu"><span class="bdg-lbl">${lbl||"vs"}</span>—</span>`;
+  // If comparison data does not exist for this KPI, do not show a fake YOY badge.
+  if (pct===null||pct===undefined) return "";
   const n=parseFloat(pct), up=n>=0, good=inv?!up:up;
   const arr = up
     ? `<svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M4 6V2M2 4l2-2 2 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`
@@ -1916,8 +1917,11 @@ async function render(force=false) {
   // Website
   safeHTML("s-web", DEFS.web.map(s => {
     const val = row ? fv(row[s.k], s.f) : "—";
-    const pct = row&&cmpRow ? pctChg(row[s.k], cmpRow[s.k]) : null;
-    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
+    const curVal = row ? parseFloat(row[s.k]) : NaN;
+    const cmpVal = cmpRow ? parseFloat(cmpRow[s.k]) : NaN;
+    const hasCmpMetric = cmpRow && !isNaN(curVal) && !isNaN(cmpVal) && cmpVal !== 0 && String(cmpRow[s.k] ?? "").trim() !== "";
+    const pct = hasCmpMetric ? pctChg(row[s.k], cmpRow[s.k]) : null;
+    return kcard(s.l, val, pct, hasCmpMetric ? cmpShort : "", s.n||"", undefined, false);
   }).join(''));
 
   // Financial
