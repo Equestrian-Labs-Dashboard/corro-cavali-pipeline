@@ -16,9 +16,9 @@ on:
         required: false
         default: ''
       update_existing:
-        description: 'Overwrite existing website KPI values? false recommended'
+        description: 'Overwrite existing website KPI values only? true recommended to replace zeros'
         required: false
-        default: 'false'
+        default: 'true'
 
 jobs:
   backfill-website-kpis:
