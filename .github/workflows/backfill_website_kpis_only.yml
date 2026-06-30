@@ -4,21 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       brands:
-        description: 'Brands to run: corro,cavali / corro / cavali'
+        description: 'Brands to run: corro / cavali / corro,cavali'
         required: false
-        default: 'corro,cavali'
+        default: 'corro'
       fill_from:
-        description: 'Optional start date filter, e.g. 2024-01-01'
+        description: 'Start date filter. Use small ranges to avoid ShopifyQL throttle.'
         required: false
-        default: ''
+        default: '2026-01-01'
       fill_to:
-        description: 'Optional end date filter, e.g. 2026-12-31'
+        description: 'End date filter. Empty = latest'
         required: false
         default: ''
       update_existing:
-        description: 'Overwrite existing website KPI values only? true recommended to replace zeros'
+        description: 'Overwrite website KPI values only? true replaces zeros'
         required: false
         default: 'true'
+      max_rows:
+        description: 'Max rows per brand per run. Keep 20-35 to avoid ShopifyQL throttle.'
+        required: false
+        default: '30'
+      sleep_between_rows:
+        description: 'Seconds to wait between ShopifyQL rows'
+        required: false
+        default: '2.5'
 
 jobs:
   backfill-website-kpis:
@@ -49,5 +57,7 @@ jobs:
           FILL_FROM: ${{ github.event.inputs.fill_from }}
           FILL_TO: ${{ github.event.inputs.fill_to }}
           UPDATE_EXISTING_WEBSITE_KPIS: ${{ github.event.inputs.update_existing }}
+          MAX_ROWS_PER_BRAND: ${{ github.event.inputs.max_rows }}
+          SLEEP_BETWEEN_ROWS: ${{ github.event.inputs.sleep_between_rows }}
         run: |
           python -u backfill_WEBSITE_KPIS_ONLY.py
