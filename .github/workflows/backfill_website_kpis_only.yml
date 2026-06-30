@@ -42,6 +42,8 @@ jobs:
         env:
           SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
           SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
+          SHOPIFY_URL_CORRO: ${{ secrets.SHOPIFY_URL_CORRO }}
+          SHOPIFY_URL_CAVALI: ${{ secrets.SHOPIFY_URL_CAVALI }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           RUN_BRANDS: ${{ github.event.inputs.brands }}
           FILL_FROM: ${{ github.event.inputs.fill_from }}
