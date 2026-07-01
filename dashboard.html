@@ -954,9 +954,11 @@ function resolveGrossProfit(row) {
 
 const DEFS = {
   web: [
-    { k:"sessions",         l:"Sessions",         f:"",  n:"Via ShopifyQL" },
-    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"New users / unique users when available" },
-    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"Transactions ÷ Sessions" },
+    { k:"sessions",         l:"Sessions",         f:"",  n:"ShopifyQL direct" },
+    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"online_store_visitors from ShopifyQL" },
+    { k:"pageviews",        l:"Pageviews",         f:"",  n:"pageviews from ShopifyQL" },
+    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"conversion_rate from ShopifyQL" },
+    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"%", n:"(Reached checkout − completed checkout) ÷ reached checkout" },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
