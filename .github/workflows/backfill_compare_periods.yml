@@ -1,0 +1,45 @@
+name: Backfill Compare Periods
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_brands:
+        description: "Brands to run: cavali,corro / cavali / corro"
+        required: false
+        default: "cavali,corro"
+
+jobs:
+  backfill-compare-periods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      RUN_BRANDS: ${{ github.event.inputs.run_brands || 'cavali,corro' }}
+      SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
+      SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
+      SHOPIFY_URL_CORRO: ${{ secrets.SHOPIFY_URL_CORRO }}
+      SHOPIFY_URL_CAVALI: ${{ secrets.SHOPIFY_URL_CAVALI }}
+      SHEET_ID_CORRO: ${{ secrets.SHEET_ID_CORRO }}
+      SHEET_ID_CAVALI: ${{ secrets.SHEET_ID_CAVALI }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      SMARTRR_API_KEY_CAVALI: ${{ secrets.SMARTRR_API_KEY_CAVALI }}
+      SMARTRR_TOKEN_CAVALI: ${{ secrets.SMARTRR_TOKEN_CAVALI }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth pytz
+
+      - name: Run compare periods backfill
+        run: |
+          echo "RUN_BRANDS=$RUN_BRANDS"
+          python -u backfill_compare_periods.py
