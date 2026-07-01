@@ -33,7 +33,7 @@ import re
 #   ❌ should NOT print the old Smartrr subscriber-summary tab logs
 #   ❌ should NOT request Shopify subscription contracts
 
-TIMEZONE    = pytz.timezone("America/New_York")
+TIMEZONE    = pytz.timezone("America/Bogota")
 GQL_VERSION = "2025-10"
 
 STORES = {
@@ -61,9 +61,7 @@ HEADERS = [
     "total_returns", "cogs",
     "pct_discount", "pct_returns", "pct_gm",
     "nb_orders", "nb_units", "aov", "units_per_order",
-    "sessions", "unique_visitors", "pageviews", "conversion_rate",
-    "sessions_reached_checkout", "sessions_completed_checkout",
-    "checkout_abandonments", "checkout_abandonment_rate",
+    "sessions", "unique_visitors", "conversion_rate",
     "new_customers", "returning_customers",
     "new_revenue", "returning_revenue",
     "new_gross_profit", "returning_gross_profit",
@@ -118,71 +116,6 @@ def get_gc():
     creds = Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
-
-
-# ─────────────────────────────────────────────────────────────────
-# GOOGLE SHEETS — retry wrapper for transient 429/5xx errors
-# ─────────────────────────────────────────────────────────────────
-GOOGLE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-
-
-def _gspread_status_code(exc):
-    """Return HTTP status code from gspread/API exceptions when available."""
-    resp = getattr(exc, "response", None)
-    code = getattr(resp, "status_code", None)
-    if code is not None:
-        try:
-            return int(code)
-        except Exception:
-            pass
-    # Some google/gspread errors expose code/status as string/int attributes.
-    for attr in ("code", "status"):
-        val = getattr(exc, attr, None)
-        if val is not None:
-            try:
-                return int(val)
-            except Exception:
-                pass
-    # Last defensive fallback: parse the exception string, e.g. "APIError: [503]".
-    m = re.search(r"\[(\d{3})\]", str(exc))
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    return None
-
-
-def _is_google_retryable(exc):
-    code = _gspread_status_code(exc)
-    if code in GOOGLE_RETRY_STATUS_CODES:
-        return True
-    return isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
-
-
-def google_retry(fn, label="Google Sheets request", max_retries=7):
-    """Retry transient Google Sheets/gspread errors, especially 503 service unavailable."""
-    last_exc = None
-    for attempt in range(max_retries + 1):
-        try:
-            return fn()
-        except Exception as exc:
-            last_exc = exc
-            if not _is_google_retryable(exc) or attempt >= max_retries:
-                raise
-            sleep_for = min(90.0, (2 ** attempt) + random.uniform(0.35, 1.75))
-            code = _gspread_status_code(exc) or "?"
-            print(f"    ⏳ Google Sheets transient HTTP {code} during {label}; retry {attempt + 1}/{max_retries} in {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-    if last_exc:
-        raise last_exc
-
-
-def get_or_create_ws(sh, title, rows, cols):
-    try:
-        return google_retry(lambda: sh.worksheet(title), f"open worksheet {title}")
-    except gspread.exceptions.WorksheetNotFound:
-        return google_retry(lambda: sh.add_worksheet(title, rows=rows, cols=cols), f"create worksheet {title}")
 
 # ─────────────────────────────────────────────────────────────────
 # SHOPIFY GQL — raw request
@@ -293,15 +226,6 @@ def _until(e):
         return e + timedelta(days=1)
     return e
 
-
-def _tz_offset(d):
-    """Return UTC offset for TIMEZONE on a date, e.g. -04:00 / -05:00."""
-    if isinstance(d, str):
-        d = date.fromisoformat(d)
-    local_dt = TIMEZONE.localize(datetime(d.year, d.month, d.day, 0, 0, 0))
-    z = local_dt.strftime("%z")
-    return z[:3] + ":" + z[3:]
-
 # ─────────────────────────────────────────────────────────────────
 # FETCH: SALES
 # ─────────────────────────────────────────────────────────────────
@@ -338,68 +262,42 @@ def fetch_sales(url, token, s, e):
 # ─────────────────────────────────────────────────────────────────
 def fetch_sessions(url, token, s, e):
     """
-    Website KPIs from ShopifyQL direct, without extra filters.
+    Section 01 source: Shopify only.
 
-    Checkout Abandonment Rate formula:
-      reached = sessions_that_reached_checkout
-      completed = sessions_that_reached_and_completed_checkout
-      abandonment_rate = (reached - completed) / reached
+    Formulas written to the dashboard:
+      - Traffic = sessions
+      - Unique Visitors = online_store_visitors
+      - CR% = Transactions / Sessions, calculated in build()
 
-    Stored as percent points for dashboard display, e.g. 45.0 means 45%.
+    We do NOT query GA/Looker-only fields such as browser, screen_resolution,
+    or new_users. ShopifyQL confirmed those are not available here.
+
+    When available, Shopify's own bot classification is applied:
+      WHERE human_or_bot_session != 'human_bot'
+    If that field is not available for any store/range, the function falls back
+    to Shopify sessions + online_store_visitors without that filter so the
+    pipeline keeps running.
     """
-    e_ql = e
-    source = "ShopifyQL direct sessions/pageviews/conversion_rate"
+    e_ql = _until(e)
+    source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
     row = ql_row(url, token,
-        f"FROM sessions SHOW sessions, online_store_visitors, pageviews, conversion_rate "
+        f"FROM sessions SHOW online_store_visitors, sessions "
+        f"WHERE human_or_bot_session != 'human_bot' "
         f"SINCE {s} UNTIL {e_ql}")
 
     if not row:
-        print(f"    sessions: 0  online_store_visitors: 0  pageviews: 0  conversion_rate: 0  checkout_abandonment_rate: 0  [ShopifyQL direct; UNTIL {e_ql}]")
-        return {
-            "sessions": 0,
-            "unique_visitors": 0,
-            "pageviews": 0,
-            "conversion_rate": 0,
-            "sessions_reached_checkout": 0,
-            "sessions_completed_checkout": 0,
-            "checkout_abandonments": 0,
-            "checkout_abandonment_rate": 0,
-            "traffic_source": source,
-        }
+        source = "ShopifyQL sessions + online_store_visitors"
+        row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions SINCE {s} UNTIL {e_ql}")
+
+    if not row:
+        print("    sessions: 0  online_store_visitors: 0  [ShopifyQL]")
+        return {"sessions": 0, "unique_visitors": 0, "traffic_source": source}
 
     sessions = int(abs(_m(row.get("sessions", 0))))
     unique = int(abs(_m(row.get("online_store_visitors", 0))))
-    pageviews = int(abs(_m(row.get("pageviews", 0))))
-    cr = _gm(row.get("conversion_rate"))
-
-    # Keep this as a separate ShopifyQL call so the main Website KPIs do not fail
-    # if a store/range does not expose checkout funnel fields.
-    funnel_source = "ShopifyQL checkout funnel"
-    funnel = ql_row(url, token,
-        f"FROM sessions SHOW sessions_that_reached_checkout, sessions_that_reached_and_completed_checkout "
-        f"SINCE {s} UNTIL {e_ql}")
-
-    reached = int(abs(_m((funnel or {}).get("sessions_that_reached_checkout", 0))))
-    completed = int(abs(_m((funnel or {}).get("sessions_that_reached_and_completed_checkout", 0))))
-    abandoned = max(reached - completed, 0)
-    checkout_abandonment_rate = round((abandoned / reached * 100), 2) if reached else 0
-
-    print(
-        f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  "
-        f"conversion_rate: {cr:.2f}%  checkout_abandonment_rate: {checkout_abandonment_rate:.2f}% "
-        f"(reached={reached:,}, completed={completed:,})  [{source}; {funnel_source}; UNTIL {e_ql}]"
-    )
-    return {
-        "sessions": sessions,
-        "unique_visitors": unique,
-        "pageviews": pageviews,
-        "conversion_rate": cr,
-        "sessions_reached_checkout": reached,
-        "sessions_completed_checkout": completed,
-        "checkout_abandonments": abandoned,
-        "checkout_abandonment_rate": checkout_abandonment_rate,
-        "traffic_source": source,
-    }
+    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  [{source}]")
+    return {"sessions": sessions, "unique_visitors": unique, "traffic_source": source}
 
 def fetch_orders_fulfilled(url, token, s, e):
     e_ql = _until(e)
@@ -415,60 +313,22 @@ def fetch_orders_fulfilled(url, token, s, e):
 # FETCH: REST ORDERS (new vs returning)
 # ─────────────────────────────────────────────────────────────────
 def rest(store_url, token, endpoint, params):
-    """
-    Shopify REST pagination with rate-limit protection.
-
-    Used by new_vs_returning and order line-items. If Shopify returns HTTP 429
-    during large periods, wait and retry instead of failing the whole pipeline.
-    """
     url     = f"https://{store_url}/admin/api/2024-01/{endpoint}"
     headers = {"X-Shopify-Access-Token": token}
     results = []
-    page_num = 0
-
     while url:
-        page_num += 1
-        for attempt in range(12):
-            r = requests.get(url, headers=headers, params=params, timeout=60)
-
-            if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
-                retry_after = r.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        sleep_for = float(retry_after)
-                    except Exception:
-                        sleep_for = 4.0
-                else:
-                    sleep_for = min(90.0, 4.0 + attempt * 3.0 + random.uniform(0.25, 1.25))
-                print(f"    Shopify REST {r.status_code} on {endpoint} page {page_num}; retry {attempt + 1}/12 in {sleep_for:.1f}s")
-                time.sleep(sleep_for)
-                continue
-
-            r.raise_for_status()
-
-            lim = r.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
-            try:
-                used, cap = [int(x) for x in lim.split("/", 1)]
-                if cap and used / cap >= 0.75:
-                    time.sleep(1.25)
-            except Exception:
-                pass
-
-            data = r.json()
-            key  = list(data.keys())[0]
-            results.extend(data[key])
-            link = r.headers.get("Link", "")
-            url  = None
-            params = {}
-            if 'rel="next"' in link:
-                for part in link.split(","):
-                    if 'rel="next"' in part:
-                        url = part.split(";")[0].strip().strip("<>")
-            break
-        else:
-            print(f"    ⚠ Shopify REST gave repeated 429 on {endpoint} page {page_num}; using partial REST data collected so far")
-            return results
-
+        r = requests.get(url, headers=headers, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        key  = list(data.keys())[0]
+        results.extend(data[key])
+        link = r.headers.get("Link", "")
+        url  = None
+        params = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
     return results
 
 
@@ -478,7 +338,7 @@ CUSTOMER_ORDER_COUNT_CACHE = {}
 CUSTOMER_FIRST_ORDER_DATE_CACHE = {}
 
 
-def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, max_retries=10):
+def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, max_retries=7):
     """Small REST GET helper for customer enrichment, with 429/5xx retry."""
     url = f"https://{store_url}/admin/api/2024-01/{endpoint}"
     headers = {"X-Shopify-Access-Token": token}
@@ -495,7 +355,7 @@ def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, m
                 except Exception:
                     sleep_for = 2.0
             else:
-                sleep_for = min(90, 4.0 + attempt * 3.0 + random.random())
+                sleep_for = min(45, (2 ** attempt) + random.random())
             print(f"    Shopify REST {r.status_code} on {endpoint}; retrying in {sleep_for:.1f}s")
             time.sleep(sleep_for)
             continue
@@ -587,8 +447,8 @@ def fetch_new_vs_returning(url, token, s, e):
     orders = rest(url, token, "orders.json", {
         "status":           "any",
         "financial_status": "paid,partially_paid,partially_refunded,refunded",
-        "created_at_min":   f"{s}T00:00:00{_tz_offset(s)}",
-        "created_at_max":   f"{e}T23:59:59{_tz_offset(e)}",
+        "created_at_min":   f"{s}T00:00:00-05:00",
+        "created_at_max":   f"{e}T23:59:59-05:00",
         "limit":            250,
         "fields":           "id,subtotal_price,created_at,customer",
     })
@@ -633,8 +493,8 @@ def fetch_orders(url, token, s, e):
     orders = rest(url, token, "orders.json", {
         "status":           "any",
         "financial_status": "paid,partially_paid,partially_refunded,refunded",
-        "created_at_min":   f"{s}T00:00:00{_tz_offset(s)}",
-        "created_at_max":   f"{e}T23:59:59{_tz_offset(e)}",
+        "created_at_min":   f"{s}T00:00:00-05:00",
+        "created_at_max":   f"{e}T23:59:59-05:00",
         "limit":            250,
         "fields":           "id,subtotal_price,created_at,line_items,source_name,tags,customer",
     })
@@ -705,24 +565,14 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
     if isinstance(sessions, dict):
         sess = int(sessions.get("sessions") or 0)
         uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
-        pv   = int(sessions.get("pageviews") or 0)
-        cr   = float(sessions.get("conversion_rate") or 0)
-        reached_checkout = int(sessions.get("sessions_reached_checkout") or 0)
-        completed_checkout = int(sessions.get("sessions_completed_checkout") or 0)
-        checkout_abandonments = int(sessions.get("checkout_abandonments") or 0)
-        checkout_abandonment_rate = float(sessions.get("checkout_abandonment_rate") or 0)
     else:
         sess = int(sessions or 0)
         uv   = 0
-        pv   = 0
-        cr   = 0
-        reached_checkout = 0
-        completed_checkout = 0
-        checkout_abandonments = 0
-        checkout_abandonment_rate = 0
-    # CR% comes directly from ShopifyQL sessions.conversion_rate.
-    # Do not calculate it as orders/sessions.
+    # CR% = Transactions / Sessions. Use Shopify sales orders as the
+    # closest available transaction count; fulfilled orders can be higher/lower
+    # because it measures operations, not checkout transactions.
     transactions = int(sales.get("orders", 0) or nb or 0)
+    cr    = round(transactions / sess * 100, 4) if sess else 0
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
     new_gp  = round(nvr.get("new_revenue",       0) * gm_rate, 2)
@@ -744,12 +594,7 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         "units_per_order":        upo,
         "sessions":               sess,
         "unique_visitors":        uv,
-        "pageviews":              pv,
         "conversion_rate":        cr,
-        "sessions_reached_checkout": reached_checkout,
-        "sessions_completed_checkout": completed_checkout,
-        "checkout_abandonments":  checkout_abandonments,
-        "checkout_abandonment_rate": checkout_abandonment_rate,
         "transactions":           transactions,
         "new_customers":          nvr.get("new_customers",       0),
         "returning_customers":    nvr.get("returning_customers", 0),
@@ -778,12 +623,7 @@ def make_kpi_row(now_str, period_key, s, e, cur):
         cur.get("units_per_order",        0),
         cur.get("sessions",               0),
         cur.get("unique_visitors",        0),
-        cur.get("pageviews",              0),
         cur.get("conversion_rate",        0),
-        cur.get("sessions_reached_checkout", 0),
-        cur.get("sessions_completed_checkout", 0),
-        cur.get("checkout_abandonments",  0),
-        cur.get("checkout_abandonment_rate", 0),
         cur.get("new_customers",          0),
         cur.get("returning_customers",    0),
         cur.get("new_revenue",            0),
@@ -860,7 +700,7 @@ def get_periods():
         "week_yoy":     (yoy_wk_s,     yoy_wk_e,       f"week_{yoy_wk_s}"),
         "month":        (mo_s,         mo_e,            mo_pk),
         "month_prev":   (pmo_s,        pmo_e,           pmo_pk),
-        "month_yoy":    (yoy_mo_s,     yoy_mo_e,        None),
+        "month_yoy":    (yoy_mo_s,     yoy_mo_e,        yoy_mo_s.strftime("%Y-%m")),
         "quarter":      (q_s,          q_e,             q_pk),
         "quarter_prev": (pq_s,         pq_e,            pq_pk),
         "quarter_yoy":  (yoy_q_s,      yoy_q_e,         yoy_q_pk),
@@ -2056,10 +1896,13 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
 
 def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
     """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
-    sh = google_retry(lambda: gc.open_by_key(sheet_id), f"open spreadsheet {sheet_id}")
-    ws = get_or_create_ws(sh, "smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet("smartrr_product_volume")
+    except Exception:
+        ws = sh.add_worksheet("smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
 
-    vals = google_retry(lambda: ws.get_all_values(), "read smartrr_product_volume")
+    vals = ws.get_all_values()
     keep = []
     replace = {str(p).strip() for p in periods_to_replace if p}
     if len(vals) >= 2:
@@ -2093,10 +1936,10 @@ def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
         )
     )
 
-    google_retry(lambda: ws.clear(), "clear smartrr_product_volume")
-    google_retry(lambda: ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS), "write smartrr_product_volume header")
+    ws.clear()
+    ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
     if merged:
-        google_retry(lambda: ws.append_rows(merged, value_input_option="USER_ENTERED"), "write smartrr_product_volume rows")
+        ws.append_rows(merged, value_input_option="USER_ENTERED")
     print(f"    smartrr_product_volume: {len(cleaned_rows)} refreshed rows; {len(merged)} total rows")
 
 
@@ -2143,12 +1986,13 @@ def _map_to_row(headers, m):
 # WRITE — upsert (no borra datos históricos)
 # ─────────────────────────────────────────────────────────────────
 def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
-    sh = google_retry(lambda: gc.open_by_key(sheet_id), f"open spreadsheet {sheet_id}")
+    sh = gc.open_by_key(sheet_id)
 
     # ── kpis_daily ──────────────────────────────────────────────
-    ws = get_or_create_ws(sh, "kpis_daily", rows=600, cols=40)
+    try:    ws = sh.worksheet("kpis_daily")
+    except: ws = sh.add_worksheet("kpis_daily", rows=600, cols=40)
 
-    existing_vals = google_retry(lambda: ws.get_all_values(), "read smartrr_product_volume")
+    existing_vals = ws.get_all_values()
     existing = {}
     if len(existing_vals) >= 2:
         ex_h = existing_vals[0]
@@ -2161,14 +2005,15 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         existing[str(r[1]).strip()] = r
 
     merged = sorted(existing.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
-    google_retry(lambda: ws.clear(), "clear kpis_daily")
-    google_retry(lambda: ws.append_row(HEADERS), "write kpis_daily header")
+    ws.clear()
+    ws.append_row(HEADERS)
     if merged:
-        google_retry(lambda: ws.append_rows(merged, value_input_option="USER_ENTERED"), "write kpis_daily rows")
+        ws.append_rows(merged, value_input_option="USER_ENTERED")
     print(f"    kpis_daily: {len(merged)} rows")
 
     # ── revenue_share ────────────────────────────────────────────
-    ws_rs = get_or_create_ws(sh, "revenue_share", rows=600, cols=12)
+    try:    ws_rs = sh.worksheet("revenue_share")
+    except: ws_rs = sh.add_worksheet("revenue_share", rows=600, cols=12)
 
     rs_headers = [
         "updated_at", "period", "channel",
@@ -2177,7 +2022,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         "pct_prev", "pct_chg",
         "gp_is_estimate",
     ]
-    rs_vals = google_retry(lambda: ws_rs.get_all_values(), "read revenue_share")
+    rs_vals = ws_rs.get_all_values()
     existing_rs = {}
     if len(rs_vals) >= 2:
         ex_h = rs_vals[0]
@@ -2231,14 +2076,15 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         r[8] = pct_chg  if pct_chg  is not None else ""
 
     merged_rs = sorted(existing_rs.values(), key=lambda r: (str(r[1]), str(r[2])))
-    google_retry(lambda: ws_rs.clear(), "clear revenue_share")
-    google_retry(lambda: ws_rs.append_row(rs_headers), "write revenue_share header")
+    ws_rs.clear()
+    ws_rs.append_row(rs_headers)
     if merged_rs:
-        google_retry(lambda: ws_rs.append_rows(merged_rs, value_input_option="USER_ENTERED"), "write revenue_share rows")
+        ws_rs.append_rows(merged_rs, value_input_option="USER_ENTERED")
     print(f"    revenue_share: {len(merged_rs)} rows")
 
     # ── new_vs_returning ─────────────────────────────────────────
-    ws_nvr = get_or_create_ws(sh, "new_vs_returning", rows=300, cols=12)
+    try:    ws_nvr = sh.worksheet("new_vs_returning")
+    except: ws_nvr = sh.add_worksheet("new_vs_returning", rows=300, cols=12)
 
     nvr_headers = [
         "updated_at", "period", "period_start", "period_end",
@@ -2246,7 +2092,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         "new_revenue", "returning_revenue",
         "new_gross_profit", "returning_gross_profit",
     ]
-    nvr_vals = google_retry(lambda: ws_nvr.get_all_values(), "read new_vs_returning")
+    nvr_vals = ws_nvr.get_all_values()
     existing_nvr = {}
     if len(nvr_vals) >= 2:
         ex_h = nvr_vals[0]
@@ -2259,14 +2105,15 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         existing_nvr[str(r[1]).strip()] = r
 
     merged_nvr = sorted(existing_nvr.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
-    google_retry(lambda: ws_nvr.clear(), "clear new_vs_returning")
-    google_retry(lambda: ws_nvr.append_row(nvr_headers), "write new_vs_returning header")
+    ws_nvr.clear()
+    ws_nvr.append_row(nvr_headers)
     if merged_nvr:
-        google_retry(lambda: ws_nvr.append_rows(merged_nvr, value_input_option="USER_ENTERED"), "write new_vs_returning rows")
+        ws_nvr.append_rows(merged_nvr, value_input_option="USER_ENTERED")
     print(f"    new_vs_returning: {len(merged_nvr)} rows")
 
     # ── ad_spend ─────────────────────────────────────────────────
-    ws_ad = get_or_create_ws(sh, "ad_spend", rows=200, cols=10)
+    try:    ws_ad = sh.worksheet("ad_spend")
+    except: ws_ad = sh.add_worksheet("ad_spend", rows=200, cols=10)
 
     ad_headers = [
         "updated_at", "brand", "period", "period_start", "period_end",
@@ -2299,10 +2146,10 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
             spend, vals.get("roas", 0), vals.get("cos", 0), cac_auto,
         ])
 
-    google_retry(lambda: ws_ad.clear(), "clear ad_spend")
-    google_retry(lambda: ws_ad.append_row(ad_headers), "write ad_spend header")
+    ws_ad.clear()
+    ws_ad.append_row(ad_headers)
     if ad_rows:
-        google_retry(lambda: ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED"), "write ad_spend rows")
+        ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED")
     print(f"    ad_spend: {len(ad_rows)} months")
 
 # ─────────────────────────────────────────────────────────────────
@@ -2326,13 +2173,14 @@ def main():
             {"label": "MTD_PREV",     "cur": "mtd_prev",     "is_snapshot": True},
             {"label": "MTD_YOY",      "cur": "mtd_yoy",      "is_snapshot": True},
             {"label": "WEEK",         "cur": "week",         "is_snapshot": False},
-            # Exact date-to-date weekly YOY row, required for weekly comparison badges.
-            {"label": "WEEK_YOY",     "cur": "week_yoy",     "is_snapshot": True},
             {"label": "MONTH",        "cur": "month",        "is_snapshot": False},
             {"label": "QUARTER",      "cur": "quarter",      "is_snapshot": False},
             {"label": "WEEK_PREV",    "cur": "week_prev",    "is_snapshot": True},
+            {"label": "WEEK_YOY",     "cur": "week_yoy",     "is_snapshot": True},
             {"label": "MONTH_PREV",   "cur": "month_prev",   "is_snapshot": True},
+            {"label": "MONTH_YOY",    "cur": "month_yoy",    "is_snapshot": True},
             {"label": "QUARTER_PREV", "cur": "quarter_prev", "is_snapshot": True},
+            {"label": "QUARTER_YOY",  "cur": "quarter_yoy",  "is_snapshot": True},
         ]
 
         for it in periods_to_run:
@@ -2393,7 +2241,7 @@ def main():
                   f"  gross:{float(row[4] or 0):>12,.2f}"
                   f"  net:{float(row[5] or 0):>12,.2f}"
                   f"  gp:{float(row[6] or 0):>10,.2f}"
-                  f"  new_cust:{int(row[24] or 0):>5}")
+                  f"  new_cust:{int(row[20] or 0):>5}")
 
 
 if __name__ == "__main__":
