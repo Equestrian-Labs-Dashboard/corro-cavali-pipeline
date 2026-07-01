@@ -61,7 +61,7 @@ HEADERS = [
     "total_returns", "cogs",
     "pct_discount", "pct_returns", "pct_gm",
     "nb_orders", "nb_units", "aov", "units_per_order",
-    "sessions", "unique_visitors", "conversion_rate",
+    "sessions", "unique_visitors", "pageviews", "conversion_rate", "checkout_abandonment_rate",
     "new_customers", "returning_customers",
     "new_revenue", "returning_revenue",
     "new_gross_profit", "returning_gross_profit",
@@ -267,37 +267,94 @@ def fetch_sessions(url, token, s, e):
     Formulas written to the dashboard:
       - Traffic = sessions
       - Unique Visitors = online_store_visitors
-      - CR% = Transactions / Sessions, calculated in build()
+      - Pageviews = pageviews
+      - CR% = ShopifyQL conversion_rate when available, fallback to Orders / Sessions
+      - Checkout Abandonment Rate = 100 - ShopifyQL checkout_conversion_rate when available
 
     We do NOT query GA/Looker-only fields such as browser, screen_resolution,
     or new_users. ShopifyQL confirmed those are not available here.
 
     When available, Shopify's own bot classification is applied:
       WHERE human_or_bot_session != 'human_bot'
-    If that field is not available for any store/range, the function falls back
-    to Shopify sessions + online_store_visitors without that filter so the
-    pipeline keeps running.
+    If a metric is not available for any store/range, the function falls back
+    gracefully so the pipeline keeps running.
     """
     e_ql = _until(e)
-    source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
-    row = ql_row(url, token,
-        f"FROM sessions SHOW online_store_visitors, sessions "
+
+    def _first_nonzero(*vals):
+        for v in vals:
+            n = _m(v)
+            if n:
+                return n
+        return 0
+
+    base_row = ql_row(url, token,
+        f"FROM sessions SHOW online_store_visitors, sessions, pageviews, conversion_rate "
         f"WHERE human_or_bot_session != 'human_bot' "
         f"SINCE {s} UNTIL {e_ql}")
 
-    if not row:
-        source = "ShopifyQL sessions + online_store_visitors"
-        row = ql_row(url, token,
+    source = "ShopifyQL sessions + online_store_visitors + pageviews + conversion_rate; exclude human_bot"
+
+    if not base_row:
+        base_row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions, pageviews, conversion_rate "
+            f"SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors + pageviews + conversion_rate"
+
+    if not base_row:
+        # Minimal fallback if pageviews/conversion_rate are not accepted in any store.
+        base_row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions "
+            f"WHERE human_or_bot_session != 'human_bot' "
+            f"SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
+
+    if not base_row:
+        base_row = ql_row(url, token,
             f"FROM sessions SHOW online_store_visitors, sessions SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors"
 
-    if not row:
-        print("    sessions: 0  online_store_visitors: 0  [ShopifyQL]")
-        return {"sessions": 0, "unique_visitors": 0, "traffic_source": source}
+    # Separate optional query: checkout_conversion_rate is not available in every shop/report.
+    checkout_rate = None
+    checkout_row = ql_row(url, token,
+        f"FROM sessions SHOW checkout_conversion_rate "
+        f"WHERE human_or_bot_session != 'human_bot' "
+        f"SINCE {s} UNTIL {e_ql}")
+    if not checkout_row:
+        checkout_row = ql_row(url, token,
+            f"FROM sessions SHOW checkout_conversion_rate SINCE {s} UNTIL {e_ql}")
+    if checkout_row:
+        checkout_rate = _gm(
+            checkout_row.get("checkout_conversion_rate")
+            or checkout_row.get("checkoutConversionRate")
+            or checkout_row.get("checkout conversion rate")
+        )
 
-    sessions = int(abs(_m(row.get("sessions", 0))))
-    unique = int(abs(_m(row.get("online_store_visitors", 0))))
-    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  [{source}]")
-    return {"sessions": sessions, "unique_visitors": unique, "traffic_source": source}
+    if not base_row:
+        print("    sessions: 0  online_store_visitors: 0  pageviews: 0  [ShopifyQL]")
+        return {"sessions": 0, "unique_visitors": 0, "pageviews": 0, "conversion_rate": 0, "checkout_abandonment_rate": "", "traffic_source": source}
+
+    sessions = int(abs(_m(base_row.get("sessions", 0))))
+    unique = int(abs(_m(base_row.get("online_store_visitors", 0))))
+    pageviews = int(abs(_m(base_row.get("pageviews", 0))))
+    conversion_rate = _gm(base_row.get("conversion_rate"))
+
+    # Abandonment = Reached checkout not completed / reached checkout.
+    # ShopifyQL exposes the inverse as checkout_conversion_rate when available.
+    checkout_abandonment = ""
+    if checkout_rate is not None and checkout_rate >= 0:
+        checkout_abandonment = round(max(0, min(100, 100 - checkout_rate)), 4)
+
+    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  cr:{conversion_rate}%  checkout_abandonment:{checkout_abandonment}  [{source}]")
+    return {
+        "sessions": sessions,
+        "unique_visitors": unique,
+        "pageviews": pageviews,
+        "conversion_rate": conversion_rate,
+        "checkout_abandonment_rate": checkout_abandonment,
+        "traffic_source": source,
+    }
+
 
 def fetch_orders_fulfilled(url, token, s, e):
     e_ql = _until(e)
@@ -316,12 +373,43 @@ def rest(store_url, token, endpoint, params):
     url     = f"https://{store_url}/admin/api/2024-01/{endpoint}"
     headers = {"X-Shopify-Access-Token": token}
     results = []
+
     while url:
-        r = requests.get(url, headers=headers, params=params, timeout=60)
-        r.raise_for_status()
+        last_resp = None
+        for attempt in range(8):
+            r = requests.get(url, headers=headers, params=params, timeout=60)
+            last_resp = r
+
+            if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    sleep_for = float(retry_after) if retry_after else min(60, (2 ** attempt) + random.random())
+                except Exception:
+                    sleep_for = min(60, (2 ** attempt) + random.random())
+                print(f"    Shopify REST {r.status_code} on {endpoint}; retrying in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                continue
+
+            r.raise_for_status()
+            break
+        else:
+            if last_resp is not None:
+                last_resp.raise_for_status()
+            return results
+
         data = r.json()
         key  = list(data.keys())[0]
         results.extend(data[key])
+
+        # Be gentle with Shopify REST pagination.
+        lim = r.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+        try:
+            used, cap = [int(x) for x in lim.split("/", 1)]
+            if cap and used / cap >= 0.75:
+                time.sleep(0.75)
+        except Exception:
+            pass
+
         link = r.headers.get("Link", "")
         url  = None
         params = {}
@@ -329,7 +417,9 @@ def rest(store_url, token, endpoint, params):
             for part in link.split(","):
                 if 'rel="next"' in part:
                     url = part.split(";")[0].strip().strip("<>")
+                    break
     return results
+
 
 
 
@@ -565,14 +655,21 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
     if isinstance(sessions, dict):
         sess = int(sessions.get("sessions") or 0)
         uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
+        pageviews = int(sessions.get("pageviews") or 0)
+        shopify_cr = sessions.get("conversion_rate")
+        checkout_abandonment_rate = sessions.get("checkout_abandonment_rate", "")
     else:
         sess = int(sessions or 0)
         uv   = 0
-    # CR% = Transactions / Sessions. Use Shopify sales orders as the
-    # closest available transaction count; fulfilled orders can be higher/lower
-    # because it measures operations, not checkout transactions.
+        pageviews = 0
+        shopify_cr = None
+        checkout_abandonment_rate = ""
+    # CR% = ShopifyQL conversion_rate when available. Fallback to Transactions / Sessions.
     transactions = int(sales.get("orders", 0) or nb or 0)
-    cr    = round(transactions / sess * 100, 4) if sess else 0
+    try:
+        cr = round(float(shopify_cr), 4) if shopify_cr not in (None, "", "None") else (round(transactions / sess * 100, 4) if sess else 0)
+    except Exception:
+        cr = round(transactions / sess * 100, 4) if sess else 0
 
     gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
     new_gp  = round(nvr.get("new_revenue",       0) * gm_rate, 2)
@@ -594,7 +691,9 @@ def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
         "units_per_order":        upo,
         "sessions":               sess,
         "unique_visitors":        uv,
+        "pageviews":              pageviews,
         "conversion_rate":        cr,
+        "checkout_abandonment_rate": checkout_abandonment_rate,
         "transactions":           transactions,
         "new_customers":          nvr.get("new_customers",       0),
         "returning_customers":    nvr.get("returning_customers", 0),
@@ -623,7 +722,9 @@ def make_kpi_row(now_str, period_key, s, e, cur):
         cur.get("units_per_order",        0),
         cur.get("sessions",               0),
         cur.get("unique_visitors",        0),
+        cur.get("pageviews",              0),
         cur.get("conversion_rate",        0),
+        cur.get("checkout_abandonment_rate", ""),
         cur.get("new_customers",          0),
         cur.get("returning_customers",    0),
         cur.get("new_revenue",            0),
