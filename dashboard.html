@@ -284,12 +284,12 @@ select:focus{border-color:var(--gr)}
       <div style="width:5px;height:5px;border-radius:50%;background:#A090FF"></div>Cavali
     </a>
     <div class="sb-sec" style="margin-top:6px">Analytics Suite</div>
-    <a class="sb-suite" href="https://equestrian-labs-dashboard.github.io/corro-pareto/" target="_blank">
+    <a class="sb-suite" href="https://arojas-company.github.io/corro-pareto/" target="_blank">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><rect x=".5" y="6" width="2" height="4.5" rx=".5" fill="#D8B054"/><rect x="3.5" y="3.5" width="2" height="7" rx=".5" fill="#D8B054" opacity=".7"/><rect x="6.5" y="1" width="2" height="9.5" rx=".5" fill="#D8B054" opacity=".4"/></svg>
       <span>Pareto Analysis</span>
       <span class="sb-badge" style="background:rgba(216,176,84,.12);color:#D8B054;border:1px solid rgba(216,176,84,.25)">GP</span>
     </a>
-    <a class="sb-suite" href="https://equestrian-labs-dashboard.github.io/corro-frequency/" target="_blank">
+    <a class="sb-suite" href="https://arojas-company.github.io/corro-frequency/" target="_blank">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="2" cy="5.5" r="1.5" fill="#72AEFF"/><circle cx="5.5" cy="3" r="1.5" fill="#72AEFF" opacity=".7"/><circle cx="9" cy="6.5" r="1.5" fill="#72AEFF" opacity=".4"/><path d="M2 5.5L5.5 3L9 6.5" stroke="#72AEFF" stroke-width="1" stroke-opacity=".4"/></svg>
       <span>Frequency</span>
       <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#72AEFF;border:1px solid rgba(114,174,255,.25)">RET</span>
@@ -583,12 +583,7 @@ function filterSmartrrRowsForCurrentPeriod(rows, opt) {
    DATE HELPERS
 ══════════════════════════════════════════════════════ */
 
-function nowInDashboardTZ() {
-  // Align dashboard current-day selectors with the daily pipeline schedule.
-  // The pipeline runs once after North America / Eastern midnight.
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
-}
-const NOW = nowInDashboardTZ(), CY = NOW.getFullYear(), CM = NOW.getMonth();
+const NOW = new Date(), CY = NOW.getFullYear(), CM = NOW.getMonth();
 const MN  = ["January","February","March","April","May","June",
               "July","August","September","October","November","December"];
 const DEFAULT_LTV_12M = 178;
@@ -619,26 +614,12 @@ function exactRow(rows, pk, start, end) {
     const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
     return m ? m[1] : s;
   };
-  const dateVal = (v) => {
-    const d = normDate(v);
-    return d ? Date.parse(d + "T12:00:00") : 0;
-  };
   const st = normDate(start), en = normDate(end);
-  const endLimit = dateVal(en);
   let m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_start) === st && normDate(r.period_end) === en);
   if (m.length) return bestRow(m);
   m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_end) === en);
   if (m.length) return bestRow(m);
   m = rows.filter(r => normDate(r.period_start) === st && normDate(r.period_end) === en && String(r.period || "").startsWith("mtd_"));
-  if (m.length) return bestRow(m);
-  // Si el dashboard pide una fecha exacta que todavía no está en Sheets,
-  // usar el último MTD disponible del mismo mes, siempre que sea <= fecha seleccionada.
-  m = rows.filter(r => {
-    const rp = String(r.period || "").trim();
-    const rs = normDate(r.period_start);
-    const re = normDate(r.period_end);
-    return rp === pk && rs === st && re && dateVal(re) <= endLimit;
-  });
   return m.length ? bestRow(m) : null;
 }
 function isFullMonthOpt(opt) {
@@ -782,8 +763,7 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
 
   __tabInflight[batchKey] = (async () => {
     const ranges = need.map(t => `ranges=${encodeURIComponent(t)}`).join('&');
-    const cacheBust = `&_=${Date.now()}`;
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}${cacheBust}`;
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 25000);
@@ -827,8 +807,8 @@ async function fetchTabsBatch(sid, tabs, opts = {}) {
 
 async function fetchTab(sid, tab, opts = {}) {
   const k = `${sid}__${tab}`;
-  if (!opts.force && cache[k]) return cache[k];
-  const local = !opts.force ? __loadTabLocal(sid, tab) : null;
+  if (cache[k]) return cache[k];
+  const local = __loadTabLocal(sid, tab);
   if (local) { cache[k] = local; return local; }
   const result = await fetchTabsBatch(sid, [tab], opts);
   return result[tab] || [];
@@ -836,23 +816,7 @@ async function fetchTab(sid, tab, opts = {}) {
 
 function bestRow(arr) {
   if (!arr || !arr.length) return null;
-  const normDate = (v) => {
-    const s = String(v || "").trim();
-    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] : "";
-  };
-  const dateVal = (v) => {
-    const d = normDate(v);
-    return d ? Date.parse(d + "T12:00:00") : 0;
-  };
-  const updVal = (v) => {
-    const s = String(v || "").trim().replace(" ", "T");
-    return Date.parse(s) || 0;
-  };
-  return [...arr].sort((a,b) =>
-    (dateVal(b.period_end) - dateVal(a.period_end)) ||
-    (updVal(b.updated_at) - updVal(a.updated_at))
-  )[0] || null;
+  return arr.sort((a,b) => (Date.parse(b.updated_at)||0) - (Date.parse(a.updated_at)||0))[0] || null;
 }
 
 function findRow(rows, opt) {
@@ -875,23 +839,9 @@ function findRow(rows, opt) {
   }
   if (ptype==="month") {
     const pk=(opt.start||"").slice(0,7);
-
-    // Current month in the Month / MTD selector must always read mtd_YYYY-MM.
-    // Even if today is the last day of the month, do not use stale period="YYYY-MM" rows.
-    if (opt.cur) {
-      const mtd = exactRow(rows, `mtd_${pk}`, opt.start, opt.end);
-      if (mtd) return mtd;
-      m = rows.filter(r => String(r.period || "").trim() === `mtd_${pk}` && r.period_start === opt.start);
-      if (m.length) return bestRow(m);
-      return null;
-    }
-
     if (!isFullMonthOpt(opt)) {
       const mtd = exactRow(rows, `mtd_${pk}`, opt.start, opt.end);
       if (mtd) return mtd;
-      m=rows.filter(r=>r.period===pk && r.period_start===opt.start && r.period_end===opt.end);
-      if(m.length) return bestRow(m);
-      return null;
     }
     m=rows.filter(r=>r.period===pk); if(m.length) return bestRow(m);
     m=rows.filter(r=>r.period_start===opt.start&&r.period_end===opt.end); if(m.length) return bestRow(m);
@@ -927,16 +877,13 @@ function findCmp(rows, opt) {
     const yr=parseInt((opt.start||"").slice(0,4)), mo=parseInt((opt.start||"").slice(5,7));
     if (!isNaN(yr) && !isNaN(mo)) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
-
-      // Current month behaves as MTD, even on the last day of the month.
-      if (opt.cur || !isFullMonthOpt(opt)) {
+      if (!isFullMonthOpt(opt)) {
         const dayLimit = dateFromISO(opt.end).getDate();
         const rg = mtdRange(py, pmo, dayLimit);
         const pk = `mtd_${py}-${String(pmo).padStart(2,'0')}`;
         const row = exactRow(rows, pk, rg.start, rg.end);
         return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
       }
-
       const pk=`${py}-${String(pmo).padStart(2,'0')}`;
       const lbl=new Date(py,pmo-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
       return { row:bestRow(rows.filter(r=>r.period===pk))||null, lbl:prev?lbl:`${lbl} (YOY)` };
@@ -947,16 +894,10 @@ function findCmp(rows, opt) {
     try {
       const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
       const me=new Date(opt.end+'T12:00');   me.setDate(me.getDate()-days);
-      const st = iso(ms), en = iso(me), pk=`week_${st}`;
-
-      // Weekly comparison: use exact date-to-date when the row exists.
-      // Until the targeted week-YOY backfill is run, fall back to the available
-      // historical week row so YOY badges do not disappear.
-      let m = rows.filter(r => r.period_start === st && r.period_end === en && String(r.period || "").startsWith("week_"));
-      if (!m.length) m = rows.filter(r => r.period === pk && r.period_start === st && r.period_end === en);
-      if (!m.length) m = rows.filter(r => r.period === pk);
-      if (!m.length) m = rows.filter(r => r.period_start === st && String(r.period || "").startsWith("week_"));
-      return { row:bestRow(m)||null, lbl:`${fmtD(st)} – ${fmtD(en)}${prev?'':' (YOY)'}` };
+      const pk=`week_${iso(ms)}`;
+      let m=rows.filter(r=>r.period===pk);
+      if (!m.length) m=rows.filter(r=>r.period_start===iso(ms)&&r.period_end===iso(me));
+      return { row:bestRow(m)||null, lbl:`${fmtD(iso(ms))} – ${fmtD(iso(me))}${prev?'':' (YOY)'}` };
     } catch(e) {}
   }
   return { row:null, lbl:"" };
@@ -968,10 +909,8 @@ function findCmp(rows, opt) {
 function fv(v, f) {
   if (v===null||v===undefined||v==="") return "—";
   const n = parseFloat(v); if (isNaN(n)) return "—";
-  if (f==="int") return Math.round(n).toLocaleString();
   if (f==="$") { if(Math.abs(n)>=1e6) return "$"+(n/1e6).toFixed(2)+"M"; if(Math.abs(n)>=1000) return "$"+(n/1000).toFixed(1)+"K"; return "$"+n.toFixed(0); }
   if (f==="%") return n.toFixed(1)+"%";
-  if (f==="pct2") return n.toFixed(2)+"%";
   if (f==="x") return n.toFixed(2)+"x";
   if (Math.abs(n)>=1e6) return (n/1e6).toFixed(1)+"M";
   if (Math.abs(n)>=1000) return (n/1000).toFixed(1)+"K";
@@ -1015,11 +954,9 @@ function resolveGrossProfit(row) {
 
 const DEFS = {
   web: [
-    { k:"sessions",         l:"Sessions",         f:"int",  n:"ShopifyQL direct" },
-    { k:"unique_visitors",  l:"Unique Visitors",  f:"int",  n:"online_store_visitors from ShopifyQL" },
-    { k:"pageviews",        l:"Pageviews",        f:"int",  n:"pageviews from ShopifyQL" },
-    { k:"conversion_rate",  l:"Conv. Rate",       f:"pct2", n:"conversion_rate from ShopifyQL" },
-    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"pct2", n:"(Reached checkout − completed checkout) ÷ reached checkout" },
+    { k:"sessions",         l:"Sessions",         f:"",  n:"Via ShopifyQL" },
+    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"New users / unique users when available" },
+    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"Transactions ÷ Sessions" },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
@@ -1054,8 +991,7 @@ function renderFCS(row) {
   if (!isCurrentOpenMonth) { el.innerHTML = ""; return; }
 
   const net = parseFloat(row.net_sales||0);
-  const rowEnd = row.period_end ? dateFromISO(String(row.period_end).slice(0,10)) : new Date(NOW);
-  const today = rowEnd, day = today.getDate();
+  const today = new Date(), day = today.getDate();
   const daysInMonth = new Date(today.getFullYear(), today.getMonth()+1, 0).getDate();
   const rate = net / Math.max(1, day);
   const fcs  = rate * daysInMonth;
@@ -1216,7 +1152,7 @@ function renderSubsEmpty(reason) {
     </div>`;
 }
 
-async function renderSubs(force=false) {
+async function renderSubs() {
   if (brand !== "cavali") return;
   const el = document.getElementById("s-subs"); if (!el) return;
   const statusEl = document.getElementById("smartrr-status");
@@ -1737,7 +1673,7 @@ async function fetchMarketingRows(force=false){
   // 'Total Shopify'!A:Z. Requesting only Total%20Shopify can return HTTP 400.
   const tabEsc = String(MARKETING_SHEET_TAB).replace(/'/g,"''");
   const range = encodeURIComponent(`'${tabEsc}'!A:Z`);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${range}?key=${AKEY}&_=${Date.now()}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${range}?key=${AKEY}`;
   const r = await fetch(url,{cache:"no-store"});
   if(!r.ok){
     const txt = await r.text().catch(()=>"");
@@ -1892,7 +1828,7 @@ async function renderMarketingFromTotalShopify(opt, force=false){
 /* ══════════════════════════════════════════════════════
    MAIN RENDER
 ══════════════════════════════════════════════════════ */
-async function render(force=false) {
+async function render() {
   const opt = getOpt();
   renderSelbar();
 
@@ -1900,7 +1836,7 @@ async function render(force=false) {
   if (root) root.classList.toggle("is-cavali", brand==="cavali");
   safeSet("mi-num", brand==="cavali" ? "07" : "06");
 
-  const skelIds = { "s-web": 5, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
+  const skelIds = { "s-web": 3, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
 
   const ovEl  = document.getElementById("ov");
@@ -1909,7 +1845,7 @@ async function render(force=false) {
   if (ovEl) ovEl.classList.add("show");
 
   const sid = SIDS[brand];
-  const tabData = await fetchTabsBatch(sid, ["kpis_daily", "revenue_share", "new_vs_returning", "ad_spend"], { force });
+  const tabData = await fetchTabsBatch(sid, ["kpis_daily", "revenue_share", "new_vs_returning", "ad_spend"]);
   const kpiR = tabData.kpis_daily || [];
   const rsR  = tabData.revenue_share || [];
   const nvrR = tabData.new_vs_returning || [];
@@ -1958,7 +1894,7 @@ async function render(force=false) {
   renderNVR(nvrR, row);
 
   // Marketing KPIs — Section 04 now comes only from external "Total Shopify" sheet.
-  await renderMarketingFromTotalShopify(opt, force);
+  await renderMarketingFromTotalShopify(opt, false);
 
   const ftManual = document.getElementById("ft-manual");
   if (ftManual) ftManual.style.display = "none";
@@ -1967,12 +1903,9 @@ async function render(force=false) {
   const roasWarnEl = document.getElementById("roas-warn");
   if (roasWarnEl) roasWarnEl.classList.remove("show");
 
-  if (brand==="cavali") await renderSubs(force);
+  if (brand==="cavali") await renderSubs();
 
-  // Show the actual row dates used. If today's row is not available yet,
-  // findRow() falls back to the latest valid MTD row and the bar reflects that.
-  const shownOpt = row ? { ...opt, start: row.period_start || opt.start, end: row.period_end || opt.end } : opt;
-  renderIbar(shownOpt, cmpLbl);
+  renderIbar(opt, cmpLbl);
   loadManual();
 
   if (row) {
@@ -1989,43 +1922,23 @@ async function render(force=false) {
 ══════════════════════════════════════════════════════ */
 function togglePanel(id) { const el=document.getElementById(id); if(el) el.classList.toggle("open"); }
 function forceRefresh() {
-  cache = {};
-  __marketingRowsCache = null;
-  _smartrrRowsCache = null; _smartrrRowsTs = 0;
-  _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
-  _smartrrSubscribersCache = null; _smartrrSubscribersTs = 0;
+  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
   try { Object.keys(localStorage).filter(k=>k.startsWith("el_sheet_cache__")).forEach(k=>localStorage.removeItem(k)); } catch(e) {}
   const btn = document.querySelector(".rf-btn");
   if (btn) btn.style.opacity = ".5";
-  render(true).then(()=>{ if(btn) btn.style.opacity="1"; }).catch(e=>{ console.warn("Force refresh failed", e); if(btn) btn.style.opacity="1"; });
+  render().then(()=>{ if(btn) btn.style.opacity="1"; });
 }
 function setBrand(b) {
   brand = b;
   document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
   safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
-  cache = {};
-  render(true);
+  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0; render();
 }
 function setPT(p, el) {
-  const changed = ptype !== p;
   ptype = p;
-
-  // When switching tabs, always show the latest/current option for that tab.
-  // This prevents Week from staying on an old saved/previous week such as Jun 22–Jun 28
-  // after the pipeline has already written the current week Jun 29–Jun 30.
-  if (changed) {
-    if (p === "week") selW = WEEKS[0]?.val || selW;
-    if (p === "mtd") selMTD = MTDS[0]?.val || selMTD;
-    if (p === "month") selMo = MONTHS[0]?.val || selMo;
-    if (p === "quarter") selQ = QUARTERS[0]?.val || selQ;
-  }
-
   document.querySelectorAll(".period-btn").forEach(x=>x.classList.remove("on"));
   if (el) el.classList.add("on");
-  cache = {};
-  renderSelbar();
-  render(true);
+  render();
 }
 function toggleTheme() {
   const h=document.documentElement, dk=h.getAttribute("data-theme")==="dark";
@@ -2034,7 +1947,7 @@ function toggleTheme() {
   if (btn) btn.textContent = dk?"☀":"☾";
 }
 
-setInterval(()=>{ forceRefresh(); }, 15*60*1000);
+setInterval(()=>{ render(); }, 15*60*1000);
 renderSelbar();
 setBrand("cavali");
 </script>
