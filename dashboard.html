@@ -253,6 +253,7 @@ select:focus{border-color:var(--gr)}
 .portal-back-pill a{color:#6d63ff;text-decoration:none;font-weight:800}
 .portal-back-pill a:hover{text-decoration:underline}
 
+.auth-hidden{display:none!important}
 </style>
 </head>
 <body>
@@ -283,21 +284,26 @@ select:focus{border-color:var(--gr)}
     <a class="sb-item" href="#" onclick="setBrand('cavali');return false">
       <div style="width:5px;height:5px;border-radius:50%;background:#A090FF"></div>Cavali
     </a>
-    <div class="sb-sec" style="margin-top:6px">Analytics Suite</div>
-    <a class="sb-suite" href="https://arojas-company.github.io/corro-pareto/" target="_blank">
+    <div class="sb-sec sb-suite-sec" style="margin-top:6px">Analytics Suite</div>
+    <a class="sb-suite" data-report-key="pareto" href="https://arojas-company.github.io/corro-pareto/" target="_blank" rel="noopener">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><rect x=".5" y="6" width="2" height="4.5" rx=".5" fill="#D8B054"/><rect x="3.5" y="3.5" width="2" height="7" rx=".5" fill="#D8B054" opacity=".7"/><rect x="6.5" y="1" width="2" height="9.5" rx=".5" fill="#D8B054" opacity=".4"/></svg>
       <span>Pareto Analysis</span>
       <span class="sb-badge" style="background:rgba(216,176,84,.12);color:#D8B054;border:1px solid rgba(216,176,84,.25)">GP</span>
     </a>
-    <a class="sb-suite" href="https://arojas-company.github.io/corro-frequency/" target="_blank">
+    <a class="sb-suite" data-report-key="frequency" href="https://arojas-company.github.io/corro-frequency/" target="_blank" rel="noopener">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="2" cy="5.5" r="1.5" fill="#72AEFF"/><circle cx="5.5" cy="3" r="1.5" fill="#72AEFF" opacity=".7"/><circle cx="9" cy="6.5" r="1.5" fill="#72AEFF" opacity=".4"/><path d="M2 5.5L5.5 3L9 6.5" stroke="#72AEFF" stroke-width="1" stroke-opacity=".4"/></svg>
       <span>Frequency</span>
       <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#72AEFF;border:1px solid rgba(114,174,255,.25)">RET</span>
     </a>
-    <a class="sb-suite" href="https://script.google.com/macros/s/AKfycbxz_0yvGe8QC7abvRApbh7zEwtSQQFp7HH38dWn2MRQ9f80f7PptvfUtyPhGU4WD_0QUA/exec" target="_blank">
+    <a class="sb-suite" data-report-key="concierge" href="https://script.google.com/macros/s/AKfycbwfBAqGCdefMojVSuEG0yZE0CkINrFnQGKbc2JhtBpZHmU-bnQmdQiUMw7dcPpWkLRyCg/exec" target="_blank" rel="noopener">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M5.5 1C4.7 1 2 2.5 2 4.5 2 7 3.5 9 5.5 10 7.5 9 9 7 9 4.5 9 2.5 6.3 1 5.5 1Z" fill="#A090FF" opacity=".35"/><path d="M3.5 5L5 6.5 7.5 4" stroke="#A090FF" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Concierge Comm.</span>
       <span class="sb-badge" style="background:rgba(160,144,255,.12);color:#A090FF;border:1px solid rgba(160,144,255,.25)">$</span>
+    </a>
+    <a class="sb-suite" data-report-key="upsell" href="https://equestrian-labs-dashboard.github.io/Report-Upsell---Smile-Report/" target="_blank" rel="noopener">
+      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="5.5" cy="5.5" r="4.5" fill="#72dfb5" opacity=".28"/><path d="M3.5 6.1c.5.9 1.2 1.3 2 1.3s1.6-.4 2-1.3" stroke="#28b98b" stroke-width="1.1" stroke-linecap="round"/><circle cx="4.1" cy="4.5" r=".45" fill="#28b98b"/><circle cx="6.9" cy="4.5" r=".45" fill="#28b98b"/></svg>
+      <span>Upsell Smile</span>
+      <span class="sb-badge" style="background:rgba(114,223,181,.12);color:#28b98b;border:1px solid rgba(114,223,181,.25)">UP</span>
     </a>
   </div>
   <div class="sb-foot">
@@ -822,7 +828,16 @@ function bestRow(arr) {
 function findRow(rows, opt) {
   if (!rows?.length) return null;
   let m;
-  if (ptype==="quarter" && opt.pk) { m=rows.filter(r=>r.period===opt.pk); if(m.length) return bestRow(m); }
+  if (ptype==="quarter" && opt.pk) {
+    // For current quarter, prefer the exact date-to-date row.
+    // This prevents stale q3_YYYY rows from a previous pipeline run from being shown.
+    const exactQ = exactRow(rows, opt.pk, opt.start, opt.end);
+    if (exactQ) return exactQ;
+    m=rows.filter(r=>r.period===opt.pk && (r.period_end||"").trim()===opt.end);
+    if(m.length) return bestRow(m);
+    m=rows.filter(r=>r.period===opt.pk);
+    if(m.length) return bestRow(m);
+  }
   if (ptype==="week") {
     const pk=`week_${opt.start}`;
     m = rows.filter(r=>r.period===pk);
@@ -856,10 +871,23 @@ function findCmp(rows, opt) {
     const match = opt.pk.match(/q(\d)_(\d{4})/);
     if (match) {
       const [,q,y] = match;
-      const pq = prev ? (parseInt(q)===1?4:parseInt(q)-1) : parseInt(q);
-      const py = prev ? (parseInt(q)===1?parseInt(y)-1:parseInt(y)) : parseInt(y)-1;
+      const qn = parseInt(q), yr = parseInt(y);
+      const pq = prev ? (qn===1?4:qn-1) : qn;
+      const py = prev ? (qn===1?yr-1:yr) : yr-1;
       const pk = `q${pq}_${py}`;
-      return { row: bestRow(rows.filter(r=>r.period===pk)), lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
+
+      // For current partial quarter, compare date-to-date, not against a stale/full quarter row.
+      if (opt.cur) {
+        const offsetYears = prev ? (qn===1 ? 1 : 0) : 1;
+        const startY = prev ? (qn===1 ? yr-1 : yr) : yr-1;
+        const rgStart = `${startY}-${(opt.start||"").slice(5,10)}`;
+        const rgEnd = `${startY}-${(opt.end||"").slice(5,10)}`;
+        const exact = exactRow(rows, pk, rgStart, rgEnd);
+        if (exact) return { row: exact, lbl:`${fmtD(rgStart)} – ${fmtD(rgEnd)}${prev?'':' (YOY)'}` };
+      }
+
+      const exact = exactRow(rows, pk, String(py)+"-"+(opt.start||"").slice(5,10), String(py)+"-"+(opt.end||"").slice(5,10));
+      return { row: exact || bestRow(rows.filter(r=>r.period===pk)), lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
     }
   }
   if (ptype==="mtd") {
@@ -1962,6 +1990,54 @@ setBrand("cavali");
   if ((b === "corro" || b === "cavali") && typeof window.setBrand === "function") {
     setTimeout(function(){ window.setBrand(b); }, 0);
   }
+})();
+</script>
+
+
+<script>
+(function(){
+  function getSession(){
+    return window.__PORTAL_SESSION__ || (function(){
+      try { return JSON.parse(sessionStorage.getItem("corro_dashboard_auth_v3") || localStorage.getItem("corro_dashboard_auth_v3") || "null"); }
+      catch(e){ return null; }
+    })();
+  }
+  function norm(v){ return String(v||"").trim().toLowerCase(); }
+  function tokensOf(s){
+    const raw = String(s && (s.accessRaw || (Array.isArray(s.access) ? s.access.join(",") : s.access)) || "");
+    const low = raw.toLowerCase();
+    if (s && (s.all === true || low === "all" || low.includes("all reports") || low.includes("todos"))) return ["all"];
+    if (Array.isArray(s && s.access)) return s.access.map(norm);
+    return raw.split(/[;,|\/]+|\s+and\s+|\s+y\s+/i).map(norm).filter(Boolean);
+  }
+  function has(tokens, key){
+    if (tokens.includes("all")) return true;
+    const aliases = {
+      pareto:["pareto","pareto analysis","gp"],
+      frequency:["frequency","retention","ret"],
+      concierge:["concierge","concierge comm","concierge comm.","concierge communication","concierge communications"],
+      upsell:["upsell","up sell","upsell smile"]
+    }[key] || [key];
+    return aliases.some(a => tokens.some(t => t === a || t.includes(a)));
+  }
+  function applySidebarAccess(){
+    const s = getSession();
+    const tokens = tokensOf(s);
+    const links = Array.from(document.querySelectorAll("[data-report-key]"));
+    links.forEach(a => {
+      const ok = has(tokens, a.getAttribute("data-report-key"));
+      a.classList.toggle("auth-hidden", !ok);
+      if (!ok) {
+        a.removeAttribute("href");
+        a.removeAttribute("target");
+      }
+    });
+    const anyVisible = links.some(a => !a.classList.contains("auth-hidden"));
+    const sec = document.querySelector(".sb-suite-sec");
+    if (sec) sec.classList.toggle("auth-hidden", !anyVisible);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", applySidebarAccess);
+  else applySidebarAccess();
 })();
 </script>
 
