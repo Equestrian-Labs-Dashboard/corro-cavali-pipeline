@@ -632,6 +632,20 @@ function exactRow(rows, pk, start, end) {
   m = rows.filter(r => normDate(r.period_start) === st && normDate(r.period_end) === en && String(r.period || "").startsWith("mtd_"));
   return m.length ? bestRow(m) : null;
 }
+function normISODate(v) {
+  const s = String(v || "").trim();
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : s;
+}
+function latestPeriodRow(rows, pk, start, end) {
+  if (!rows?.length || !pk) return null;
+  const st = normISODate(start), en = normISODate(end);
+  let m = rows.filter(r => String(r.period || "").trim() === pk);
+  if (st) m = m.filter(r => !normISODate(r.period_start) || normISODate(r.period_start) === st);
+  if (en) m = m.filter(r => !normISODate(r.period_end) || normISODate(r.period_end) <= en);
+  if (!m.length) return null;
+  return bestRow(m);
+}
 function isFullMonthOpt(opt) {
   if (!opt || opt.y === undefined || opt.m === undefined) return false;
   return opt.end === iso(lastDay(opt.y, opt.m));
@@ -833,12 +847,12 @@ function findRow(rows, opt) {
   if (!rows?.length) return null;
   let m;
   if (ptype==="quarter" && opt.pk) {
-    // For current quarter, prefer the exact date-to-date row.
-    // This prevents stale q3_YYYY rows from a previous pipeline run from being shown.
+    // Current quarter can be partial. Prefer exact row; if today's pipeline
+    // has not run yet, use the latest row for the same quarter with period_end <= selected end.
     const exactQ = exactRow(rows, opt.pk, opt.start, opt.end);
     if (exactQ) return exactQ;
-    m=rows.filter(r=>r.period===opt.pk && (r.period_end||"").trim()===opt.end);
-    if(m.length) return bestRow(m);
+    const latestQ = latestPeriodRow(rows, opt.pk, opt.start, opt.end);
+    if (latestQ) return latestQ;
     m=rows.filter(r=>r.period===opt.pk);
     if(m.length) return bestRow(m);
   }
@@ -853,13 +867,16 @@ function findRow(rows, opt) {
     const pk=`mtd_${(opt.start||"").slice(0,7)}`;
     const exact = exactRow(rows, pk, opt.start, opt.end);
     if (exact) return exact;
+    const latest = latestPeriodRow(rows, pk, opt.start, opt.end);
+    if (latest) return latest;
     m=rows.filter(r=>r.period==="mtd"&&r.period_start===opt.start&&r.period_end===opt.end); if(m.length) return bestRow(m);
-    // Important: do not fall back to the full month for MTD. It creates false negative comparisons.
+    // Do not fall back to full month for MTD; use latest MTD only.
   }
   if (ptype==="month") {
     const pk=(opt.start||"").slice(0,7);
     if (!isFullMonthOpt(opt)) {
-      const mtd = exactRow(rows, `mtd_${pk}`, opt.start, opt.end);
+      const mtdPk = `mtd_${pk}`;
+      const mtd = exactRow(rows, mtdPk, opt.start, opt.end) || latestPeriodRow(rows, mtdPk, opt.start, opt.end);
       if (mtd) return mtd;
     }
     m=rows.filter(r=>r.period===pk); if(m.length) return bestRow(m);
@@ -886,11 +903,13 @@ function findCmp(rows, opt) {
         const startY = prev ? (qn===1 ? yr-1 : yr) : yr-1;
         const rgStart = `${startY}-${(opt.start||"").slice(5,10)}`;
         const rgEnd = `${startY}-${(opt.end||"").slice(5,10)}`;
-        const exact = exactRow(rows, pk, rgStart, rgEnd);
+        const exact = exactRow(rows, pk, rgStart, rgEnd) || latestPeriodRow(rows, pk, rgStart, rgEnd);
         if (exact) return { row: exact, lbl:`${fmtD(rgStart)} – ${fmtD(rgEnd)}${prev?'':' (YOY)'}` };
       }
 
-      const exact = exactRow(rows, pk, String(py)+"-"+(opt.start||"").slice(5,10), String(py)+"-"+(opt.end||"").slice(5,10));
+      const qStart = String(py)+"-"+(opt.start||"").slice(5,10);
+      const qEnd = String(py)+"-"+(opt.end||"").slice(5,10);
+      const exact = exactRow(rows, pk, qStart, qEnd) || latestPeriodRow(rows, pk, qStart, qEnd);
       return { row: exact || bestRow(rows.filter(r=>r.period===pk)), lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
     }
   }
@@ -901,7 +920,7 @@ function findCmp(rows, opt) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
       const pk=`mtd_${py}-${String(pmo).padStart(2,'0')}`;
       const rg = mtdRange(py, pmo, dayLimit);
-      const row = exactRow(rows, pk, rg.start, rg.end);
+      const row = exactRow(rows, pk, rg.start, rg.end) || latestPeriodRow(rows, pk, rg.start, rg.end);
       return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
     }
   }
