@@ -928,11 +928,13 @@ function findCmp(rows, opt) {
     const days = prev ? 7 : 364;
     try {
       const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
-      const me=new Date(opt.end+'T12:00');   me.setDate(me.getDate()-days);
+      // Business rule: compare against the FULL comparison week, even when the current week is partial.
+      const me=new Date(ms); me.setDate(me.getDate()+6);
       const pk=`week_${iso(ms)}`;
-      // Business rule: compare to the full stored comparison week when it exists.
-      let m=rows.filter(r=>r.period===pk);
-      if (!m.length) m=rows.filter(r=>r.period_start===iso(ms)&&r.period_end===iso(me));
+      let exact = exactRow(rows, pk, iso(ms), iso(me));
+      let m = exact ? [exact] : rows.filter(r=>r.period===pk && normISODate(r.period_end)===iso(me));
+      if (!m.length) m=rows.filter(r=>r.period===pk);
+      if (!m.length) m=rows.filter(r=>normISODate(r.period_start)===iso(ms)&&normISODate(r.period_end)===iso(me));
       return { row:bestRow(m)||null, lbl:`${fmtD(iso(ms))} – ${fmtD(iso(me))}${prev?'':' (YOY)'}` };
     } catch(e) {}
   }
