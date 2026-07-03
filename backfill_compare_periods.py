@@ -18,6 +18,7 @@ Optional env:
 
 import os
 import calendar
+import time
 from datetime import datetime, timedelta, date
 
 import pipeline as p
@@ -50,6 +51,7 @@ def _build_period_row(now_str, url, token, period_key, start, end):
     orders = p.fetch_orders(url, token, start, end)
     nvr = p.fetch_new_vs_returning(url, token, start, end)
     cur = p.build(sales, orders, nvr, sessions, fulfilled)
+    time.sleep(0.35)
     return p.make_kpi_row(now_str, period_key, start, end, cur), orders, sales, cur, nvr
 
 
