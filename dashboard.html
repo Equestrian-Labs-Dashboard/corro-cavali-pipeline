@@ -897,20 +897,9 @@ function findCmp(rows, opt) {
       const py = prev ? (qn===1?yr-1:yr) : yr-1;
       const pk = `q${pq}_${py}`;
 
-      // For current partial quarter, compare date-to-date, not against a stale/full quarter row.
-      if (opt.cur) {
-        const offsetYears = prev ? (qn===1 ? 1 : 0) : 1;
-        const startY = prev ? (qn===1 ? yr-1 : yr) : yr-1;
-        const rgStart = `${startY}-${(opt.start||"").slice(5,10)}`;
-        const rgEnd = `${startY}-${(opt.end||"").slice(5,10)}`;
-        const exact = exactRow(rows, pk, rgStart, rgEnd) || latestPeriodRow(rows, pk, rgStart, rgEnd);
-        if (exact) return { row: exact, lbl:`${fmtD(rgStart)} – ${fmtD(rgEnd)}${prev?'':' (YOY)'}` };
-      }
-
-      const qStart = String(py)+"-"+(opt.start||"").slice(5,10);
-      const qEnd = String(py)+"-"+(opt.end||"").slice(5,10);
-      const exact = exactRow(rows, pk, qStart, qEnd) || latestPeriodRow(rows, pk, qStart, qEnd);
-      return { row: exact || bestRow(rows.filter(r=>r.period===pk)), lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
+      // Business rule: compare selected/current quarter against the FULL comparison quarter.
+      // Example: Q3 2026 current-to-date compares vs full Q3 2025 for YOY.
+      return { row: bestRow(rows.filter(r=>r.period===pk)) || null, lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
     }
   }
   if (ptype==="mtd") {
@@ -928,15 +917,10 @@ function findCmp(rows, opt) {
     const yr=parseInt((opt.start||"").slice(0,4)), mo=parseInt((opt.start||"").slice(5,7));
     if (!isNaN(yr) && !isNaN(mo)) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
-      if (!isFullMonthOpt(opt)) {
-        const dayLimit = dateFromISO(opt.end).getDate();
-        const rg = mtdRange(py, pmo, dayLimit);
-        const pk = `mtd_${py}-${String(pmo).padStart(2,'0')}`;
-        const row = exactRow(rows, pk, rg.start, rg.end);
-        return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
-      }
       const pk=`${py}-${String(pmo).padStart(2,'0')}`;
       const lbl=new Date(py,pmo-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
+      // Business rule: Month / MTD compares against the FULL comparison month.
+      // Example: Jul 1–3 2026 compares vs full July 2025 for YOY.
       return { row:bestRow(rows.filter(r=>r.period===pk))||null, lbl:prev?lbl:`${lbl} (YOY)` };
     }
   }
@@ -946,6 +930,7 @@ function findCmp(rows, opt) {
       const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
       const me=new Date(opt.end+'T12:00');   me.setDate(me.getDate()-days);
       const pk=`week_${iso(ms)}`;
+      // Business rule: compare to the full stored comparison week when it exists.
       let m=rows.filter(r=>r.period===pk);
       if (!m.length) m=rows.filter(r=>r.period_start===iso(ms)&&r.period_end===iso(me));
       return { row:bestRow(m)||null, lbl:`${fmtD(iso(ms))} – ${fmtD(iso(me))}${prev?'':' (YOY)'}` };
