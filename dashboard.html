@@ -838,9 +838,24 @@ async function fetchTab(sid, tab, opts = {}) {
   return result[tab] || [];
 }
 
+function __filledCell(v) {
+  return v !== undefined && v !== null && String(v).trim() !== "";
+}
 function bestRow(arr) {
   if (!arr || !arr.length) return null;
-  return arr.sort((a,b) => (Date.parse(b.updated_at)||0) - (Date.parse(a.updated_at)||0))[0] || null;
+
+  // Google Sheets can contain duplicate period rows after backfills.
+  // Some older rows have financials but blank pageviews/checkout, while newer repair rows
+  // may have the website fields. Merge the best available non-empty values instead of
+  // blindly taking one row and losing Pageviews / Checkout Abandonment.
+  const sorted = [...arr].sort((a,b) => (Date.parse(a.updated_at)||0) - (Date.parse(b.updated_at)||0));
+  const merged = {};
+  for (const row of sorted) {
+    for (const [k,v] of Object.entries(row || {})) {
+      if (__filledCell(v)) merged[k] = v;
+    }
+  }
+  return Object.keys(merged).length ? merged : (sorted[sorted.length-1] || null);
 }
 
 function findRow(rows, opt) {
