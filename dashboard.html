@@ -900,6 +900,51 @@ function findRow(rows, opt) {
   return null;
 }
 
+function __hasMetricValue(row, key) {
+  return row && row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "";
+}
+function __cmpMonthTarget(opt, prev) {
+  const yr = parseInt((opt.start || "").slice(0,4), 10);
+  const mo = parseInt((opt.start || "").slice(5,7), 10);
+  if (isNaN(yr) || isNaN(mo)) return null;
+  const pmo = prev ? (mo === 1 ? 12 : mo - 1) : mo;
+  const py = prev ? (mo === 1 ? yr - 1 : yr) : yr - 1;
+  return `${py}-${String(pmo).padStart(2,'0')}`;
+}
+function cmpMetricValue(rows, opt, cmpRow, key) {
+  if (__hasMetricValue(cmpRow, key)) return cmpRow[key];
+
+  // If the selected comparison row is the correct full month but that older
+  // row does not have newly-added website fields, look for the same metric in
+  // any repair/backfill row for the same comparison month. This does NOT change
+  // financial comparison values when they already exist on the full month row.
+  if (ptype === "month") {
+    const ym = __cmpMonthTarget(opt, selCmp === "prev");
+    if (ym) {
+      const candidates = (rows || []).filter(r => {
+        const p = String(r.period || "").trim();
+        const ps = String(r.period_start || "").slice(0,7);
+        return p === ym || p === `mtd_${ym}` || ps === ym;
+      }).filter(r => __hasMetricValue(r, key));
+      if (candidates.length) return bestRow(candidates)[key];
+    }
+  }
+
+  // Same idea for quarters and weeks: use another same-period repair row only
+  // when the chosen compare row lacks this specific metric.
+  if (ptype === "quarter" && cmpRow && cmpRow.period) {
+    const candidates = (rows || []).filter(r => String(r.period || "").trim() === String(cmpRow.period || "").trim())
+      .filter(r => __hasMetricValue(r, key));
+    if (candidates.length) return bestRow(candidates)[key];
+  }
+  if (ptype === "week" && cmpRow && cmpRow.period) {
+    const candidates = (rows || []).filter(r => String(r.period || "").trim() === String(cmpRow.period || "").trim())
+      .filter(r => __hasMetricValue(r, key));
+    if (candidates.length) return bestRow(candidates)[key];
+  }
+  return null;
+}
+
 function findCmp(rows, opt) {
   if (!rows?.length || selCmp==="none") return { row:null, lbl:"" };
   const prev = selCmp==="prev";
@@ -1920,7 +1965,8 @@ async function render() {
   // Website
   safeHTML("s-web", DEFS.web.map(s => {
     const val = row ? fv(row[s.k], s.f) : "—";
-    const pct = row&&cmpRow ? pctChg(row[s.k], cmpRow[s.k]) : null;
+    const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
+    const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
     return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
   }).join(''));
 
@@ -1934,7 +1980,8 @@ async function render() {
       pct = (gpCur !== null && gpCmp !== null) ? pctChg(gpCur, gpCmp) : null;
     } else {
       val = row ? fv(row[s.k], s.f) : "—";
-      pct = row&&cmpRow ? pctChg(row[s.k], cmpRow[s.k]) : null;
+      const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
+      pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
     }
     return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, s.inv||false);
   }).join(''));
@@ -1942,7 +1989,8 @@ async function render() {
   // Operational
   safeHTML("s-op", DEFS.op.map(s => {
     const val = row ? fv(row[s.k], s.f) : "—";
-    const pct = row&&cmpRow ? pctChg(row[s.k], cmpRow[s.k]) : null;
+    const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
+    const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
     return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
   }).join(''));
 
