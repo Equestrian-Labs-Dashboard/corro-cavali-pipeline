@@ -121,19 +121,67 @@ def get_gc():
 # SHOPIFY GQL — raw request
 # ─────────────────────────────────────────────────────────────────
 def gql(store_url, token, query):
-    r = requests.post(
-        f"https://{store_url}/admin/api/{GQL_VERSION}/graphql.json",
-        headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-        json={"query": query}, timeout=60,
-    )
-    if r.status_code != 200:
-        print(f"    HTTP {r.status_code} — {r.text[:200]}")
-        return None
-    d = r.json()
-    if d.get("errors"):
-        print(f"    GQL errors: {d['errors']}")
-        return None
-    return d.get("data")
+    """
+    Shopify GraphQL wrapper with retry/backoff.
+
+    Important for compare backfills: ShopifyQL can return GraphQL errors with
+    code THROTTLED even when HTTP status is 200. Older versions returned None
+    immediately, which wrote zero rows for some weeks. This waits for the
+    Shopify throttle window and retries before giving up.
+    """
+    endpoint = f"https://{store_url}/admin/api/{GQL_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+
+    for attempt in range(8):
+        try:
+            r = requests.post(endpoint, headers=headers, json={"query": query}, timeout=60)
+        except Exception as exc:
+            wait = min(60, (2 ** attempt) + random.random())
+            print(f"    GraphQL request error: {exc}; retrying in {wait:.1f}s")
+            time.sleep(wait)
+            continue
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            retry_after = r.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else min(60, (2 ** attempt) + random.random())
+            except Exception:
+                wait = min(60, (2 ** attempt) + random.random())
+            print(f"    HTTP {r.status_code} GraphQL; retrying in {wait:.1f}s")
+            time.sleep(wait)
+            continue
+
+        if r.status_code != 200:
+            print(f"    HTTP {r.status_code} — {r.text[:200]}")
+            return None
+
+        d = r.json()
+        errs = d.get("errors") or []
+        if errs:
+            err_txt = json.dumps(errs, default=str)
+            throttled = "THROTTLED" in err_txt or "Rate limited" in err_txt
+            if throttled and attempt < 7:
+                wait = min(60, (2 ** attempt) + random.random())
+                # Shopify often includes windowResetAt in errors.extensions.cost.
+                try:
+                    reset_at = errs[0].get("extensions", {}).get("cost", {}).get("windowResetAt")
+                    if reset_at:
+                        reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                        now_utc = datetime.now(reset_dt.tzinfo)
+                        wait = max(wait, min(60, (reset_dt - now_utc).total_seconds() + 1))
+                except Exception:
+                    pass
+                print(f"    GQL throttled; retrying in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
+            print(f"    GQL errors: {errs}")
+            return None
+
+        return d.get("data")
+
+    print("    GQL retry limit reached; returning no data")
+    return None
 
 # ─────────────────────────────────────────────────────────────────
 # ql_run — DEFINITIVO (verificado contra docs.shopify.dev 2026-01)
