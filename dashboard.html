@@ -484,6 +484,7 @@ const CH_COLORS = {
 
 let brand = "cavali", ptype = "month";
 let cache = {}, manualData = {};
+let __renderToken = 0;
 
 /* ══════════════════════════════════════════════════════
    SMARTRR — Product Volume by Product-Variant
@@ -845,9 +846,8 @@ function bestRow(arr) {
   if (!arr || !arr.length) return null;
 
   // Google Sheets can contain duplicate period rows after backfills.
-  // Some older rows have financials but blank pageviews/checkout, while newer repair rows
-  // may have the website fields. Merge the best available non-empty values instead of
-  // blindly taking one row and losing Pageviews / Checkout Abandonment.
+  // Merge non-empty values so rows with financials do not erase newer
+  // Pageviews / Checkout Abandonment values from repair rows.
   const sorted = [...arr].sort((a,b) => (Date.parse(a.updated_at)||0) - (Date.parse(b.updated_at)||0));
   const merged = {};
   for (const row of sorted) {
@@ -1884,23 +1884,30 @@ async function renderMarketingFromTotalShopify(opt, force=false){
    MAIN RENDER
 ══════════════════════════════════════════════════════ */
 async function render() {
+  const token = ++__renderToken;
+  const renderBrand = brand;
+  const renderPtype = ptype;
   const opt = getOpt();
+  const renderOptVal = opt?.val || "";
+  const isStale = () => token !== __renderToken || renderBrand !== brand || renderPtype !== ptype || renderOptVal !== (getOpt()?.val || "");
+
   renderSelbar();
 
   const root = document.getElementById("app-root");
-  if (root) root.classList.toggle("is-cavali", brand==="cavali");
-  safeSet("mi-num", brand==="cavali" ? "07" : "06");
+  if (root) root.classList.toggle("is-cavali", renderBrand==="cavali");
+  safeSet("mi-num", renderBrand==="cavali" ? "07" : "06");
 
   const skelIds = { "s-web": 3, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
 
   const ovEl  = document.getElementById("ov");
   const ovLbl = document.getElementById("ov-lbl");
-  if (ovLbl) ovLbl.textContent = `Loading ${brand==="corro"?"Corro":"Cavali"}...`;
+  if (ovLbl) ovLbl.textContent = `Loading ${renderBrand==="corro"?"Corro":"Cavali"}...`;
   if (ovEl) ovEl.classList.add("show");
 
-  const sid = SIDS[brand];
+  const sid = SIDS[renderBrand];
   const tabData = await fetchTabsBatch(sid, ["kpis_daily", "revenue_share", "new_vs_returning", "ad_spend"]);
+  if (isStale()) return;
   const kpiR = tabData.kpis_daily || [];
   const rsR  = tabData.revenue_share || [];
   const nvrR = tabData.new_vs_returning || [];
@@ -1949,7 +1956,9 @@ async function render() {
   renderNVR(nvrR, row);
 
   // Marketing KPIs — Section 04 now comes only from external "Total Shopify" sheet.
+  if (isStale()) return;
   await renderMarketingFromTotalShopify(opt, false);
+  if (isStale()) return;
 
   const ftManual = document.getElementById("ft-manual");
   if (ftManual) ftManual.style.display = "none";
@@ -1958,7 +1967,11 @@ async function render() {
   const roasWarnEl = document.getElementById("roas-warn");
   if (roasWarnEl) roasWarnEl.classList.remove("show");
 
-  if (brand==="cavali") await renderSubs();
+  if (isStale()) return;
+  if (renderBrand==="cavali") {
+    await renderSubs();
+    if (isStale()) return;
+  }
 
   renderIbar(opt, cmpLbl);
   loadManual();
@@ -1984,10 +1997,16 @@ function forceRefresh() {
   render().then(()=>{ if(btn) btn.style.opacity="1"; });
 }
 function setBrand(b) {
+  b = (b === "corro" || b === "cavali") ? b : "corro";
   brand = b;
+  __renderToken++;
   document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
   safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0; render();
+  ["s-web","s-fin","s-op","s-mkt"].forEach((id,i)=>safeHTML(id, skel([5,9,4,4][i])));
+  safeHTML("rs-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
+  safeHTML("nvr-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
+  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
+  render();
 }
 function setPT(p, el) {
   ptype = p;
