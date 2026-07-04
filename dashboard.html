@@ -1040,13 +1040,20 @@ function kcardAmber(lbl, val, warnTxt, note) {
 function skel(n) { return Array(n).fill(`<div class="kc sk"><div class="kc-lbl" style="width:55%;height:9px"> </div><div class="kc-val" style="height:21px;margin-top:8px"> </div></div>`).join(''); }
 
 function resolveGrossProfit(row) {
-  const direct = parseFloat(row.gross_profit||"");
-  if (!isNaN(direct) && direct !== 0) return direct;
+  // Show real zero as $0. Do not turn 0 into "—".
+  // This matters for Cavali periods with Gross Sales but 100% discount / $0 Net Sales.
+  if (!row) return null;
+  const rawDirect = row.gross_profit;
+  if (rawDirect !== undefined && rawDirect !== null && String(rawDirect).trim() !== "") {
+    const direct = parseFloat(rawDirect);
+    if (!isNaN(direct)) return direct;
+  }
   const ns = parseFloat(row.net_sales||0);
   const gm = parseFloat(row.pct_gm||0);
   if (ns > 0 && gm > 0) return ns * gm / 100;
   const cogs = parseFloat(row.cogs||0);
   if (ns > 0 && cogs > 0) return ns - cogs;
+  if (ns === 0 && cogs === 0) return 0;
   return null;
 }
 
