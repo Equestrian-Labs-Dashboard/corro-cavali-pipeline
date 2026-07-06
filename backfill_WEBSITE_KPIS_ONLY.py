@@ -1,262 +1,106 @@
+"""
+Targeted Website KPI month repair for both Corro and Cavali.
+
+Use this when Pageviews / Checkout Abandonment are missing for specific historical months.
+It updates only website KPI fields in kpis_daily and preserves financial/Smartrr data.
+
+Examples:
+  RUN_BRANDS=corro TARGET_MONTHS=2024-11,2024-12,2025-01 python -u backfill_website_kpis_target_months.py
+  RUN_BRANDS=cavali TARGET_MONTHS=2024-07,2024-08,2024-09,2024-10,2024-11,2024-12,2025-01,2025-02,2025-03,2025-04,2025-05,2025-06 python -u backfill_website_kpis_target_months.py
+"""
+
 import os
-import json
+import calendar
 import time
-from datetime import datetime, timezone
-import requests
-import gspread
-from google.oauth2.service_account import Credentials
+from datetime import datetime, date
+import pipeline as p
 
-GQL_VERSION = "2025-10"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+WEB_FIELDS = ["sessions", "unique_visitors", "pageviews", "conversion_rate", "checkout_abandonment_rate"]
 
-STORES = {
-    "corro": {
-        "url": os.environ.get("SHOPIFY_URL_CORRO") or os.environ.get("SHOPIFY_STORE_CORRO") or "corroshop.com",
-        "token": os.environ.get("SHOPIFY_TOKEN_CORRO", ""),
-        "sheet_id": os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU"),
-    },
-    "cavali": {
-        "url": os.environ.get("SHOPIFY_URL_CAVALI") or os.environ.get("SHOPIFY_STORE_CAVALI") or "cavali-club.myshopify.com",
-        "token": os.environ.get("SHOPIFY_TOKEN_CAVALI", ""),
-        "sheet_id": os.environ.get("SHEET_ID_CAVALI", "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig"),
-    },
-}
+def month_range(ym):
+    y, m = [int(x) for x in ym.split("-")]
+    return date(y, m, 1).isoformat(), date(y, m, calendar.monthrange(y, m)[1]).isoformat()
 
-TARGET_COLUMNS = [
-    "pageviews",
-    "sessions_reached_checkout",
-    "sessions_completed_checkout",
-    "checkout_abandonments",
-    "checkout_abandonment_rate",
-]
+def row_to_map(headers, row):
+    return {h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)}
 
-UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING_WEBSITE_KPIS", "true").lower() == "true"
-SLEEP_BETWEEN_ROWS = float(os.environ.get("SLEEP_BETWEEN_ROWS", "2.0"))
-MAX_ROWS_PER_BRAND = int(os.environ.get("MAX_ROWS_PER_BRAND", "35") or "35")
+def map_to_row(headers, m):
+    return [m.get(h, "") for h in headers]
 
-
-def get_gc():
-    creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-def num(v):
+def safe_date(v):
     try:
-        return float(str(v or 0).replace(",", "").replace("%", "").strip())
+        return datetime.fromisoformat(str(v)[:10])
     except Exception:
-        return 0.0
+        return datetime.min
 
+def save_ws(ws, headers, existing):
+    rows = sorted(existing.values(), key=lambda m: (safe_date(m.get("period_start", "")), str(m.get("period", ""))))
+    ws.clear()
+    ws.append_row(headers)
+    if rows:
+        ws.append_rows([map_to_row(headers, m) for m in rows], value_input_option="USER_ENTERED")
+    return len(rows)
 
-def throttle_wait_from_errors(errors):
-    """Return seconds to wait when Shopify GraphQL returns THROTTLED."""
-    for err in errors or []:
-        ext = err.get("extensions") or {}
-        if ext.get("code") == "THROTTLED":
-            cost = ext.get("cost") or {}
-            reset_at = cost.get("windowResetAt")
-            if reset_at:
-                try:
-                    reset_dt = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
-                    now = datetime.now(timezone.utc)
-                    return max(int((reset_dt - now).total_seconds()) + 5, 10)
-                except Exception:
-                    return 20
-            return 20
-    return 0
+def repair_brand(gc, brand, months):
+    cfg = p.STORES[brand]
+    sh = gc.open_by_key(cfg["sheet_id"])
+    try:
+        ws = sh.worksheet("kpis_daily")
+    except Exception:
+        ws = sh.add_worksheet("kpis_daily", rows=800, cols=len(p.HEADERS))
 
+    values = ws.get_all_values()
+    headers = values[0] if values else list(p.HEADERS)
+    for h in p.HEADERS:
+        if h not in headers:
+            headers.append(h)
 
-def gql(store, token, query):
-    url = f"https://{store}/admin/api/{GQL_VERSION}/graphql.json"
-    last_payload = None
+    existing = {}
+    for r in values[1:]:
+        m = row_to_map(headers, r)
+        pk = str(m.get("period", "")).strip()
+        if pk:
+            existing[pk] = m
 
-    for attempt in range(10):
-        r = requests.post(
-            url,
-            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-            json={"query": query},
-            timeout=60,
-        )
+    now_str = datetime.now(p.TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    url, token = cfg["url"], cfg["token"]
 
-        if r.status_code in (429, 500, 502, 503, 504):
-            wait = min(120, 8 + attempt * 8)
-            print(f"    HTTP {r.status_code}; retry {attempt+1}/10 in {wait}s")
-            time.sleep(wait)
-            continue
+    print(f"\n{'='*60}\n  {brand.upper()} — targeted website KPI repair\n{'='*60}", flush=True)
 
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code} for {store}: {r.text[:250]}")
+    for ym in months:
+        s, e = month_range(ym)
+        print(f"  Repairing {ym}: {s} -> {e}", flush=True)
+        web = p.fetch_sessions(url, token, s, e)
 
-        payload = r.json()
-        last_payload = payload
-        errors = payload.get("errors") or []
-        wait = throttle_wait_from_errors(errors)
+        row = existing.get(ym, {})
+        row["updated_at"] = now_str
+        row["period"] = ym
+        row["period_start"] = s
+        row["period_end"] = e
+        for k in WEB_FIELDS:
+            row[k] = web.get(k, "")
+        existing[ym] = row
 
-        if wait and attempt < 9:
-            print(f"    ShopifyQL THROTTLED; waiting {wait}s before retry {attempt+1}/10")
-            time.sleep(wait)
-            continue
+        print(f"    sessions={row.get('sessions')} visitors={row.get('unique_visitors')} pageviews={row.get('pageviews')} cr={row.get('conversion_rate')} checkout_abandonment={row.get('checkout_abandonment_rate')}", flush=True)
+        total = save_ws(ws, headers, existing)
+        print(f"    saved {ym}; total kpis_daily rows={total}", flush=True)
+        time.sleep(1.25)
 
-        if errors:
-            raise RuntimeError(f"GQL errors: {errors}")
-
-        return payload.get("data") or {}
-
-    raise RuntimeError(f"GraphQL failed after retries. Last payload: {last_payload}")
-
-
-def ql_run(store, token, shopifyql):
-    escaped = shopifyql.replace("\\", "\\\\").replace('"', '\\"')
-    query = (
-        f'{{ shopifyqlQuery(query: "{escaped}") {{ '
-        f'tableData {{ columns {{ name }} rows }} '
-        f'parseErrors }} }}'
-    )
-    data = gql(store, token, query)
-    obj = data.get("shopifyqlQuery") or {}
-    errs = obj.get("parseErrors") or []
-    if errs:
-        raise RuntimeError(f"ShopifyQL parseErrors: {errs}")
-
-    td = obj.get("tableData") or {}
-    rows = td.get("rows") or []
-
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        return rows
-
-    if isinstance(rows, list):
-        cols = [(c.get("name") or f"col_{i}") for i, c in enumerate(td.get("columns") or [])]
-        return [{cols[i] if i < len(cols) else f"col_{i}": v for i, v in enumerate(row)} for row in rows]
-
-    if isinstance(rows, str):
-        try:
-            parsed = json.loads(rows)
-            return parsed if isinstance(parsed, list) else []
-        except Exception:
-            return []
-
-    return []
-
-
-def ql_row(store, token, shopifyql):
-    rows = ql_run(store, token, shopifyql)
-    return rows[-1] if rows else {}
-
-
-def fetch_website_extra(store, token, start, end):
-    # Single query per row. This reduces query count by half and avoids throttle faster.
-    row = ql_row(store, token,
-        f"FROM sessions "
-        f"SHOW pageviews, sessions_that_reached_checkout, sessions_that_reached_and_completed_checkout "
-        f"SINCE {start} UNTIL {end}"
-    )
-
-    pageviews = int(abs(num(row.get("pageviews", 0))))
-    reached = int(abs(num(row.get("sessions_that_reached_checkout", 0))))
-    completed = int(abs(num(row.get("sessions_that_reached_and_completed_checkout", 0))))
-    abandoned = max(reached - completed, 0)
-    rate = round(abandoned / reached * 100, 2) if reached else 0
-
-    return {
-        "pageviews": pageviews,
-        "sessions_reached_checkout": reached,
-        "sessions_completed_checkout": completed,
-        "checkout_abandonments": abandoned,
-        "checkout_abandonment_rate": rate,
-    }
-
-
-def ensure_cols(ws, values):
-    header = list(values[0])
-    changed = False
-    for c in TARGET_COLUMNS:
-        if c not in header:
-            header.append(c)
-            changed = True
-    if changed:
-        ws.update("1:1", [header], value_input_option="USER_ENTERED")
-        for r in values:
-            while len(r) < len(header):
-                r.append("")
-        values[0] = header
-    return header, values
-
-
-def blankish(v):
-    return str(v or "").strip() in ("", "0", "0.0", "0.00", "-", "—")
-
+    print(f"  done {brand}", flush=True)
 
 def main():
-    gc = get_gc()
-    brands = [b for b in os.environ.get("RUN_BRANDS", "corro,cavali").lower().replace(" ", "").split(",") if b]
-    fill_from = os.environ.get("FILL_FROM", "2026-01-01")
-    fill_to = os.environ.get("FILL_TO", "")
+    months_raw = os.environ.get("TARGET_MONTHS", "").strip()
+    if not months_raw:
+        raise SystemExit("Set TARGET_MONTHS, example: TARGET_MONTHS=2024-11,2024-12,2025-01")
+    months = [m.strip() for m in months_raw.split(",") if m.strip()]
+    brands = [b.strip().lower() for b in os.environ.get("RUN_BRANDS", "corro").split(",") if b.strip()]
 
+    gc = p.get_gc()
     for brand in brands:
-        cfg = STORES[brand]
-        if not cfg["token"]:
-            print(f"Skipping {brand}: missing token")
+        if brand not in p.STORES:
+            print(f"Skipping unknown brand: {brand}", flush=True)
             continue
-
-        print(f"\n=== {brand.upper()} — website-only KPI backfill ===")
-        print(f"    store={cfg['url']}")
-        print(f"    fill_from={fill_from or 'none'} fill_to={fill_to or 'none'} max_rows={MAX_ROWS_PER_BRAND}")
-
-        sh = gc.open_by_key(cfg["sheet_id"])
-        ws = sh.worksheet("kpis_daily")
-        values = ws.get_all_values()
-        if not values:
-            continue
-
-        header, values = ensure_cols(ws, values)
-        idx = {h: i for i, h in enumerate(header)}
-
-        updates = []
-        processed = skipped = failed = 0
-
-        for rn, row in enumerate(values[1:], start=2):
-            if processed >= MAX_ROWS_PER_BRAND:
-                print(f"    stopping early: MAX_ROWS_PER_BRAND={MAX_ROWS_PER_BRAND}")
-                break
-
-            period = row[idx["period"]] if idx["period"] < len(row) else ""
-            start = row[idx["period_start"]] if idx["period_start"] < len(row) else ""
-            end = row[idx["period_end"]] if idx["period_end"] < len(row) else ""
-            if not start or not end:
-                continue
-            if fill_from and end < fill_from:
-                continue
-            if fill_to and start > fill_to:
-                continue
-
-            needs = UPDATE_EXISTING or any(blankish(row[idx[c]] if idx[c] < len(row) else "") for c in TARGET_COLUMNS)
-            if not needs:
-                skipped += 1
-                continue
-
-            print(f"    row {rn}: {period} {start} → {end}")
-            try:
-                data = fetch_website_extra(cfg["url"], cfg["token"], start, end)
-            except Exception as exc:
-                print(f"    ⚠ failed row {rn}: {exc}")
-                failed += 1
-                time.sleep(SLEEP_BETWEEN_ROWS)
-                continue
-
-            for c in TARGET_COLUMNS:
-                updates.append({"range": gspread.utils.rowcol_to_a1(rn, idx[c] + 1), "values": [[data[c]]]})
-            processed += 1
-
-            if len(updates) >= 75:
-                ws.batch_update(updates, value_input_option="USER_ENTERED")
-                updates = []
-
-            time.sleep(SLEEP_BETWEEN_ROWS)
-
-        if updates:
-            ws.batch_update(updates, value_input_option="USER_ENTERED")
-
-        print(f"  done {brand}: processed={processed}, skipped={skipped}, failed={failed}")
-
+        repair_brand(gc, brand, months)
 
 if __name__ == "__main__":
     main()
