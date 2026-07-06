@@ -3,61 +3,69 @@ name: Backfill Website KPIs Only
 on:
   workflow_dispatch:
     inputs:
-      brands:
-        description: 'Brands to run: corro / cavali / corro,cavali'
+      run_brands:
+        description: "corro,cavali"
+        required: true
+        default: "corro"
+      start_date:
+        description: "Start date filter. Use small ranges to avoid ShopifyQL throttle."
+        required: true
+        default: "2024-01-01"
+      end_date:
+        description: "End date filter. Empty = latest"
         required: false
-        default: 'corro'
-      fill_from:
-        description: 'Start date filter. Use small ranges to avoid ShopifyQL throttle.'
-        required: false
-        default: '2026-01-01'
-      fill_to:
-        description: 'End date filter. Empty = latest'
-        required: false
-        default: ''
-      update_existing:
-        description: 'Overwrite website KPI values only? true replaces zeros'
-        required: false
-        default: 'true'
-      max_rows:
-        description: 'Max rows per brand per run. Keep 20-35 to avoid ShopifyQL throttle.'
-        required: false
-        default: '30'
-      sleep_between_rows:
-        description: 'Seconds to wait between ShopifyQL rows'
-        required: false
-        default: '2.5'
+        default: ""
+      overwrite_website_values:
+        description: "Overwrite website KPI values only? true replaces zeros"
+        required: true
+        default: "true"
+      max_rows_per_brand:
+        description: "Max Rows per brand per run. Keep 20-35 to avoid ShopifyQL throttle."
+        required: true
+        default: "30"
+      sleep_seconds:
+        description: "Seconds to wait between ShopifyQL rows"
+        required: true
+        default: "2.5"
 
 jobs:
   backfill-website-kpis:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
+
+    env:
+      RUN_BRANDS: ${{ github.event.inputs.run_brands }}
+      START_DATE: ${{ github.event.inputs.start_date }}
+      END_DATE: ${{ github.event.inputs.end_date }}
+      OVERWRITE_WEBSITE_VALUES: ${{ github.event.inputs.overwrite_website_values }}
+      MAX_ROWS_PER_BRAND: ${{ github.event.inputs.max_rows_per_brand }}
+      SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds }}
+
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      SHOPIFY_STORE_CORRO: ${{ secrets.SHOPIFY_STORE_CORRO }}
+      SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
+      SHOPIFY_STORE_CAVALI: ${{ secrets.SHOPIFY_STORE_CAVALI }}
+      SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
+
+      SMARTRR_PUBLIC_TOKEN_CAVALI: ${{ secrets.SMARTRR_PUBLIC_TOKEN_CAVALI }}
+      SMARTRR_PRIVATE_TOKEN_CAVALI: ${{ secrets.SMARTRR_PRIVATE_TOKEN_CAVALI }}
+      SMARTRR_API_TOKEN_CAVALI: ${{ secrets.SMARTRR_API_TOKEN_CAVALI }}
+      SMARTRR_TOKEN_CAVALI: ${{ secrets.SMARTRR_TOKEN_CAVALI }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          pip install requests gspread google-auth
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth google-auth-oauthlib pytz
 
-      - name: Fill only Pageviews + Checkout Abandonment history
-        env:
-          SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
-          SHOPIFY_TOKEN_CAVALI: ${{ secrets.SHOPIFY_TOKEN_CAVALI }}
-          SHOPIFY_URL_CORRO: ${{ secrets.SHOPIFY_URL_CORRO }}
-          SHOPIFY_URL_CAVALI: ${{ secrets.SHOPIFY_URL_CAVALI }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          RUN_BRANDS: ${{ github.event.inputs.brands }}
-          FILL_FROM: ${{ github.event.inputs.fill_from }}
-          FILL_TO: ${{ github.event.inputs.fill_to }}
-          UPDATE_EXISTING_WEBSITE_KPIS: ${{ github.event.inputs.update_existing }}
-          MAX_ROWS_PER_BRAND: ${{ github.event.inputs.max_rows }}
-          SLEEP_BETWEEN_ROWS: ${{ github.event.inputs.sleep_between_rows }}
-        run: |
-          python -u backfill_WEBSITE_KPIS_ONLY.py
+      - name: Run website KPI backfill
+        run: python -u backfill_WEBSITE_KPIS_ONLY.py
