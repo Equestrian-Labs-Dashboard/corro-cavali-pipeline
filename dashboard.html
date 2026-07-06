@@ -1016,7 +1016,15 @@ function fv(v, f) {
 }
 function pctChg(c, p) {
   const cv=parseFloat(c), pv=parseFloat(p);
-  if (isNaN(cv)||isNaN(pv)||pv===0) return null;
+  if (isNaN(cv)||isNaN(pv)) return null;
+
+  // Avoid "YOY —" when both values are real zeros.
+  // If previous is 0, normal % change is mathematically undefined, but for dashboard readability:
+  // 0 vs 0 = 0.0%, current > 0 vs 0 = +100.0%, current 0 vs previous > 0 = -100.0%.
+  if (pv === 0) {
+    if (cv === 0) return "0.0";
+    return cv > 0 ? "100.0" : "-100.0";
+  }
   return ((cv-pv)/Math.abs(pv)*100).toFixed(1);
 }
 function badge(pct, lbl, inv) {
