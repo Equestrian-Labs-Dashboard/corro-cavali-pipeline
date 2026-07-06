@@ -1183,9 +1183,12 @@ function renderNVR(nvrRows, kpiRow) {
   const newNC   = parseInt(src.new_customers||0);
   const retNC   = parseInt(src.returning_customers||0);
   const total   = newRev + retRev;
-  const isReal  = newRev > 0 || retRev > 0;
+
+  // Show real zeros as 0 / $0 instead of dashes. Some Cavali periods have
+  // actual $0 revenue because orders are fully discounted; that is not missing data.
+  const hasNvrData = !!nvrRow || ["new_customers","returning_customers","new_revenue","returning_revenue"].some(k => src[k] !== undefined && src[k] !== null && String(src[k]).trim() !== "");
   const src_lbl = nvrRow ? "Pipeline v4 · REST orders_count" : "kpis_daily fallback";
-  const noDataNote = !isReal ? `<div class="nvr-note">⚠ No revenue data — run pipeline v4</div>` : "";
+  const noDataNote = !hasNvrData ? `<div class="nvr-note">⚠ No revenue data — run pipeline v4</div>` : "";
 
   el.innerHTML = `
     <div class="nvr-col">
@@ -1193,10 +1196,10 @@ function renderNVR(nvrRows, kpiRow) {
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="4" stroke="#72AEFF" stroke-width="1.5"/><path d="M5 3v4M3 5h4" stroke="#72AEFF" stroke-width="1.2" stroke-linecap="round"/></svg>
         New Customers
       </div>
-      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${newNC||"—"}</span></div>
+      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${Number.isFinite(newNC)?newNC:"—"}</span></div>
       <div class="nvr-row"><span class="nvr-lbl">Revenue</span><span class="nvr-val">${fv(newRev,"$")}</span></div>
       <div class="nvr-row"><span class="nvr-lbl">Gross Profit</span><span class="nvr-val nvr-gp">${fv(newGP,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(newRev/total*100).toFixed(1)+"%":"—"}</span></div>
+      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(newRev/total*100).toFixed(1)+"%":"0.0%"}</span></div>
       ${noDataNote}
       <div class="nvr-note" style="color:var(--tx3)">${src_lbl}</div>
     </div>
@@ -1205,10 +1208,10 @@ function renderNVR(nvrRows, kpiRow) {
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M7 3c0-1.1-.9-2-2-2S3 1.9 3 3s.9 2 2 2 2-.9 2-2z" stroke="#2EE896" stroke-width="1.2"/><path d="M1.5 9c0-1.9 1.6-3.5 3.5-3.5S8.5 7.1 8.5 9" stroke="#2EE896" stroke-width="1.2" stroke-linecap="round"/></svg>
         Returning Customers
       </div>
-      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${retNC||"—"}</span></div>
+      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${Number.isFinite(retNC)?retNC:"—"}</span></div>
       <div class="nvr-row"><span class="nvr-lbl">Revenue</span><span class="nvr-val">${fv(retRev,"$")}</span></div>
       <div class="nvr-row"><span class="nvr-lbl">Gross Profit</span><span class="nvr-val nvr-gp">${fv(retGP,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(retRev/total*100).toFixed(1)+"%":"—"}</span></div>
+      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(retRev/total*100).toFixed(1)+"%":"0.0%"}</span></div>
       ${noDataNote}
     </div>`;
 }
