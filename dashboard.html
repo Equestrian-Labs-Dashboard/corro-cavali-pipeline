@@ -956,6 +956,7 @@ function findCmp(rows, opt) {
       const pq = prev ? (qn===1?4:qn-1) : qn;
       const py = prev ? (qn===1?yr-1:yr) : yr-1;
       const pk = `q${pq}_${py}`;
+      if (py < 2024) return { row:null, lbl:"" };
 
       // Business rule: compare selected/current quarter against the FULL comparison quarter.
       // Example: Q3 2026 current-to-date compares vs full Q3 2025 for YOY.
@@ -968,6 +969,7 @@ function findCmp(rows, opt) {
     if (!isNaN(yr) && !isNaN(mo) && !isNaN(dayLimit)) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
       const pk=`mtd_${py}-${String(pmo).padStart(2,'0')}`;
+      if (py < 2024) return { row:null, lbl:"" };
       const rg = mtdRange(py, pmo, dayLimit);
       const row = exactRow(rows, pk, rg.start, rg.end) || latestPeriodRow(rows, pk, rg.start, rg.end);
       return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
@@ -979,6 +981,7 @@ function findCmp(rows, opt) {
       const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
       const pk=`${py}-${String(pmo).padStart(2,'0')}`;
       const lbl=new Date(py,pmo-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
+      if (py < 2024) return { row:null, lbl:"" };
       // Business rule: Month / MTD compares against the FULL comparison month.
       // Example: Jul 1–3 2026 compares vs full July 2025 for YOY.
       return { row:bestRow(rows.filter(r=>r.period===pk))||null, lbl:prev?lbl:`${lbl} (YOY)` };
@@ -988,6 +991,7 @@ function findCmp(rows, opt) {
     const days = prev ? 7 : 364;
     try {
       const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
+      if (ms.getFullYear() < 2024) return { row:null, lbl:"" };
       // Business rule: compare against the FULL comparison week, even when the current week is partial.
       const me=new Date(ms); me.setDate(me.getDate()+6);
       const pk=`week_${iso(ms)}`;
@@ -1040,7 +1044,10 @@ function badgeAmber(txt) { return `<span class="bdg bdg-am">⚠ ${txt}</span>`; 
 function kcard(lbl, val, pct, cmpL, note, acc, inv) {
   const n = pct!==null&&pct!==undefined ? parseFloat(pct) : null;
   const col = n!==null ? ((inv?n<=0:n>=0)?"var(--gr)":"var(--rd)") : (acc||"var(--bd)");
-  return `<div class="kc"><div class="kc-bar" style="background:${col}"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badge(pct,cmpL||"vs",inv)}</div>${note?`<div class="kc-note">${note}</div>`:""}</div>`;
+  // If cmpL is intentionally blank, do not show a YOY badge.
+  // Used for 2024 periods because there is no reliable 2023 baseline in the dashboard data.
+  const badgeHtml = cmpL === "" ? "" : badge(pct,cmpL||"vs",inv);
+  return `<div class="kc"><div class="kc-bar" style="background:${col}"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badgeHtml}</div>${note?`<div class="kc-note">${note}</div>`:""}</div>`;
 }
 function kcardAmber(lbl, val, warnTxt, note) {
   return `<div class="kc"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badgeAmber(warnTxt)}</div>${note?`<div class="kc-note" style="color:var(--am)">${note}</div>`:""}</div>`;
