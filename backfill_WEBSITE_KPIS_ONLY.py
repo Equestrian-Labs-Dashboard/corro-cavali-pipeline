@@ -1,5 +1,5 @@
 """
-Backfill Website KPIs Only
+Backfill Website KPIs Only — v111
 
 Compatible with the GitHub Actions form fields:
   RUN_BRANDS=corro
@@ -9,9 +9,6 @@ Compatible with the GitHub Actions form fields:
   MAX_ROWS_PER_BRAND=30
   SLEEP_SECONDS=2.5
 
-Also supports the older format:
-  TARGET_MONTHS=2024-11,2024-12,2025-01
-
 What it updates:
   sessions
   unique_visitors
@@ -20,7 +17,11 @@ What it updates:
   checkout_abandonment_rate
 
 What it preserves:
-  financial KPIs, Smartrr rows/data, revenue share, new/returning, etc.
+  financial KPIs, Smartrr data, revenue share, new/returning, etc.
+
+Important fix:
+  pipeline.fetch_sessions expects date objects in this repo version.
+  This script now passes date objects, not strings.
 """
 
 import os
@@ -45,16 +46,19 @@ def parse_bool(v, default=True):
     return s in ("1", "true", "yes", "y", "si", "sí")
 
 
-def month_range(ym):
+def month_range_dates(ym):
     y, m = [int(x) for x in ym.split("-")]
-    return date(y, m, 1).isoformat(), date(y, m, calendar.monthrange(y, m)[1]).isoformat()
+    s = date(y, m, 1)
+    e = date(y, m, calendar.monthrange(y, m)[1])
+    return s, e
 
 
 def months_between(start_date, end_date):
-    s = date.fromisoformat(start_date[:10])
-    e = date.fromisoformat(end_date[:10])
+    s = date.fromisoformat(str(start_date)[:10])
+    e = date.fromisoformat(str(end_date)[:10])
     cur = date(s.year, s.month, 1)
     last = date(e.year, e.month, 1)
+
     out = []
     while cur <= last:
         out.append(f"{cur.year}-{cur.month:02d}")
@@ -96,6 +100,23 @@ def save_ws(ws, headers, existing):
     return len(rows)
 
 
+def fetch_website_kpis_safe(url, token, start_date_obj, end_date_obj):
+    """
+    Calls pipeline.fetch_sessions with date objects.
+    Adds one retry because ShopifyQL sometimes throttles/transiently fails.
+    """
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            return p.fetch_sessions(url, token, start_date_obj, end_date_obj)
+        except Exception as exc:
+            last_err = exc
+            wait = 3 * attempt
+            print(f"    fetch_sessions attempt {attempt} failed: {exc}; retrying in {wait}s", flush=True)
+            time.sleep(wait)
+    raise last_err
+
+
 def repair_brand(gc, brand, months, overwrite=True, max_rows=30, sleep_seconds=2.5):
     cfg = p.STORES[brand]
     sh = gc.open_by_key(cfg["sheet_id"])
@@ -122,7 +143,7 @@ def repair_brand(gc, brand, months, overwrite=True, max_rows=30, sleep_seconds=2
     now_str = datetime.now(p.TIMEZONE).strftime("%Y-%m-%d %H:%M")
     url, token = cfg["url"], cfg["token"]
 
-    print(f"\n{'='*60}\n  {brand.upper()} — WEBSITE KPI ONLY BACKFILL\n{'='*60}", flush=True)
+    print(f"\n{'='*60}\n  {brand.upper()} — WEBSITE KPI ONLY BACKFILL v111\n{'='*60}", flush=True)
     print(f"  months requested: {months}", flush=True)
     print(f"  overwrite website values: {overwrite}", flush=True)
     print(f"  max rows this run: {max_rows}", flush=True)
@@ -134,22 +155,26 @@ def repair_brand(gc, brand, months, overwrite=True, max_rows=30, sleep_seconds=2
             print(f"  Reached MAX_ROWS_PER_BRAND={max_rows}. Stop safely.", flush=True)
             break
 
-        s, e = month_range(ym)
-        print(f"\n  Repairing {ym}: {s} -> {e}", flush=True)
+        s_date, e_date = month_range_dates(ym)
+        s_str, e_str = s_date.isoformat(), e_date.isoformat()
+        print(f"\n  Repairing {ym}: {s_str} -> {e_str}", flush=True)
 
         row = existing.get(ym, {})
         if not overwrite:
-            already_ok = all(has_value(row.get(k)) and str(row.get(k)).strip() not in ("0", "0.0") for k in ("pageviews", "checkout_abandonment_rate"))
+            already_ok = all(
+                has_value(row.get(k)) and str(row.get(k)).strip() not in ("0", "0.0")
+                for k in ("pageviews", "checkout_abandonment_rate")
+            )
             if already_ok:
                 print("    skip: website fields already populated", flush=True)
                 continue
 
-        web = p.fetch_sessions(url, token, s, e)
+        web = fetch_website_kpis_safe(url, token, s_date, e_date)
 
         row["updated_at"] = now_str
         row["period"] = ym
-        row["period_start"] = s
-        row["period_end"] = e
+        row["period_start"] = s_str
+        row["period_end"] = e_str
 
         for k in WEB_FIELDS:
             new_val = web.get(k, "")
