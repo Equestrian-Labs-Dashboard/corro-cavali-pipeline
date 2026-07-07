@@ -270,7 +270,15 @@ select:focus{border-color:var(--gr)}
 .web-box-sub{font-size:10px;color:var(--tx3);margin-top:3px;line-height:1.45}
 .emma-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:rgba(147,112,219,.10);border:1px solid rgba(147,112,219,.24);color:#7a58d1;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
 .web-box .kg{margin:0}
+.kcmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:2px 0 9px}
+.kcmp-item{background:var(--sf2);border:1px solid var(--bd2);border-radius:8px;padding:8px 9px;min-width:0}
+.kcmp-item.emma{background:linear-gradient(180deg, rgba(114,174,255,.07), rgba(147,112,219,.04));border-color:rgba(114,174,255,.28)}
+.kcmp-tag{font-size:8px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);margin-bottom:4px}
+.kcmp-item.emma .kcmp-tag{color:var(--pu)}
+.kcmp-val{font-family:'Syne',sans-serif;font-size:23px;font-weight:700;letter-spacing:-.04em;line-height:1.05;color:var(--tx)}
+.kcmp-sub{font-size:8px;color:var(--tx3);margin-top:4px;line-height:1.3}
 .web-info{font-size:11px;color:var(--tx3);line-height:1.5;padding:8px 2px 2px}
+@media (max-width: 640px){.kcmp-grid{grid-template-columns:1fr}}
 @media (max-width: 1180px){.web-compare{grid-template-columns:1fr}}
 
 </style>
@@ -371,7 +379,7 @@ select:focus{border-color:var(--gr)}
       <div class="web-box-head">
         <div>
           <div class="web-box-title">Shopify</div>
-          <div class="web-box-sub">Current website KPI source kept intact.</div>
+          <div class="web-box-sub">Current website KPI source kept intact. Sessions and Conv. Rate also show the Emma value beside Shopify when available.</div>
         </div>
       </div>
       <div class="kg" id="s-web"></div>
@@ -1087,6 +1095,12 @@ function kcard(lbl, val, pct, cmpL, note, acc, inv) {
 }
 function kcardAmber(lbl, val, warnTxt, note) {
   return `<div class="kc"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badgeAmber(warnTxt)}</div>${note?`<div class="kc-note" style="color:var(--am)">${note}</div>`:""}</div>`;
+}
+function kcardCompare(lbl, shopVal, shopPct, cmpL, shopNote, emmaVal, emmaNote, inv) {
+  const n = shopPct!==null&&shopPct!==undefined ? parseFloat(shopPct) : null;
+  const col = n!==null ? ((inv?n<=0:n>=0)?"var(--gr)":"var(--rd)") : "var(--bd)";
+  const badgeHtml = cmpL === "" ? "" : badge(shopPct,cmpL||"vs",inv);
+  return `<div class="kc"><div class="kc-bar" style="background:${col}"></div><div class="kc-lbl">${lbl}</div><div class="kcmp-grid"><div class="kcmp-item"><div class="kcmp-tag">Shopify</div><div class="kcmp-val">${shopVal}</div><div class="kcmp-sub">${shopNote || 'Current Shopify KPI source'}</div></div><div class="kcmp-item emma"><div class="kcmp-tag">Emma</div><div class="kcmp-val">${emmaVal}</div><div class="kcmp-sub">${emmaNote || 'Emma CRM snapshot'}</div></div></div><div class="kc-badges">${badgeHtml}</div><div class="kc-note">YOY badge shown for <strong>Shopify</strong>. Emma is displayed beside it as a reference snapshot.</div></div>`;
 }
 function skel(n) { return Array(n).fill(`<div class="kc sk"><div class="kc-lbl" style="width:55%;height:9px"> </div><div class="kc-val" style="height:21px;margin-top:8px"> </div></div>`).join(''); }
 
@@ -2146,10 +2160,28 @@ async function render() {
   const cmpShort         = selCmp==="yoy"?"YOY":selCmp==="prev"?"PREV":"—";
 
   // Website
+  const emmaForCompare = getEmmaCorroData(opt);
   safeHTML("s-web", DEFS.web.map(s => {
     const val = row ? fv(row[s.k], s.f) : "—";
     const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
     const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
+
+    const emmaComparable = brand === 'corro'
+      && emmaForCompare && emmaForCompare.state === 'ok'
+      && (s.k === 'sessions' || s.k === 'conversion_rate');
+
+    if (emmaComparable) {
+      const emmaKey = s.k === 'sessions' ? 'sessions' : 'cr_sessions';
+      const emmaVal = fv(emmaForCompare.data[emmaKey], s.f);
+      const emmaNote = s.k === 'sessions'
+        ? `Emma sessions · ${emmaForCompare.note || 'CRM snapshot'}`
+        : `Emma CR% Sessions · ${emmaForCompare.note || 'CRM snapshot'}`;
+      const shopNote = s.k === 'sessions'
+        ? 'Shopify sessions · ShopifyQL direct'
+        : 'Shopify conversion rate · ShopifyQL';
+      return kcardCompare(s.l, val, pct, cmpShort, shopNote, emmaVal, emmaNote, false);
+    }
+
     return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
   }).join(''));
   renderEmma(opt);
