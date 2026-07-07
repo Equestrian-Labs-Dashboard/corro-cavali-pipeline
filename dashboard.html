@@ -257,6 +257,22 @@ select:focus{border-color:var(--gr)}
 
 .sb-logo-img{width:138px;height:48px;background:transparent center left/contain no-repeat;margin:2px 0 6px 0}
 @media(max-width:860px){.sb-logo-img{width:120px;height:42px}}
+
+/* ══════════════════════════════════════════════════════
+   WEBSITE KPI COMPARE — Shopify + Emma (Corro only)
+══════════════════════════════════════════════════════ */
+.web-compare{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.88fr);gap:14px;align-items:start}
+.web-box{min-width:0}
+.web-box.shopify{padding-right:2px}
+.web-box.emma{border:1px solid var(--bd);border-radius:16px;padding:12px;background:linear-gradient(180deg, rgba(114,174,255,.05), rgba(147,112,219,.04));box-shadow:0 10px 30px rgba(11,18,32,.04)}
+.web-box-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin:0 0 10px}
+.web-box-title{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx2);font-weight:800}
+.web-box-sub{font-size:10px;color:var(--tx3);margin-top:3px;line-height:1.45}
+.emma-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:rgba(147,112,219,.10);border:1px solid rgba(147,112,219,.24);color:#7a58d1;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+.web-box .kg{margin:0}
+.web-info{font-size:11px;color:var(--tx3);line-height:1.5;padding:8px 2px 2px}
+@media (max-width: 1180px){.web-compare{grid-template-columns:1fr}}
+
 </style>
 </head>
 <body>
@@ -350,7 +366,27 @@ select:focus{border-color:var(--gr)}
   <div class="warn-bar" id="roas-warn">⚠ <strong>Ad Spend / ROAS / CAC</strong> — Exact Google + Meta spend can be entered below. If no spend is available, the dashboard uses a reference estimate so Ad Spend and ROAS do not stay blank.</div>
 
   <div class="sec"><div class="sec-num">01</div><div class="sec-line"></div><div class="sec-lbl">Website KPIs</div><div class="sec-line"></div></div>
-  <div class="kg" id="s-web"></div>
+  <div class="web-compare" id="web-compare-wrap">
+    <div class="web-box shopify">
+      <div class="web-box-head">
+        <div>
+          <div class="web-box-title">Shopify</div>
+          <div class="web-box-sub">Current website KPI source kept intact.</div>
+        </div>
+      </div>
+      <div class="kg" id="s-web"></div>
+    </div>
+    <div class="web-box emma" id="emma-box">
+      <div class="web-box-head">
+        <div>
+          <div class="web-box-title">Emma / CRM Web Snapshot</div>
+          <div class="web-box-sub">Corro only · 2026 monthly snapshots from the provided capture. Quarter values are automatically calculated from the available 2026 months.</div>
+        </div>
+        <div class="emma-chip">2026 only</div>
+      </div>
+      <div class="kg" id="s-emma"></div>
+    </div>
+  </div>
 
   <div class="sec"><div class="sec-num">02</div><div class="sec-line"></div><div class="sec-lbl">Financial KPIs — Net Sales confirmed</div><div class="sec-line"></div></div>
   <div class="kg" id="s-fin"></div>
@@ -1098,6 +1134,128 @@ const DEFS = {
     { k:"aov",             l:"AOV",              f:"$", n:"Net Sales ÷ Orders" },
   ],
 };
+
+const EMMA_DEFS = [
+  { k:"new_users", l:"New Users", f:"" },
+  { k:"sessions", l:"Sessions", f:"" },
+  { k:"cr_sessions", l:"CR% Sessions", f:"%" },
+  { k:"transactions", l:"Transactions", f:"" },
+  { k:"total_revenue", l:"Total Revenue", f:"$" },
+  { k:"avg_purchase_revenue", l:"Avg Purchase Revenue", f:"$" },
+];
+
+const EMMA_CORRO_MONTHLY = {
+  "2026-01": { new_users:31028, sessions:39564, cr_sessions:1.05, transactions:416, total_revenue:75561, avg_purchase_revenue:182 },
+  "2026-02": { new_users:16577, sessions:22841, cr_sessions:1.04, transactions:237, total_revenue:38674, avg_purchase_revenue:163 },
+  "2026-03": { new_users:18289, sessions:21793, cr_sessions:0.57, transactions:125, total_revenue:23542, avg_purchase_revenue:188 },
+  "2026-04": { new_users:17797, sessions:21055, cr_sessions:1.50, transactions:315, total_revenue:54249, avg_purchase_revenue:172 },
+  "2026-05": { new_users:30394, sessions:37443, cr_sessions:1.17, transactions:437, total_revenue:76807, avg_purchase_revenue:176 },
+  "2026-06": { new_users:19364, sessions:23842, cr_sessions:1.00, transactions:239, total_revenue:43723, avg_purchase_revenue:183 },
+};
+
+function _emmaMonthsInRange(startYm, endYm) {
+  const out = [];
+  let y = parseInt(String(startYm||'').slice(0,4), 10);
+  let m = parseInt(String(startYm||'').slice(5,7), 10);
+  const ey = parseInt(String(endYm||'').slice(0,4), 10);
+  const em = parseInt(String(endYm||'').slice(5,7), 10);
+  if (!y || !m || !ey || !em) return out;
+  while (y < ey || (y === ey && m <= em)) {
+    out.push(`${y}-${String(m).padStart(2,'0')}`);
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+function getEmmaCorroData(opt) {
+  if (brand !== "corro") return { state:"hidden-brand" };
+  if (ptype === "week") return { state:"na-week" };
+
+  const startYm = String(opt?.start || '').slice(0,7);
+  if (!startYm || !startYm.startsWith('2026-')) return { state:"na-year" };
+
+  if (ptype === "quarter") {
+    const endYm = String(opt?.end || '').slice(0,7);
+    const months = _emmaMonthsInRange(startYm, endYm);
+    if (!months.length) return { state:"no-data" };
+    const rows = months.map(ym => EMMA_CORRO_MONTHLY[ym]).filter(Boolean);
+    if (rows.length !== months.length) return { state:"no-data" };
+
+    const sums = rows.reduce((acc, r) => {
+      acc.new_users += +r.new_users || 0;
+      acc.sessions += +r.sessions || 0;
+      acc.transactions += +r.transactions || 0;
+      acc.total_revenue += +r.total_revenue || 0;
+      return acc;
+    }, { new_users:0, sessions:0, transactions:0, total_revenue:0 });
+
+    const cr = sums.sessions > 0 ? (sums.transactions / sums.sessions * 100) : null;
+    const apr = sums.transactions > 0 ? (sums.total_revenue / sums.transactions) : null;
+    return {
+      state:"ok",
+      mode:"quarter",
+      note:`Quarter calc from Emma monthly captures: ${months.join(', ')}`,
+      data:{
+        new_users:sums.new_users,
+        sessions:sums.sessions,
+        cr_sessions:cr,
+        transactions:sums.transactions,
+        total_revenue:sums.total_revenue,
+        avg_purchase_revenue:apr
+      }
+    };
+  }
+
+  const row = EMMA_CORRO_MONTHLY[startYm];
+  if (!row) return { state:"no-data" };
+  return {
+    state:"ok",
+    mode:"month",
+    note:`Emma monthly snapshot: ${startYm}`,
+    data: row
+  };
+}
+
+function renderEmma(opt) {
+  const box = document.getElementById('emma-box');
+  const wrap = document.getElementById('web-compare-wrap');
+  const el = document.getElementById('s-emma');
+  if (!el || !box || !wrap) return;
+
+  const em = getEmmaCorroData(opt);
+  const onCorro = brand === 'corro';
+  box.style.display = onCorro ? '' : 'none';
+  wrap.style.gridTemplateColumns = onCorro ? '' : '1fr';
+
+  if (!onCorro) {
+    safeHTML('s-emma', '');
+    return;
+  }
+
+  const infoCard = (title, note) => `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--pu)"></div><div class="kc-lbl">${title}</div><div class="kc-val">—</div><div class="kc-note">${note}</div></div>`;
+
+  if (em.state === 'na-week') {
+    safeHTML('s-emma', infoCard('Emma / CRM snapshot', 'Emma is not shown in Week view. It only applies to Month / MTD and Quarter for Corro.'));
+    return;
+  }
+  if (em.state === 'na-year') {
+    safeHTML('s-emma', infoCard('Emma / CRM snapshot', 'Emma is enabled only for 2026 selections. Older years stay Shopify-only as requested.'));
+    return;
+  }
+  if (em.state !== 'ok') {
+    safeHTML('s-emma', infoCard('Emma / CRM snapshot', 'No Emma snapshot was loaded for this Corro period yet. Provide the missing month capture if you want it shown here.'));
+    return;
+  }
+
+  safeHTML('s-emma', EMMA_DEFS.map(s => {
+    const val = fv(em.data[s.k], s.f);
+    const note = s.k === 'avg_purchase_revenue'
+      ? 'Total revenue ÷ transactions'
+      : (s.k === 'cr_sessions' ? 'Transactions ÷ sessions' : (em.note || 'Emma source'));
+    return kcard(s.l, val, null, '', note, 'var(--pu)', false);
+  }).join(''));
+}
 
 /* ══════════════════════════════════════════════════════
    FCS FORECAST (Corro only)
@@ -1967,7 +2125,7 @@ async function render() {
   if (root) root.classList.toggle("is-cavali", renderBrand==="cavali");
   safeSet("mi-num", renderBrand==="cavali" ? "07" : "06");
 
-  const skelIds = { "s-web": 3, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
+  const skelIds = { "s-web": 5, "s-emma": 6, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
 
   const ovEl  = document.getElementById("ov");
@@ -1994,6 +2152,7 @@ async function render() {
     const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
     return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
   }).join(''));
+  renderEmma(opt);
 
   // Financial
   safeHTML("s-fin", DEFS.fin.map(s => {
@@ -2075,7 +2234,7 @@ function setBrand(b) {
   __renderToken++;
   document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
   safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  ["s-web","s-fin","s-op","s-mkt"].forEach((id,i)=>safeHTML(id, skel([5,9,4,4][i])));
+  ["s-web","s-emma","s-fin","s-op","s-mkt"].forEach((id,i)=>safeHTML(id, skel([5,6,9,4,4][i])));
   safeHTML("rs-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
   safeHTML("nvr-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
   _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
