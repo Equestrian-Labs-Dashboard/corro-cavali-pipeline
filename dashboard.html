@@ -334,6 +334,13 @@ select:focus{border-color:var(--gr)}
       <span>Upsell Smile</span>
       <span class="sb-badge" style="background:rgba(114,223,181,.12);color:#28b98b;border:1px solid rgba(114,223,181,.25)">UP</span>
     </a>
+    <div class="sb-sec sb-ops-sec" style="margin-top:10px">Operations</div>
+    <a class="sb-suite" data-report-key="sku_savvy" href="https://equestrian-labs-dashboard.github.io/corro-skusavvy/" target="_blank" rel="noopener">
+      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><rect x="1.2" y="1.4" width="8.6" height="8.2" rx="1.4" fill="#72AEFF" opacity=".25"/><path d="M3 3.4h5M3 5.5h5M3 7.6h3" stroke="#4C8FE0" stroke-width="1" stroke-linecap="round"/></svg>
+      <span>SKU Savvy</span>
+      <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#4C8FE0;border:1px solid rgba(114,174,255,.25)">OPS</span>
+    </a>
+
   </div>
   <div class="sb-foot">
     <div class="sync-r"><div class="sync-d"></div>Auto-sync daily 8AM</div>
@@ -2292,7 +2299,8 @@ setBrand("cavali");
       pareto:["pareto","pareto analysis","gp"],
       frequency:["frequency","retention","ret"],
       concierge:["concierge","concierge comm","concierge comm.","concierge communication","concierge communications"],
-      upsell:["upsell","up sell","upsell smile"]
+      upsell:["upsell","up sell","upsell smile"],
+      sku_savvy:["sku savvy","sku savy","skusavvy","sku","operations"]
     }[key] || [key];
     return aliases.some(a => tokens.some(t => t === a || t.includes(a)));
   }
@@ -2311,6 +2319,9 @@ setBrand("cavali");
     const anyVisible = links.some(a => !a.classList.contains("auth-hidden"));
     const sec = document.querySelector(".sb-suite-sec");
     if (sec) sec.classList.toggle("auth-hidden", !anyVisible);
+    const ops = document.querySelector(".sb-ops-sec");
+    const sku = document.querySelector('[data-report-key="sku_savvy"]');
+    if (ops && sku) ops.classList.toggle("auth-hidden", sku.classList.contains("auth-hidden"));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", applySidebarAccess);
   else applySidebarAccess();
