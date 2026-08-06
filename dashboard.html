@@ -1136,7 +1136,7 @@ const DEFS = {
     { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"online_store_visitors from ShopifyQL" },
     { k:"pageviews",        l:"Pageviews",         f:"",  n:"pageviews from ShopifyQL" },
     { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"conversion_rate from ShopifyQL" },
-    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"%", n:"(Reached checkout − completed checkout) ÷ reached checkout" },
+    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"%", n:"(Reached checkout − completed checkout) ÷ reached checkout", inv:true },
   ],
   fin: [
     { k:"gross_sales",    l:"Gross Sales",    f:"$" },
@@ -2154,10 +2154,10 @@ async function render() {
       const shopNote = s.k === 'sessions'
         ? 'Shopify sessions · ShopifyQL direct'
         : 'Shopify conversion rate · ShopifyQL';
-      return kcardCompare(s.l, val, pct, cmpShort, shopNote, emmaVal, emmaNote, false);
+      return kcardCompare(s.l, val, pct, cmpShort, shopNote, emmaVal, emmaNote, s.inv||false);
     }
 
-    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
+    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, s.inv||false);
   }).join(''));
   renderEmma(opt);
 
