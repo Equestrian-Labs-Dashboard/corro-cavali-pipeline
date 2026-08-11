@@ -110,6 +110,21 @@ SMARTRR_API_KEYS = {
 
 
 # ─────────────────────────────────────────────────────────────────
+# CORRO HITS HUDSON CHANNEL RULE
+# Source of truth: Hits-Hudson_Corro project config/report logic.
+# Include HITS when:
+#   1) Shopify physical/POS/fulfillment location id == Corro Trailer 1, OR
+#   2) exact ORDER TAG == HitsHudson.
+# False-positive protection:
+#   Employee / Concierge orders passing through the trailer are NOT HITS unless
+#   they explicitly carry the HitsHudson order tag.
+# ─────────────────────────────────────────────────────────────────
+HITS_LOCATION_ID = str(os.environ.get("HITS_LOCATION_ID", "67063775290"))
+HITS_LOCATION_NAME = os.environ.get("HITS_LOCATION_NAME", "Corro Trailer 1")
+HITS_ORDER_TAG = os.environ.get("HITS_ORDER_TAG", "HitsHudson")
+
+
+# ─────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────────
 def get_gc():
@@ -634,7 +649,7 @@ def fetch_orders(url, token, s, e):
         "created_at_min":   f"{s}T00:00:00-05:00",
         "created_at_max":   f"{e}T23:59:59-05:00",
         "limit":            250,
-        "fields":           "id,subtotal_price,created_at,line_items,source_name,tags,customer",
+        "fields":           "id,subtotal_price,created_at,line_items,source_name,tags,customer,location_id,fulfillments",
     })
     return enrich_orders_with_customer_order_counts(url, token, orders)
 
@@ -646,28 +661,114 @@ def calc_units(orders):
     )
 
 
+def _order_tags_list(order):
+    raw = order.get("tags") or ""
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def _numeric_id(v):
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    return s.split("/")[-1].split("?")[0]
+
+
+def _hits_location_ids(order):
+    ids = set()
+
+    # REST order location_id / legacy location identifiers.
+    for key in ("location_id", "locationId"):
+        v = order.get(key)
+        if v not in (None, ""):
+            ids.add(_numeric_id(v))
+
+    # REST fulfillments usually expose location_id.
+    for f in order.get("fulfillments") or []:
+        if not isinstance(f, dict):
+            continue
+        for key in ("location_id", "locationId"):
+            v = f.get(key)
+            if v not in (None, ""):
+                ids.add(_numeric_id(v))
+
+        # Defensive support if a location object is returned.
+        loc = f.get("location") or {}
+        if isinstance(loc, dict) and loc.get("id") not in (None, ""):
+            ids.add(_numeric_id(loc.get("id")))
+
+    # Defensive support for GraphQL-shaped objects.
+    physical = order.get("physicalLocation") or order.get("physical_location") or {}
+    if isinstance(physical, dict) and physical.get("id") not in (None, ""):
+        ids.add(_numeric_id(physical.get("id")))
+
+    return {x for x in ids if x}
+
+
+def _hits_location_names(order):
+    names = []
+
+    physical = order.get("physicalLocation") or order.get("physical_location") or {}
+    if isinstance(physical, dict) and physical.get("name"):
+        names.append(str(physical.get("name")))
+
+    for f in order.get("fulfillments") or []:
+        if not isinstance(f, dict):
+            continue
+        loc = f.get("location") or {}
+        if isinstance(loc, dict) and loc.get("name"):
+            names.append(str(loc.get("name")))
+
+    return names
+
+
+def is_hits_order(order):
+    """
+    Exact HITS Hudson rule copied from the dedicated HITS report:
+
+      include = (Corro Trailer 1 location OR exact order tag HitsHudson)
+
+    plus the same false-positive protection used by the current HITS GitHub
+    report: Employee / Concierge orders at the trailer are excluded unless the
+    exact HitsHudson order tag is present.
+    """
+    tags = _order_tags_list(order)
+    lower_tags = [t.lower() for t in tags]
+    target_tag = HITS_ORDER_TAG.lower()
+
+    has_hits_tag = any(t == target_tag for t in lower_tags)
+
+    location_ids = _hits_location_ids(order)
+    has_hits_location_id = HITS_LOCATION_ID in location_ids
+
+    target_name = HITS_LOCATION_NAME.lower().strip()
+    has_hits_location_name = any(
+        target_name and target_name in str(name).lower()
+        for name in _hits_location_names(order)
+    )
+
+    matches_location = has_hits_location_id or has_hits_location_name
+
+    clearly_non_hits = (
+        not has_hits_tag
+        and any(t == "employee" or "concierge" in t for t in lower_tags)
+    )
+
+    return (has_hits_tag or matches_location) and not clearly_non_hits
+
+
 def classify_revenue_channel(order):
     """
-    Classify a Shopify order for the Revenue Share breakdown.
+    Revenue Share classifier.
 
-    Business rule added for Corro:
-      - HITS must be separated from Wellington / Ecommerce.
-      - HITS is evaluated BEFORE POS/Wellington because a HITS order can also
-        have source_name=pos. Without this precedence it was being counted
-        inside Wellington (POS).
-      - Regular web/Shopify orders remain stored as "Online" for backwards
-        compatibility; dashboard.html presents this as "Ecommerce" for Corro.
-
-    This does not change total sales; it only redistributes the existing
-    revenue-share buckets.
+    HITS is intentionally evaluated BEFORE Wellington/POS because HITS sales
+    are POS/location sales and would otherwise be absorbed by Wellington.
     """
     src  = (order.get("source_name") or "").lower().strip()
     tags = (order.get("tags") or "").lower().strip()
 
-    # HITS / HITS Hudson / HITS Houston / tags such as "missing hits Houston".
-    # Word-boundary matching avoids accidental partial-word matches.
-    is_hits = bool(re.search(r"\bhits\b", tags)) or bool(re.search(r"\bhits\b", src))
-    if is_hits:
+    if is_hits_order(order):
         return "HITS"
 
     if src == "pos" or "wellington" in tags or bool(re.search(r"(^|[,;\s])pos($|[,;\s])", tags)):
