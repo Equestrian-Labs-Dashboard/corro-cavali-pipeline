@@ -1179,6 +1179,8 @@ const EMMA_CORRO_MONTHLY = {
   "2026-04": { new_users:17797, sessions:21055, cr_sessions:1.50, transactions:315, total_revenue:54249, avg_purchase_revenue:172 },
   "2026-05": { new_users:30394, sessions:37443, cr_sessions:1.17, transactions:437, total_revenue:76807, avg_purchase_revenue:176 },
   "2026-06": { new_users:19364, sessions:23842, cr_sessions:1.00, transactions:239, total_revenue:43723, avg_purchase_revenue:183 },
+  "2026-07": { new_users:21702, sessions:24991, cr_sessions:1.15, transactions:288, total_revenue:35411, avg_purchase_revenue:123 },
+  "2026-08": { new_users:5604, sessions:6561, cr_sessions:0.96, transactions:63, total_revenue:9189, avg_purchase_revenue:146, snapshot_end:"2026-08-11", partial:true },
 };
 
 function _emmaMonthsInRange(startYm, endYm) {
@@ -1240,7 +1242,9 @@ function getEmmaCorroData(opt) {
   return {
     state:"ok",
     mode:"month",
-    note:`Emma monthly snapshot: ${startYm}`,
+    note: row.partial
+      ? `Emma MTD snapshot: ${startYm} through ${row.snapshot_end || opt?.end || "current date"}`
+      : `Emma monthly snapshot: ${startYm}`,
     data: row
   };
 }
