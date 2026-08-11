@@ -523,12 +523,18 @@ const CAVALI_RENAME = {
   "Others":           "Subscriptions",
   "Online":           "Single Products",
   "Wellington (POS)": null,
+  "HITS":             null,
   "Concierge":        "Concierge",
+};
+const CORRO_RENAME = {
+  "Online": "Ecommerce",
 };
 const CH_COLORS = {
   "Wellington (POS)": "#D8B054",
+  "HITS":             "#28b98b",
   "Concierge":        "#A090FF",
   "Online":           "#72AEFF",
+  "Ecommerce":        "#72AEFF",
   "Single Products":  "#72AEFF",
   "Others":           "#707070",
   "Subscriptions":    "#2EE896",
@@ -1290,7 +1296,12 @@ function renderRS(rsRows, row) {
       const nm = CAVALI_RENAME[r.channel];
       return nm===null ? null : { ...r, channel: nm||r.channel };
     }).filter(Boolean);
+  } else if (brand==="corro") {
+    ch = ch.map(r => ({ ...r, channel: CORRO_RENAME[r.channel] || r.channel }));
   }
+
+  // Do not clutter the breakdown with empty newly-added buckets.
+  ch = ch.filter(r => Math.abs(parseFloat(r.amount)||0) > 0 || Math.abs(parseFloat(r.pct)||0) > 0);
 
   if (!ch.length) { el.innerHTML=`<div style="font-size:11px;color:var(--tx3)">No data for this period.</div>`; return; }
 
