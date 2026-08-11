@@ -1,2343 +1,2437 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="light">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Equestrian Labs — Analytics</title>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet">
+"""
+Pipeline CORRO / CAVALI v4.5 — CORRECTO REAL
+=============================================
+Cambios clave de esta versión:
+- Cavali sección 06 YA NO usa la pestaña vieja de resumen Smartrr.
+- YA NO consulta subscription-contract en Shopify GraphQL.
+- Escribe la pestaña correcta: smartrr_product_volume.
+- Para Cavali/Smartrr usa Order Line Item Created Date para el filtro de fecha.
+- Escribe por producto/variant:
+  active_subscribers_to_date = total activo acumulado por producto hasta el fin del filtro.
+  new_subscribers = nuevos del rango seleccionado.
+- Si Smartrr no entrega líneas utilizables, usa fallback de Shopify order line_items para no dejar vacío.
+- Mantiene kpis_daily, revenue_share, new_vs_returning y ad_spend.
 
-<script>
-/* Dashboard guard — portal session required.
-   This does not replace server-side security, but it prevents direct dashboard
-   access from browsers that have not logged in through index.html. */
-(function(){
-  const KEY = "corro_dashboard_auth_v3";
-  const TTL_DAYS = 90;
-  const qs = new URLSearchParams(location.search);
-  const requestedBrand = (qs.get("brand") || "").toLowerCase();
+EJECUCIÓN:
+  python -u pipeline.py
 
-  function readSession(){
-    for (const store of [sessionStorage, localStorage]) {
-      try {
-        const s = JSON.parse(store.getItem(KEY) || "null");
-        if (s && s.ok && s.email && s.ts && (Date.now() - Number(s.ts)) < TTL_DAYS*24*60*60*1000) return s;
-      } catch(e) {}
-    }
-    return null;
-  }
-  function tokensOf(s){
-    const raw = String(s && (s.accessRaw || (Array.isArray(s.access) ? s.access.join(",") : s.access)) || "");
-    const low = raw.toLowerCase();
-    if (s && (s.all === true || low === "all" || low.includes("all reports") || low.includes("todos"))) return ["all"];
-    if (Array.isArray(s && s.access)) return s.access.map(x => String(x).toLowerCase());
-    return raw.split(/[;,|\/]+|\s+and\s+|\s+y\s+/i).map(x => x.trim().toLowerCase()).filter(Boolean);
-  }
-  function has(tokens, key){
-    if (tokens.includes("all")) return true;
-    if (key === "dashboard") return tokens.includes("dashboard") || tokens.includes("main dashboard");
-    if (key === "corro") return tokens.includes("corro") || tokens.includes("dashboard_corro") || tokens.includes("dashboard corro") || has(tokens,"dashboard");
-    if (key === "cavali") return tokens.includes("cavali") || tokens.includes("dashboard_cavali") || tokens.includes("dashboard cavali") || has(tokens,"dashboard");
-    return tokens.includes(key);
-  }
-  function goPortal(reason){
-    const next = location.pathname.split("/").pop() + location.search;
-    location.replace("./index.html?reason=" + encodeURIComponent(reason || "login_required") + "&next=" + encodeURIComponent(next));
-  }
+Requiere env vars:
+  SHOPIFY_TOKEN_CORRO
+  SHOPIFY_TOKEN_CAVALI
+  GOOGLE_CREDENTIALS
+  SMARTRR_API_KEY_CAVALI opcional/recomendado
+"""
 
-  const session = readSession();
-  if (!session) return goPortal("login_required");
+import os, json, time, random, requests, gspread, calendar
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta, date
+import pytz
+import re
 
-  const tokens = tokensOf(session);
-  const canDashboard = has(tokens,"dashboard") || has(tokens,"corro") || has(tokens,"cavali");
-  if (!canDashboard) return goPortal("not_allowed");
+# SANITY MARKERS expected in GitHub Actions logs:
+#   ✅ smartrr_product_volume: ... refreshed rows
+#   ❌ should NOT print the old Smartrr subscriber-summary tab logs
+#   ❌ should NOT request Shopify subscription contracts
 
-  if ((requestedBrand === "corro" || requestedBrand === "cavali") && !has(tokens, requestedBrand)) {
-    return goPortal("brand_not_allowed");
-  }
+TIMEZONE    = pytz.timezone("America/Bogota")
+GQL_VERSION = "2025-10"
 
-  window.__PORTAL_SESSION__ = session;
-})();
-</script>
-
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-[data-theme="light"]{
-  --bg:#EDF2F7;--sf:#FFFFFF;--sf2:#F0F5FA;--sf3:#E2EAF2;
-  --bd:#C8D8E8;--bd2:#A0B8D0;
-  --tx:#0D1B2A;--tx2:#3A5470;--tx3:#7A96B0;
-  --gr:#0C7050;--gr-bg:#D2F0E4;--gr-bd:rgba(12,112,80,.2);
-  --rd:#B83020;--rd-bg:#FAE0DC;--rd-bd:rgba(184,48,32,.2);
-  --gd:#8B6914;--pu:#4840B0;--bl:#1450A8;
-  --am:#c47a00;--am-bg:rgba(196,122,0,.09);--am-bd:rgba(196,122,0,.25);
-  --navy:#1C3F6E;--navy2:#0D2B4E;
+STORES = {
+    "cavali": {
+        # Uses the same GitHub Secrets you already have. Defaults keep the old behavior intact.
+        "url":      os.environ.get("SHOPIFY_URL_CAVALI", "cavali-club.myshopify.com"),
+        "token":    os.environ["SHOPIFY_TOKEN_CAVALI"],
+        "sheet_id": os.environ.get("SHEET_ID_CAVALI", "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig"),
+    },
+    "corro":  {
+        # Uses the same GitHub Secrets you already have. Defaults keep the old behavior intact.
+        "url":      os.environ.get("SHOPIFY_URL_CORRO", "equestrian-labs.myshopify.com"),
+        "token":    os.environ["SHOPIFY_TOKEN_CORRO"],
+        "sheet_id": os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU"),
+    },
 }
-[data-theme="dark"]{
-  --bg:#0D1B2A;--sf:#0F2236;--sf2:#162E48;--sf3:#1C3A58;
-  --bd:#1E3A5F;--bd2:#2A5080;
-  --tx:#F0F6FF;--tx2:#A8C0D8;--tx3:#5A7A98;
-  --gr:#2EE896;--gr-bg:#0A3020;--gr-bd:rgba(46,232,150,.22);
-  --rd:#F06868;--rd-bg:#3C1010;--rd-bd:rgba(240,104,104,.22);
-  --gd:#D8B054;--pu:#A090FF;--bl:#72AEFF;
-  --am:#D8B054;--am-bg:rgba(216,176,84,.10);--am-bd:rgba(216,176,84,.25);
-  --navy:#1C3F6E;--navy2:#0D2B4E;
-}
-html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx)}
-.app{display:flex;min-height:100vh}
-.sb{width:200px;background:var(--sf);border-right:1px solid var(--bd);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;flex-shrink:0;overflow:hidden}
-.sb-top{padding:16px 14px 13px;border-bottom:1px solid var(--bd)}
-.sb-dots{display:flex;gap:3px;margin-bottom:6px}
-.sb-dot{width:7px;height:7px;border-radius:50%}
-.sb-name{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:var(--tx)}
-.sb-sub{font-size:10px;color:var(--tx3);margin-top:1px}
-.sb-nav{flex:1;padding:7px 0;overflow-y:auto}
-.sb-sec{padding:8px 14px 3px;font-size:9px;font-weight:600;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase}
-.sb-item{display:flex;align-items:center;gap:7px;padding:6px 14px;font-size:12px;color:var(--tx2);cursor:pointer;border-left:2px solid transparent;text-decoration:none;transition:all .1s}
-.sb-item:hover,.sb-item.on{background:var(--sf2);color:var(--tx)}
-.sb-item.on{border-left-color:var(--gr);font-weight:500}
-.sb-suite{display:flex;align-items:center;gap:7px;padding:5px 14px;font-size:11px;color:var(--tx3);text-decoration:none;border-left:2px solid transparent;transition:all .1s}
-.sb-suite:hover{background:var(--sf2);color:var(--tx)}
-.sb-badge{display:inline-flex;align-items:center;padding:1px 5px;border-radius:20px;font-size:9px;font-weight:600;margin-left:auto}
-.sb-foot{padding:10px 14px;border-top:1px solid var(--bd)}
-.sync-r{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--tx3)}
-.sync-d{width:5px;height:5px;border-radius:50%;background:var(--gr);animation:pu 2.5s infinite}
-@keyframes pu{0%,100%{opacity:1}50%{opacity:.15}}
-.main{flex:1;padding:20px 22px;min-width:0;overflow-x:hidden}
-.ph{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px}
-.ph h1{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--tx);letter-spacing:-.025em}
-.ph p{font-size:11px;color:var(--tx3);margin-top:2px}
-.ph-r{display:flex;align-items:center;gap:6px}
-.live-dot{display:flex;align-items:center;gap:4px;background:var(--gr-bg);border:1px solid var(--gr-bd);border-radius:20px;padding:3px 9px;font-size:10px;color:var(--gr);font-weight:600}
-.icon-btn{width:27px;height:27px;border-radius:50%;border:1px solid var(--bd2);background:var(--sf2);color:var(--tx2);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all .12s}
-.icon-btn:hover{border-color:var(--gr);color:var(--gr)}
-.rf-btn{display:flex;align-items:center;gap:4px;padding:4px 10px;border-radius:5px;border:1px solid var(--bd2);background:var(--sf2);color:var(--tx2);cursor:pointer;font-size:10px;font-weight:500;font-family:'DM Sans',sans-serif;transition:all .12s}
-.rf-btn:hover{border-color:var(--gr);color:var(--gr)}
-.ctrl{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px}
-.btn-grp{display:flex;gap:2px;background:var(--sf2);border:1px solid var(--bd);border-radius:7px;padding:2px}
-.brand-btn{display:flex;align-items:center;gap:5px;padding:5px 11px;border-radius:5px;border:1px solid transparent;background:transparent;font-family:'DM Sans',sans-serif;font-size:11px;font-weight:500;color:var(--tx2);cursor:pointer;transition:all .12s}
-.brand-btn.on{background:var(--sf);color:var(--tx);border-color:var(--bd2)}
-.period-btn{padding:4px 10px;border-radius:5px;border:1px solid transparent;background:transparent;font-family:'DM Sans',sans-serif;font-size:11px;font-weight:500;color:var(--tx2);cursor:pointer;transition:all .12s}
-.period-btn.on{background:var(--sf);color:var(--tx);border-color:var(--bd2)}
-.selbar{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:9px 13px;margin-bottom:11px;display:flex;align-items:center;flex-wrap:wrap;gap:12px}
-.sel-grp{display:flex;align-items:center;gap:7px}
-.sel-lbl{font-size:10px;color:var(--tx3);font-weight:500;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
-.sel-div{width:1px;height:16px;background:var(--bd2)}
-select{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;color:var(--tx);background:var(--sf2);border:1px solid var(--bd2);border-radius:5px;padding:4px 10px;cursor:pointer;outline:none;transition:border-color .12s}
-select:focus{border-color:var(--gr)}
-.ibar{font-size:11px;color:var(--tx3);background:var(--sf2);border-radius:6px;padding:6px 12px;margin-bottom:13px;line-height:1.7}
-.ibar span{color:var(--tx);font-weight:500}
-.warn-bar{display:none;font-size:10px;color:var(--am);background:var(--am-bg);border:1px solid var(--am-bd);border-radius:6px;padding:5px 11px;margin-bottom:10px;line-height:1.6}
-.warn-bar.show{display:block}
-.sec{display:flex;align-items:center;gap:8px;margin:16px 0 9px}
-.sec-num{font-size:9px;font-weight:700;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;font-family:'Syne',sans-serif;white-space:nowrap}
-.sec-line{flex:1;height:1px;background:var(--bd)}
-.sec-lbl{font-size:9px;font-weight:600;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
-.kg{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:7px}
-.kc{background:var(--sf);border:1px solid var(--bd);border-radius:9px;padding:13px 14px;position:relative;overflow:hidden;transition:border-color .12s,transform .1s}
-.kc:hover{border-color:var(--bd2);transform:translateY(-1px)}
-.kc-bar{position:absolute;top:0;left:0;right:0;height:3px}
-.kc-lbl{font-size:10px;color:var(--tx2);font-weight:600;letter-spacing:.04em;text-transform:uppercase;margin-bottom:8px}
-.kc-val{font-family:'Syne',sans-serif;font-size:26px;font-weight:700;color:var(--tx);letter-spacing:-.04em;line-height:1;margin-bottom:9px}
-.kc-badges{display:flex;gap:4px;flex-wrap:wrap}
-.kc-note{font-size:9px;color:var(--tx3);margin-top:4px;font-style:italic}
-.bdg{display:inline-flex;align-items:center;gap:2px;font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px}
-.bdg-lbl{font-size:9px;opacity:.55;margin-right:1px;font-weight:400}
-.bdg-up{background:var(--gr-bg);color:var(--gr);border:1px solid var(--gr-bd)}
-.bdg-dn{background:var(--rd-bg);color:var(--rd);border:1px solid var(--rd-bd)}
-.bdg-neu{background:var(--sf2);color:var(--tx3);border:1px solid var(--bd)}
-.bdg-am{background:var(--am-bg);color:var(--am);border:1px solid var(--am-bd)}
-.kc-fcs{background:linear-gradient(135deg,var(--navy) 0%,var(--navy2) 100%);border:1px solid var(--bd2);border-radius:9px;padding:13px 14px;position:relative;overflow:hidden;transition:transform .1s}
-.kc-fcs:hover{transform:translateY(-1px)}
-.kc-fcs .kc-lbl{color:#A8C8E8}
-.kc-fcs .kc-val{color:#FFFFFF;font-family:'Syne',sans-serif;font-size:26px;font-weight:700;letter-spacing:-.04em;line-height:1;margin-bottom:9px}
-.kc-fcs .kc-note{color:#7AA8C8}
-.kc-sub{background:var(--sf);border:1px solid rgba(160,144,255,.3);border-radius:9px;padding:13px 14px;position:relative;overflow:hidden;transition:border-color .12s,transform .1s}
-.kc-sub:hover{border-color:rgba(160,144,255,.6);transform:translateY(-1px)}
-.kc-sub .kc-bar{background:var(--pu)}
-.kc-sub .kc-lbl{color:var(--pu)}
-.kc-sub .kc-val{font-family:'Syne',sans-serif;font-size:32px;font-weight:700;letter-spacing:-.04em;line-height:1;margin-bottom:9px}
-.smartrr-product-wrap{display:block;width:100%}
-.smartrr-total-card{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:10px;align-items:stretch;margin-bottom:10px}
-.smartrr-total-card .kc-sub{min-height:140px;background:linear-gradient(135deg,rgba(160,144,255,.14),var(--sf));border-color:rgba(160,144,255,.48)}
-.smartrr-total-card .kc-val{font-size:46px;color:var(--pu)}
-.smartrr-total-card .kc-lbl{color:var(--pu)}
-.smartrr-total-note{background:var(--sf2);border:1px solid var(--bd);border-radius:9px;padding:12px 14px;color:var(--tx2);font-size:10px;line-height:1.55;display:flex;flex-direction:column;justify-content:center}
-.smartrr-total-note strong{color:var(--tx)}
-.smartrr-product-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:7px;width:100%}
-.smartrr-subtitle{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--tx3);margin:12px 0 7px;display:flex;align-items:center;gap:8px}.smartrr-subtitle:after{content:"";height:1px;background:var(--bd);flex:1}.sub-total-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:7px;width:100%}.sub-total-box-row{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.sub-total-box{background:var(--sf2);border:1px solid var(--bd2);border-radius:6px;padding:7px}.sub-total-lbl{font-size:8px;color:var(--tx3);font-weight:700;letter-spacing:.08em;text-transform:uppercase;line-height:1.15}.sub-total-val{font-family:'Syne',sans-serif;font-size:18px;font-weight:700;line-height:1.1;margin-top:3px}.sub-total-val.active,.sub-total-val.total{color:var(--gr)}.sub-total-val.paused{color:var(--gd)}.delivery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:7px;width:100%;margin-top:7px}.delivery-card .kc-val{font-size:28px}.delivery-note{font-size:9px;color:var(--tx3);margin-top:5px;line-height:1.35}
-.kc-sub.sm-sub-small{padding:10px 11px;min-height:122px}
-.kc-sub.sm-sub-small .kc-lbl{font-size:9px;line-height:1.2;margin-bottom:5px}
-.kc-sub.sm-sub-small .sub-mini-label{font-size:8px;color:var(--tx3);font-weight:700;letter-spacing:.09em;text-transform:uppercase;margin-bottom:5px}
-.kc-sub.sm-sub-small .kc-val{font-size:24px;margin-bottom:6px}
-.kc-sub.sm-sub-small .kc-note{font-size:8px;line-height:1.35}
-@media (max-width:760px){.smartrr-total-card{grid-template-columns:1fr}.smartrr-total-card .kc-val{font-size:38px}}
-
-.panel{background:var(--sf);border:1px solid var(--bd);border-radius:9px;overflow:hidden;margin-top:7px}
-.panel-hd{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;cursor:pointer;user-select:none;transition:background .1s}
-.panel-hd:hover{background:var(--sf2)}
-.panel.open .panel-hd{background:var(--sf2);border-bottom:1px solid var(--bd)}
-.panel-title{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:600;color:var(--tx2);letter-spacing:.07em;text-transform:uppercase}
-.panel-dot{width:5px;height:5px;border-radius:50%}
-.panel-chev{font-size:10px;color:var(--tx3);transition:transform .18s}
-.panel.open .panel-chev{transform:rotate(180deg)}
-.panel-body{display:none;padding:12px 14px}
-.panel.open .panel-body{display:block}
-.rs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:7px}
-.rs-card{background:var(--sf2);border:1px solid var(--bd);border-radius:7px;padding:11px 12px}
-.rs-name{font-size:10px;color:var(--tx3);font-weight:500;text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px}
-.rs-pct{font-family:'Syne',sans-serif;font-size:20px;font-weight:700}
-.rs-amt{font-size:11px;color:var(--tx2);margin-top:2px}
-.rs-gp{font-size:10px;color:var(--tx3);margin-top:5px;padding-top:5px;border-top:1px solid var(--bd)}
-.rs-gp span{font-weight:600}
-.rs-bar-wrap{height:2px;background:var(--bd2);border-radius:1px;margin-top:8px;overflow:hidden}
-.rs-bar-fill{height:100%;border-radius:1px}
-.nvr-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.nvr-col{background:var(--sf2);border:1px solid var(--bd);border-radius:7px;padding:12px 13px}
-.nvr-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;display:flex;align-items:center;gap:6px}
-.nvr-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
-.nvr-lbl{font-size:10px;color:var(--tx3)}
-.nvr-val{font-size:12px;font-weight:600;color:var(--tx);font-family:'Syne',sans-serif}
-.nvr-gp{color:var(--gr) !important}
-.nvr-note{font-size:9px;color:var(--am);margin-top:6px;font-style:italic}
-.cac-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:7px}
-.cac-note-box{font-size:9px;color:var(--am);background:var(--am-bg);border:1px solid var(--am-bd);border-radius:5px;padding:5px 9px;margin-bottom:10px;line-height:1.6}
-.mi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(195px,1fr));gap:10px;margin-bottom:12px}
-.mi-field{display:flex;flex-direction:column;gap:4px}
-.mi-lbl{font-size:9px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
-.mi-note{font-size:9px;color:var(--am);font-style:italic;display:block;margin-top:1px}
-.mi-wrap{position:relative}
-.mi-pre{position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--tx3);pointer-events:none}
-.mi-inp{width:100%;background:var(--sf2);border:1px solid var(--bd2);border-radius:6px;padding:7px 9px 7px 22px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;color:var(--tx);outline:none;transition:border-color .12s}
-.mi-inp.no-pre{padding-left:9px}
-.mi-inp:focus{border-color:var(--gr)}
-.mi-sub-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:4px}
-.mi-sub-lbl{font-size:9px;color:var(--tx3);margin-bottom:2px}
-.mi-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)}
-.btn-save{padding:6px 14px;border-radius:6px;border:none;background:var(--gr);color:#0A0A09;font-family:'DM Sans',sans-serif;font-size:11px;font-weight:700;cursor:pointer;transition:opacity .12s}
-.btn-save:hover{opacity:.85}
-.btn-clear{padding:6px 14px;border-radius:6px;border:1px solid var(--bd2);background:transparent;color:var(--tx3);font-family:'DM Sans',sans-serif;font-size:11px;cursor:pointer}
-.saved-tag{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--gr);background:var(--gr-bg);border:1px solid var(--gr-bd);border-radius:20px;padding:2px 7px}
-.mi-derived{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:7px;margin-top:4px}
-.smartrr-badge{display:inline-flex;align-items:center;gap:5px;font-size:9px;padding:2px 8px;border-radius:20px;margin-bottom:8px}
-.smartrr-ok{background:var(--gr-bg);color:var(--gr);border:1px solid var(--gr-bd)}
-.smartrr-warn{background:var(--am-bg);color:var(--am);border:1px solid var(--am-bd)}
-.cavali-only{display:none}
-.is-cavali .cavali-only{display:block}
-.corro-only{display:block}
-.is-cavali .corro-only{display:none}
-.foot{margin-top:20px;padding-top:12px;border-top:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:7px}
-.foot-txt{font-size:10px;color:var(--tx3)}
-.foot-tags{display:flex;gap:5px;flex-wrap:wrap}
-.foot-tag{background:var(--sf2);border:1px solid var(--bd);border-radius:20px;padding:2px 8px;font-size:10px;color:var(--tx3)}
-.ov{display:none;position:fixed;inset:0;background:rgba(10,25,45,.72);z-index:200;align-items:center;justify-content:center;flex-direction:column;gap:10px;backdrop-filter:blur(3px)}
-.ov.show{display:flex}
-.spinner{width:24px;height:24px;border:2px solid var(--bd2);border-top-color:var(--gr);border-radius:50%;animation:spin .65s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.ov-lbl{font-size:11px;color:var(--tx);background:var(--sf);padding:7px 14px;border-radius:20px;border:1px solid var(--bd2)}
-.sk .kc-lbl,.sk .kc-val{background:var(--sf2);border-radius:3px;color:transparent;animation:shimmer 1.4s ease-in-out infinite}
-@keyframes shimmer{0%,100%{opacity:.3}50%{opacity:.8}}
-
-
-/* ──────────────────────────────────────────────────────────────
-   LOGIN GATE — User Access Registry (Google Sheets)
-   Light mode default
-   ────────────────────────────────────────────────────────────── */
-
-
-
-.access-section{margin-top:14px}
-.access-section:first-child{margin-top:0}
-.access-section-title{font-size:10px;color:#A8C0D8;letter-spacing:.11em;text-transform:uppercase;font-weight:800;margin:0 0 8px 2px}
-
-
-.portal-back-pill{position:fixed;right:16px;bottom:14px;z-index:90;display:flex;gap:10px;align-items:center;border:1px solid rgba(170,190,215,.65);background:rgba(255,255,255,.92);backdrop-filter:blur(10px);box-shadow:0 8px 26px rgba(23,42,72,.10);border-radius:999px;padding:8px 12px;font-size:12px;color:#607894}
-.portal-back-pill a{color:#6d63ff;text-decoration:none;font-weight:800}
-.portal-back-pill a:hover{text-decoration:underline}
-
-.auth-hidden{display:none!important}
-
-.sb-logo-img{width:138px;height:48px;background:transparent center left/contain no-repeat;margin:2px 0 6px 0}
-@media(max-width:860px){.sb-logo-img{width:120px;height:42px}}
-
-/* ══════════════════════════════════════════════════════
-   WEBSITE KPI COMPARE — Shopify + Emma (Corro only)
-══════════════════════════════════════════════════════ */
-.web-compare{display:grid;grid-template-columns:1fr;gap:14px;align-items:start}
-.web-box{min-width:0}
-.web-box.shopify{padding-right:2px}
-.web-box.emma{display:none!important}
-.web-box-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin:0 0 10px}
-.web-box-title{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx2);font-weight:800}
-.web-box-sub{font-size:10px;color:var(--tx3);margin-top:3px;line-height:1.45}
-.emma-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:rgba(147,112,219,.10);border:1px solid rgba(147,112,219,.24);color:#7a58d1;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
-.web-box .kg{margin:0}
-.kcmp-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin:4px 0 10px}
-.kcmp-item{background:var(--sf2);border:1px solid var(--bd2);border-radius:10px;padding:9px 10px;min-width:0;overflow:hidden}
-.kcmp-item.emma{background:linear-gradient(180deg, rgba(114,174,255,.07), rgba(147,112,219,.04));border-color:rgba(114,174,255,.28)}
-.kcmp-tag{font-size:8px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);margin-bottom:5px;white-space:nowrap}
-.kcmp-item.emma .kcmp-tag{color:var(--pu)}
-.kcmp-val{font-family:'Syne',sans-serif;font-size:21px;font-weight:700;letter-spacing:-.04em;line-height:1.02;color:var(--tx);white-space:nowrap}
-.kcmp-sub{font-size:8px;color:var(--tx3);margin-top:6px;line-height:1.25}
-.kcmp-card{grid-column:span 2;min-width:300px}
-.web-info{font-size:11px;color:var(--tx3);line-height:1.5;padding:8px 2px 2px}
-@media (max-width: 640px){.kcmp-grid{grid-template-columns:1fr}}
-@media (max-width: 1180px){.web-compare{grid-template-columns:1fr}}
-
-</style>
-</head>
-<body>
-<div class="portal-back-pill"><a href="./index.html">Reports menu</a></div>
-<div class="ov" id="ov"><div class="spinner"></div><div class="ov-lbl" id="ov-lbl">Loading...</div></div>
-<div class="app" id="app-root">
-
-<!-- SIDEBAR -->
-<div class="sb">
-  <div class="sb-top">
-    <div class="sb-dots">
-      <div class="sb-dot" style="background:#2EE896"></div>
-      <div class="sb-dot" style="background:#A090FF"></div>
-    </div>
-    <div class="sb-logo-img" aria-label="Corro logo" style="background-image:url(./corro_logo.png)"></div>
-    <div class="sb-name">Equestrian Labs, Inc.</div>
-    <div class="sb-sub">Analytics Suite</div>
-  </div>
-  <div class="sb-nav">
-    <div class="sb-sec">Performance</div>
-    <a class="sb-item on" href="#">
-      <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="1" y="1" width="4" height="4" rx="1" fill="currentColor"/><rect x="7" y="1" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/><rect x="1" y="7" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/><rect x="7" y="7" width="4" height="4" rx="1" fill="currentColor" opacity=".4"/></svg>
-      Dashboard
-    </a>
-    <div class="sb-sec" style="margin-top:4px">Brands</div>
-    <a class="sb-item" href="#" onclick="setBrand('corro');return false">
-      <div style="width:5px;height:5px;border-radius:50%;background:#2EE896"></div>Corro
-    </a>
-    <a class="sb-item" href="#" onclick="setBrand('cavali');return false">
-      <div style="width:5px;height:5px;border-radius:50%;background:#A090FF"></div>Cavali
-    </a>
-    <div class="sb-sec sb-suite-sec" style="margin-top:6px">Analytics Suite</div>
-    <a class="sb-suite" data-report-key="pareto" href="https://equestrian-labs-dashboard.github.io/corro-pareto/" target="_blank" rel="noopener">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><rect x=".5" y="6" width="2" height="4.5" rx=".5" fill="#D8B054"/><rect x="3.5" y="3.5" width="2" height="7" rx=".5" fill="#D8B054" opacity=".7"/><rect x="6.5" y="1" width="2" height="9.5" rx=".5" fill="#D8B054" opacity=".4"/></svg>
-      <span>Pareto Analysis</span>
-      <span class="sb-badge" style="background:rgba(216,176,84,.12);color:#D8B054;border:1px solid rgba(216,176,84,.25)">GP</span>
-    </a>
-    <a class="sb-suite" data-report-key="frequency" href="https://equestrian-labs-dashboard.github.io/corro-frequency/" target="_blank" rel="noopener">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="2" cy="5.5" r="1.5" fill="#72AEFF"/><circle cx="5.5" cy="3" r="1.5" fill="#72AEFF" opacity=".7"/><circle cx="9" cy="6.5" r="1.5" fill="#72AEFF" opacity=".4"/><path d="M2 5.5L5.5 3L9 6.5" stroke="#72AEFF" stroke-width="1" stroke-opacity=".4"/></svg>
-      <span>Frequency</span>
-      <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#72AEFF;border:1px solid rgba(114,174,255,.25)">RET</span>
-    </a>
-    <a class="sb-suite" data-report-key="concierge" href="https://script.google.com/macros/s/AKfycbwfBAqGCdefMojVSuEG0yZE0CkINrFnQGKbc2JhtBpZHmU-bnQmdQiUMw7dcPpWkLRyCg/exec" target="_blank" rel="noopener">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M5.5 1C4.7 1 2 2.5 2 4.5 2 7 3.5 9 5.5 10 7.5 9 9 7 9 4.5 9 2.5 6.3 1 5.5 1Z" fill="#A090FF" opacity=".35"/><path d="M3.5 5L5 6.5 7.5 4" stroke="#A090FF" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span>Concierge Comm.</span>
-      <span class="sb-badge" style="background:rgba(160,144,255,.12);color:#A090FF;border:1px solid rgba(160,144,255,.25)">$</span>
-    </a>
-    <a class="sb-suite" data-report-key="upsell" href="https://equestrian-labs-dashboard.github.io/Report-Upsell---Smile-Report/" target="_blank" rel="noopener">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="5.5" cy="5.5" r="4.5" fill="#72dfb5" opacity=".28"/><path d="M3.5 6.1c.5.9 1.2 1.3 2 1.3s1.6-.4 2-1.3" stroke="#28b98b" stroke-width="1.1" stroke-linecap="round"/><circle cx="4.1" cy="4.5" r=".45" fill="#28b98b"/><circle cx="6.9" cy="4.5" r=".45" fill="#28b98b"/></svg>
-      <span>Upsell Smile</span>
-      <span class="sb-badge" style="background:rgba(114,223,181,.12);color:#28b98b;border:1px solid rgba(114,223,181,.25)">UP</span>
-    </a>
-    <div class="sb-sec sb-ops-sec" style="margin-top:10px">Operations</div>
-    <a class="sb-suite" data-report-key="sku_savvy" href="https://equestrian-labs-dashboard.github.io/corro-skusavvy/" target="_blank" rel="noopener">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><rect x="1.2" y="1.4" width="8.6" height="8.2" rx="1.4" fill="#72AEFF" opacity=".25"/><path d="M3 3.4h5M3 5.5h5M3 7.6h3" stroke="#4C8FE0" stroke-width="1" stroke-linecap="round"/></svg>
-      <span>SKU Savvy</span>
-      <span class="sb-badge" style="background:rgba(114,174,255,.12);color:#4C8FE0;border:1px solid rgba(114,174,255,.25)">OPS</span>
-    </a>
-
-  </div>
-  <div class="sb-foot">
-    <div class="sync-r"><div class="sync-d"></div>Auto-sync daily 8AM</div>
-    <div style="font-size:10px;color:var(--tx3);margin-top:2px" id="sb-upd">Shopify → Sheets</div>
-  </div>
-</div>
-
-<!-- MAIN -->
-<div class="main">
-  <div class="ph">
-    <div>
-      <h1 id="ph-title">Corro — Performance</h1>
-      <p id="ph-sub">Shopify API · pipeline v4 · real gross profit · live data</p>
-    </div>
-    <div class="ph-r">
-      <div class="live-dot"><div style="width:5px;height:5px;border-radius:50%;background:var(--gr)"></div>Live</div>
-      <button class="rf-btn" onclick="forceRefresh()">
-        <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M10 6a4 4 0 1 1-.8-2.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10 2v2.5H7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Refresh
-      </button>
-      <button class="icon-btn" id="theme-btn" onclick="toggleTheme()">☾</button>
-    </div>
-  </div>
-
-  <div class="ctrl">
-    <div class="btn-grp" id="brand-grp">
-      <button class="brand-btn on" onclick="setBrand('corro')"><div style="width:5px;height:5px;border-radius:50%;background:#2EE896"></div>Corro</button>
-      <button class="brand-btn" onclick="setBrand('cavali')"><div style="width:5px;height:5px;border-radius:50%;background:#A090FF"></div>Cavali</button>
-    </div>
-    <div class="btn-grp" id="period-grp">
-      <button class="period-btn" onclick="setPT('week',this)">Week</button>
-      <button class="period-btn on" onclick="setPT('month',this)">Month / MTD</button>
-      <button class="period-btn" onclick="setPT('quarter',this)">Quarter</button>
-    </div>
-  </div>
-
-  <div class="selbar" id="selbar"></div>
-  <div class="ibar" id="ibar"></div>
-  <div class="warn-bar" id="roas-warn">⚠ <strong>Ad Spend / ROAS / CAC</strong> — Exact Google + Meta spend can be entered below. If no spend is available, the dashboard uses a reference estimate so Ad Spend and ROAS do not stay blank.</div>
-
-  <div class="sec"><div class="sec-num">01</div><div class="sec-line"></div><div class="sec-lbl">Website KPIs</div><div class="sec-line"></div></div>
-  <div class="web-compare" id="web-compare-wrap">
-    <div class="web-box shopify">
-      <div class="web-box-head">
-        <div>
-          <div class="web-box-title">Shopify</div>
-          <div class="web-box-sub">Shopify KPIs remain fixed. Sessions and Conv. Rate show Shopify vs Emma side by side when Emma data is available.</div>
-        </div>
-      </div>
-      <div class="kg" id="s-web"></div>
-    </div>
-    <div class="web-box emma" id="emma-box">
-      <div class="web-box-head">
-        <div>
-          <div class="web-box-title">Emma / CRM Web Snapshot</div>
-          <div class="web-box-sub">Corro only · 2026 monthly snapshots from the provided capture. Quarter values are automatically calculated from the available 2026 months.</div>
-        </div>
-        <div class="emma-chip">2026 only</div>
-      </div>
-      <div class="kg" id="s-emma"></div>
-    </div>
-  </div>
-
-  <div class="sec"><div class="sec-num">02</div><div class="sec-line"></div><div class="sec-lbl">Financial KPIs — Net Sales confirmed</div><div class="sec-line"></div></div>
-  <div class="kg" id="s-fin"></div>
-
-  <div class="corro-only" style="margin-top:7px"><div class="kg" id="s-fcs"></div></div>
-
-  <div class="panel open" id="rs-panel" style="margin-top:7px">
-    <div class="panel-hd" onclick="togglePanel('rs-panel')">
-      <div class="panel-title"><div class="panel-dot" style="background:var(--gr)"></div>Revenue Share by Channel · Net Sales + Gross Profit</div>
-      <span class="panel-chev">▾</span>
-    </div>
-    <div class="panel-body"><div class="rs-grid" id="rs-grid"><div style="font-size:11px;color:var(--tx3)">Loading...</div></div></div>
-  </div>
-
-  <div class="panel open" id="nvr-panel" style="margin-top:7px">
-    <div class="panel-hd" onclick="togglePanel('nvr-panel')">
-      <div class="panel-title"><div class="panel-dot" style="background:var(--bl)"></div>New vs Returning — Revenue + Gross Profit (real data)</div>
-      <span class="panel-chev">▾</span>
-    </div>
-    <div class="panel-body"><div class="nvr-grid" id="nvr-grid"><div style="font-size:11px;color:var(--tx3)">Loading...</div></div></div>
-  </div>
-
-  <div class="sec"><div class="sec-num">03</div><div class="sec-line"></div><div class="sec-lbl">Operational KPIs</div><div class="sec-line"></div></div>
-  <div class="kg" id="s-op"></div>
-
-  <div class="sec"><div class="sec-num">04</div><div class="sec-line"></div><div class="sec-lbl" id="mkt-lbl">Marketing KPIs</div><div class="sec-line"></div></div>
-  <div class="kg" id="s-mkt"></div>
-
-  <div class="sec"><div class="sec-num">05</div><div class="sec-line"></div><div class="sec-lbl">CAC to LTV — Ratio & Health</div><div class="sec-line"></div></div>
-  <div class="cac-note-box" id="cac-note-box">⏳ <strong>CAC note:</strong> When G+M spend is entered below, CAC is calculated automatically (G+M ÷ new customers from pipeline v4). Until full LTV data is ready, LTV uses the Shopify reference: <strong>$178</strong>. If no CAC can be calculated, CAC is shown only as a reference fallback: <strong>$47</strong>.</div>
-  <div class="cac-grid" id="s-cac"></div>
-
-  <!-- 06 · Cavali Product Volume by Product-Variant (Smartrr) -->
-  <div class="cavali-only" id="subs-sec">
-    <div class="sec"><div class="sec-num">06</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--pu)">Cavali — Product Volume by Product-Variant · Smartrr</div><div class="sec-line"></div></div>
-    <div id="smartrr-status"></div>
-    <div class="kg" id="s-subs"></div>
-  </div>
-
-  <div class="sec">
-    <div class="sec-num" id="mi-num">06</div>
-    <div class="sec-line"></div>
-    <div class="sec-lbl">Manual Inputs — Ad Spend · CAC · LTV</div>
-    <div class="sec-line"></div>
-  </div>
-  <div class="panel open" id="mi-panel">
-    <div class="panel-hd" onclick="togglePanel('mi-panel')">
-      <div class="panel-title"><div class="panel-dot" style="background:var(--gd)"></div>Ad Spend · ROAS · CAC · LTV — manual data entry</div>
-      <span class="panel-chev">▾</span>
-    </div>
-    <div class="panel-body">
-      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). LTV override optional — default $178.</div>
-      <div class="mi-grid">
-        <div class="mi-field">
-          <div class="mi-lbl">Google + Meta Ad Spend ($)<span class="mi-note">G+M only — for exact ROAS & CAC</span></div>
-          <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-spend" type="number" min="0" step="0.01" placeholder="0.00" oninput="calcDerived()"></div>
-        </div>
-        <div class="mi-field">
-          <div class="mi-lbl">New Customers (period)<span class="mi-note">Auto from pipeline v4 if available</span></div>
-          <div class="mi-wrap"><input class="mi-inp no-pre" id="mi-newcust" type="number" min="0" step="1" placeholder="0" oninput="calcDerived()"></div>
-        </div>
-        <div class="mi-field">
-          <div class="mi-lbl">LTV-12M ($ per customer)<span class="mi-note">Default: $178 (Shopify ref)</span></div>
-          <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-ltv" type="number" min="0" step="0.01" placeholder="178.00" oninput="calcDerived()"></div>
-        </div>
-        <div class="mi-field">
-          <div class="mi-lbl">CAC Override ($)<span class="mi-note">Auto-calculated if G+M spend entered</span></div>
-          <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-cac-ov" type="number" min="0" step="0.01" placeholder="auto" oninput="calcDerived()"></div>
-        </div>
-        <div class="mi-field">
-          <div class="mi-lbl">Net Sales Override ($)<span class="mi-note">Auto from Sheets if empty</span></div>
-          <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-ns" type="number" min="0" step="0.01" placeholder="auto" oninput="calcDerived()"></div>
-        </div>
-      </div>
-      <div style="font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:7px">Calculated (Google+Meta)</div>
-      <div class="mi-derived" id="mi-derived"></div>
-      <div class="mi-actions">
-        <button class="btn-save" onclick="saveManual()">Save for this period</button>
-        <button class="btn-clear" onclick="clearManual()">Clear</button>
-        <span id="mi-msg"></span>
-      </div>
-    </div>
-  </div>
-
-  <div class="foot">
-    <div class="foot-txt" id="foot-txt">Last updated: —</div>
-    <div class="foot-tags">
-      <div class="foot-tag">Shopify API</div>
-      <div class="foot-tag">Pipeline v4</div>
-      <div class="foot-tag">Google Sheets</div>
-      <div class="foot-tag">Auto-daily 8AM</div>
-      <div class="foot-tag" id="ft-manual" style="display:none;color:var(--gd)">G+M Manual active</div>
-      <div class="foot-tag" id="ft-roas" style="color:var(--am)">ROAS: Shopify ⚠</div>
-      <div class="foot-tag cavali-only" id="ft-smartrr" style="color:var(--pu)">Smartrr</div>
-    </div>
-  </div>
-
-</div><!-- /main -->
-</div><!-- /app -->
-
-<script>
-/* ══════════════════════════════════════════════════════
-   CONFIG
-   ─────────────────────────────────────────────────────
-   Shopify data is read from Google Sheets.
-   Smartrr keys must NOT live in this static HTML. Smartrr is fetched
-   by the GitHub Actions pipeline and written to the `smartrr_product_volume` tab.
-══════════════════════════════════════════════════════ */
-const SIDS = {
-  corro:  "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU",
-  cavali: "1QUdJc2EIdElIX5nlLQxWxS98aAz-TgQnSg9glJpNtig",
-};
-const AKEY = "AIzaSyD8oIf_TyxchEkU_MpKJXngrjrMVyV81oY";
-const MARKETING_SHEET_ID = "1ROTaII-_S_0VntYvOZj8GFCoUnkQVcr1rPES0p-14mI";
-const MARKETING_SHEET_TAB = "Total Shopify";
-
-const CAVALI_RENAME = {
-  "Others":           "Subscriptions",
-  "Online":           "Single Products",
-  "Wellington (POS)": null,
-  "HITS":             null,
-  "Concierge":        "Concierge",
-};
-const CORRO_RENAME = {
-  "Online": "Ecommerce",
-};
-const CH_COLORS = {
-  "Wellington (POS)": "#D8B054",
-  "HITS":             "#28b98b",
-  "Concierge":        "#A090FF",
-  "Online":           "#72AEFF",
-  "Ecommerce":        "#72AEFF",
-  "Single Products":  "#72AEFF",
-  "Others":           "#707070",
-  "Subscriptions":    "#2EE896",
-};
-
-let brand = "cavali", ptype = "month";
-let cache = {}, manualData = {};
-let __renderToken = 0;
-
-/* ══════════════════════════════════════════════════════
-   SMARTRR — Product Volume by Product-Variant
-   Source tab: smartrr_product_volume
-   Period logic: exact dashboard period + Order Line Item Created Date.
-══════════════════════════════════════════════════════ */
-let _smartrrRowsCache = null, _smartrrRowsTs = 0;
-let _smartrrDeliveryCache = null, _smartrrDeliveryTs = 0;
-let _smartrrSubscribersCache = null, _smartrrSubscribersTs = 0;
-
-function _num(v) {
-  const n = parseFloat(String(v ?? "").replace(/,/g, "").replace("USD", "").trim());
-  return isNaN(n) ? 0 : n;
-}
-function _periodKeyForSubs(opt) {
-  if (ptype === "week") return `week_${opt.start}`;
-  if (ptype === "mtd") return `mtd_${(opt.start||"").slice(0,7)}`;
-  if (ptype === "month") return (opt.start||"").slice(0,7);
-  if (ptype === "quarter") return opt.pk || opt.val;
-  return "";
-}
-
-function _periodKeysForSubs(opt) {
-  const keys = new Set();
-  const ym = String(opt?.start || "").slice(0, 7);
-  const primary = _periodKeyForSubs(opt || {});
-  if (primary) keys.add(primary);
-
-  // Current month in the dashboard is a partial month, but the pipeline stores it as mtd_YYYY-MM.
-  if (ptype === "month" && ym) {
-    keys.add(ym);
-    keys.add(`mtd_${ym}`);
-  }
-
-  // MTD can also be found as a month key in old sheets/backfills.
-  if (ptype === "mtd" && ym) {
-    keys.add(`mtd_${ym}`);
-    keys.add(ym);
-  }
-
-  return Array.from(keys).filter(Boolean);
-}
-
-async function fetchSmartrrProductRows() {
-  if (brand !== "cavali") return [];
-  if (_smartrrRowsCache && Date.now() - _smartrrRowsTs < 10 * 60 * 1000) return _smartrrRowsCache;
-  const sid = SIDS[brand];
-  const rows = await fetchTab(sid, "smartrr_product_volume");
-  _smartrrRowsCache = Array.isArray(rows) ? rows : [];
-  _smartrrRowsTs = Date.now();
-  return _smartrrRowsCache;
-}
-
-async function fetchSmartrrDeliveryRows() {
-  // Keep delivery optional; many sheets don't have smartrr_delivery_due yet and
-  // querying it causes noisy 400 errors in browser console.
-  return [];
-}
-
-async function fetchSmartrrSubscribersRows() {
-  if (brand !== "cavali") return [];
-  if (_smartrrSubscribersCache && Date.now() - _smartrrSubscribersTs < 10 * 60 * 1000) return _smartrrSubscribersCache;
-  const sid = SIDS[brand];
-  const rows = await fetchTab(sid, "smartrr_subscribers", { silent: true });
-  _smartrrSubscribersCache = Array.isArray(rows) ? rows : [];
-  _smartrrSubscribersTs = Date.now();
-  return _smartrrSubscribersCache;
-}
-
-function filterRowsForCurrentPeriod(rows, opt) {
-  const keys = _periodKeysForSubs(opt);
-  const st = String(opt.start || "").trim();
-  const en = String(opt.end || "").trim();
-  const normDate = (v) => {
-    const s = String(v || "").trim();
-    if (!s) return "";
-    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] : s;
-  };
-  const stN = normDate(st);
-  const enN = normDate(en);
-  return (rows || []).filter(r => {
-    const rb = String(r.brand || brand || "").toLowerCase();
-    const targetBrand = String(brand || "").toLowerCase();
-    if (targetBrand && rb && rb !== targetBrand) return false;
-    if (!keys.includes(String(r.period || "").trim())) return false;
-    const rs = normDate(r.period_start);
-    const re = normDate(r.period_end);
-    // Accept rows written with datetime suffixes and allow period_end <= selected end.
-    if (rs && stN && rs !== stN) return false;
-    if (re && enN && re > enN) return false;
-    return true;
-  });
-}
-
-function smartrrProductBucket(name) {
-  const t = String(name || "").toLowerCase();
-  if (t.includes("premier")) return "The Premier Box";
-  if (t.includes("signature")) return "The Signature Box";
-  return "Other";
-}
-
-function filterSmartrrRowsForCurrentPeriod(rows, opt) {
-  return filterRowsForCurrentPeriod(rows, opt);
-}
-/* ══════════════════════════════════════════════════════
-   DATE HELPERS
-══════════════════════════════════════════════════════ */
-
-const NOW = new Date(), CY = NOW.getFullYear(), CM = NOW.getMonth();
-const MN  = ["January","February","March","April","May","June",
-              "July","August","September","October","November","December"];
-const DEFAULT_LTV_12M = 178;
-const DEFAULT_CAC_REF = 47;
-
-function iso(d) {
-  if (!(d instanceof Date)) return String(d);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-function lastDay(y, m) { return new Date(y, m+1, 0); }
-function fmtD(s) {
-  try { return new Date(s+'T12:00').toLocaleDateString('en',{month:'short',day:'numeric',year:'numeric'}); }
-  catch(e) { return s||"—"; }
-}
-function dateFromISO(s) { return new Date((s||"") + 'T12:00'); }
-function mtdRange(y, month1, dayLimit) {
-  const m0 = month1 - 1;
-  const endDay = Math.min(dayLimit || 1, lastDay(y, m0).getDate());
-  return {
-    start: `${y}-${String(month1).padStart(2,'0')}-01`,
-    end: iso(new Date(y, m0, endDay)),
-  };
-}
-function exactRow(rows, pk, start, end) {
-  if (!rows?.length) return null;
-  const normDate = (v) => {
-    const s = String(v || "").trim();
-    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] : s;
-  };
-  const st = normDate(start), en = normDate(end);
-  let m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_start) === st && normDate(r.period_end) === en);
-  if (m.length) return bestRow(m);
-  m = rows.filter(r => (r.period || "").trim() === pk && normDate(r.period_end) === en);
-  if (m.length) return bestRow(m);
-  m = rows.filter(r => normDate(r.period_start) === st && normDate(r.period_end) === en && String(r.period || "").startsWith("mtd_"));
-  return m.length ? bestRow(m) : null;
-}
-function normISODate(v) {
-  const s = String(v || "").trim();
-  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : s;
-}
-function latestPeriodRow(rows, pk, start, end) {
-  if (!rows?.length || !pk) return null;
-  const st = normISODate(start), en = normISODate(end);
-  let m = rows.filter(r => String(r.period || "").trim() === pk);
-  if (st) m = m.filter(r => !normISODate(r.period_start) || normISODate(r.period_start) === st);
-  if (en) m = m.filter(r => !normISODate(r.period_end) || normISODate(r.period_end) <= en);
-  if (!m.length) return null;
-  return bestRow(m);
-}
-function isFullMonthOpt(opt) {
-  if (!opt || opt.y === undefined || opt.m === undefined) return false;
-  return opt.end === iso(lastDay(opt.y, opt.m));
-}
-
-function buildWeeks() {
-  const out = [], tod = new Date(NOW), dow = tod.getDay(), mon = new Date(tod);
-  mon.setDate(tod.getDate() - (dow === 0 ? 6 : dow - 1));
-  for (let i = 0; i < 200; i++) {
-    const m = new Date(mon); m.setDate(mon.getDate() - i*7);
-    if (m.getFullYear() < 2024) break;
-    const s = new Date(m); s.setDate(m.getDate() + 6);
-    const e = s > NOW ? new Date(NOW) : s;
-    out.push({ val: iso(m)+'__'+iso(e), label: `${m.toLocaleDateString('en',{month:'short',day:'numeric'})} – ${e.toLocaleDateString('en',{month:'short',day:'numeric',year:'numeric'})}`, start: iso(m), end: iso(e) });
-  }
-  return out;
-}
-function buildMTDs() {
-  const out = [];
-  const dayLimit = NOW.getDate();
-  for (let y = CY; y >= 2024; y--) {
-    for (let m = (y===CY?CM:11); m >= 0; m--) {
-      const cur = y===CY&&m===CM;
-      const rg = mtdRange(y, m+1, dayLimit);
-      const e = cur ? iso(NOW) : rg.end;
-      out.push({ val: rg.start+'__'+e, label: `${MN[m]} ${y}${cur?' (MTD)':''}`, start: rg.start, end: e, m, y, cur });
-    }
-  }
-  return out;
-}
-function buildMonths() {
-  const out = [];
-  for (let y = CY; y >= 2024; y--) {
-    for (let m = (y===CY?CM:11); m >= 0; m--) {
-      const cur = y===CY&&m===CM;
-      const s = `${y}-${String(m+1).padStart(2,'0')}-01`;
-      // Current month is not complete yet, so it behaves like MTD and compares date-to-date.
-      const e = cur ? iso(NOW) : iso(lastDay(y,m));
-      out.push({ val: s+'__'+e, label: `${MN[m]} ${y}${cur?' (MTD)':''}`, start: s, end: e, m, y, cur });
-    }
-  }
-  return out;
-}
-function buildQuarters() {
-  const out = [];
-  for (let y = CY; y >= 2024; y--) {
-    const maxQ = y===CY ? Math.floor(CM/3)+1 : 4;
-    for (let q = maxQ; q >= 1; q--) {
-      const qs = new Date(y,(q-1)*3,1), qe = new Date(y,q*3,0), cur = y===CY&&q===maxQ;
-      const e = cur ? iso(NOW) : iso(qe), pk = `q${q}_${y}`;
-      out.push({ val: pk, label: `Q${q} ${y}${cur?' (current)':''}`, start: iso(qs), end: e, q, y, pk, cur });
-    }
-  }
-  return out;
-}
-
-const WEEKS = buildWeeks(), MTDS = buildMTDs(), MONTHS = buildMonths(), QUARTERS = buildQuarters();
-let selW = WEEKS[0]?.val||"", selMTD = MTDS[0]?.val||"", selMo = MONTHS[0]?.val||"", selQ = QUARTERS[0]?.val||"", selCmp = "yoy";
-
-function getOpt() {
-  if (ptype==="week")   return WEEKS.find(o=>o.val===selW)||WEEKS[0]||{};
-  if (ptype==="mtd")    return MTDS.find(o=>o.val===selMTD)||MTDS[0]||{};
-  if (ptype==="month")  return MONTHS.find(o=>o.val===selMo)||MONTHS[0]||{};
-  return QUARTERS.find(o=>o.val===selQ)||QUARTERS[0]||{};
-}
-
-/* ══════════════════════════════════════════════════════
-   SELECTOR BAR
-══════════════════════════════════════════════════════ */
-function renderSelbar() {
-  const bar = document.getElementById("selbar"); if (!bar) return;
-  let opts, sv, oc;
-  if (ptype==="week")       { opts=WEEKS;    sv=selW;   oc="onSelW(this.value)"; }
-  else if (ptype==="mtd")   { opts=MTDS;     sv=selMTD; oc="onSelMTD(this.value)"; }
-  else if (ptype==="month") { opts=MONTHS;   sv=selMo;  oc="onSelMo(this.value)"; }
-  else                      { opts=QUARTERS; sv=selQ;   oc="onSelQ(this.value)"; }
-  const lbls = {week:"Select week",mtd:"Select month / MTD",month:"Select month / MTD",quarter:"Select quarter"};
-  bar.innerHTML =
-    `<div class="sel-grp"><span class="sel-lbl">${lbls[ptype]}</span>` +
-    `<select onchange="${oc}">${(opts||[]).map(o=>`<option value="${o.val}"${o.val===sv?' selected':''}>${o.label}</option>`).join('')}</select></div>` +
-    `<div class="sel-div"></div>` +
-    `<div class="sel-grp"><span class="sel-lbl">Compare vs</span>` +
-    `<select onchange="selCmp2(this.value)">` +
-    `<option value="prev"${selCmp==="prev"?' selected':''}>Previous period</option>` +
-    `<option value="yoy"${selCmp==="yoy"?' selected':''}>Same period last year (YOY)</option>` +
-    `<option value="none"${selCmp==="none"?' selected':''}>No comparison</option>` +
-    `</select></div>`;
-}
-function onSelW(v)   { selW   = v; cache={}; renderSelbar(); render(); }
-function onSelMTD(v) { selMTD = v; cache={}; renderSelbar(); render(); }
-function onSelMo(v)  { selMo  = v; cache={}; renderSelbar(); render(); }
-function onSelQ(v)   { selQ   = v; cache={}; renderSelbar(); render(); }
-function selCmp2(v)  { selCmp = v; render(); }
-
-function renderIbar(opt, cmpLbl) {
-  const el = document.getElementById("ibar"); if (!el) return;
-  let h = `<span>${fmtD(opt.start)}</span> – <span>${fmtD(opt.end)}</span>`;
-  if (cmpLbl) h += ` &nbsp;·&nbsp; vs <span>${cmpLbl}</span>`;
-  h += ` &nbsp;·&nbsp; <span>Net Sales confirmed ✓</span>`;
-  el.innerHTML = h;
-}
-
-/* ══════════════════════════════════════════════════════
-   SHEETS FETCH — batchGet + local cache + retry
-   This avoids 429 loops and prevents Cavali from hanging forever.
-══════════════════════════════════════════════════════ */
-const __tabInflight = {};
-const __tabError = {};
-function __tabCacheKey(sid, tab) { return `el_sheet_cache__${sid}__${tab}`; }
-function __rowsToObjects(values) {
-  const rows = values || [];
-  if (rows.length < 2) return [];
-  const h = rows[0];
-  return rows.slice(1).map(row => Object.fromEntries(h.map((hh,i)=>[hh,row[i]||""])));
-}
-function __saveTabLocal(sid, tab, rows) {
-  try { localStorage.setItem(__tabCacheKey(sid, tab), JSON.stringify({ts: Date.now(), rows})); } catch(e) {}
-}
-function __loadTabLocal(sid, tab, maxAgeMs = 60 * 60 * 1000) {
-  try {
-    const raw = localStorage.getItem(__tabCacheKey(sid, tab));
-    if (!raw) return null;
-    const d = JSON.parse(raw);
-    if (!d || !Array.isArray(d.rows)) return null;
-    if (Date.now() - (d.ts || 0) > maxAgeMs) return null;
-    return d.rows;
-  } catch(e) { return null; }
-}
-async function __sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-async function fetchTabsBatch(sid, tabs, opts = {}) {
-  const uniqueTabs = [...new Set((tabs || []).filter(Boolean))];
-  const out = Object.fromEntries(uniqueTabs.map(t => [t, opts.force ? [] : (cache[`${sid}__${t}`] || __loadTabLocal(sid, t) || [])]));
-  const need = opts.force ? uniqueTabs : uniqueTabs.filter(t => !cache[`${sid}__${t}`]);
-  if (!need.length) return out;
-
-  const batchKey = `${sid}__batch__${need.join('|')}`;
-  if (__tabInflight[batchKey]) return __tabInflight[batchKey];
-
-  __tabInflight[batchKey] = (async () => {
-    const ranges = need.map(t => `ranges=${encodeURIComponent(t)}`).join('&');
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?${ranges}&key=${AKEY}`;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 25000);
-      try {
-        const r = await fetch(url, { signal: controller.signal, cache: "no-store" });
-        clearTimeout(timer);
-        if (r.status === 429) {
-          console.warn(`Sheets API 429; retry ${attempt + 1}/3`);
-          await __sleep(1200 * (attempt + 1));
-          continue;
-        }
-        if (!r.ok) {
-          if (!opts.silent) console.warn(`Sheets batch HTTP ${r.status}`);
-          break;
-        }
-        const d = await r.json();
-        const valueRanges = d.valueRanges || [];
-        need.forEach((tab, i) => {
-          const res = __rowsToObjects((valueRanges[i] || {}).values || []);
-          cache[`${sid}__${tab}`] = res;
-          __saveTabLocal(sid, tab, res);
-          out[tab] = res;
-        });
-        return out;
-      } catch(e) {
-        clearTimeout(timer);
-        if (!opts.silent) console.warn('Sheets batch fetch failed', e);
-        await __sleep(800 * (attempt + 1));
-      }
-    }
-    need.forEach(tab => {
-      __tabError[`${sid}__${tab}`] = 'Sheets API limit, missing tab, or network error';
-      out[tab] = cache[`${sid}__${tab}`] || __loadTabLocal(sid, tab, 24 * 60 * 60 * 1000) || [];
-    });
-    return out;
-  })();
-
-  try { return await __tabInflight[batchKey]; }
-  finally { delete __tabInflight[batchKey]; }
-}
-
-async function fetchTab(sid, tab, opts = {}) {
-  const k = `${sid}__${tab}`;
-  if (cache[k]) return cache[k];
-  const local = __loadTabLocal(sid, tab);
-  if (local) { cache[k] = local; return local; }
-  const result = await fetchTabsBatch(sid, [tab], opts);
-  return result[tab] || [];
-}
-
-function __filledCell(v) {
-  return v !== undefined && v !== null && String(v).trim() !== "";
-}
-function bestRow(arr) {
-  if (!arr || !arr.length) return null;
-
-  // Google Sheets can contain duplicate period rows after backfills.
-  // Merge non-empty values so rows with financials do not erase newer
-  // Pageviews / Checkout Abandonment values from repair rows.
-  const sorted = [...arr].sort((a,b) => (Date.parse(a.updated_at)||0) - (Date.parse(b.updated_at)||0));
-  const merged = {};
-  for (const row of sorted) {
-    for (const [k,v] of Object.entries(row || {})) {
-      if (__filledCell(v)) merged[k] = v;
-    }
-  }
-  return Object.keys(merged).length ? merged : (sorted[sorted.length-1] || null);
-}
-
-function findRow(rows, opt) {
-  if (!rows?.length) return null;
-  let m;
-  if (ptype==="quarter" && opt.pk) {
-    // Current quarter can be partial. Prefer exact row; if today's pipeline
-    // has not run yet, use the latest row for the same quarter with period_end <= selected end.
-    const exactQ = exactRow(rows, opt.pk, opt.start, opt.end);
-    if (exactQ) return exactQ;
-    const latestQ = latestPeriodRow(rows, opt.pk, opt.start, opt.end);
-    if (latestQ) return latestQ;
-    m=rows.filter(r=>r.period===opt.pk);
-    if(m.length) return bestRow(m);
-  }
-  if (ptype==="week") {
-    const pk=`week_${opt.start}`;
-    m = rows.filter(r=>r.period===pk);
-    if (m.length) { const ex=m.filter(r=>(r.period_end||"").trim()===opt.end); return bestRow(ex.length?ex:m); }
-    m = rows.filter(r=>r.period_start===opt.start&&r.period_end===opt.end&&(r.period||"").startsWith("week_"));
-    if (m.length) return bestRow(m);
-  }
-  if (ptype==="mtd") {
-    const pk=`mtd_${(opt.start||"").slice(0,7)}`;
-    const exact = exactRow(rows, pk, opt.start, opt.end);
-    if (exact) return exact;
-    const latest = latestPeriodRow(rows, pk, opt.start, opt.end);
-    if (latest) return latest;
-    m=rows.filter(r=>r.period==="mtd"&&r.period_start===opt.start&&r.period_end===opt.end); if(m.length) return bestRow(m);
-    // Do not fall back to full month for MTD; use latest MTD only.
-  }
-  if (ptype==="month") {
-    const pk=(opt.start||"").slice(0,7);
-    if (!isFullMonthOpt(opt)) {
-      const mtdPk = `mtd_${pk}`;
-      const mtd = exactRow(rows, mtdPk, opt.start, opt.end) || latestPeriodRow(rows, mtdPk, opt.start, opt.end);
-      if (mtd) return mtd;
-    }
-    m=rows.filter(r=>r.period===pk); if(m.length) return bestRow(m);
-    m=rows.filter(r=>r.period_start===opt.start&&r.period_end===opt.end); if(m.length) return bestRow(m);
-  }
-  return null;
-}
-
-function __hasMetricValue(row, key) {
-  return row && row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "";
-}
-function __cmpMonthTarget(opt, prev) {
-  const yr = parseInt((opt.start || "").slice(0,4), 10);
-  const mo = parseInt((opt.start || "").slice(5,7), 10);
-  if (isNaN(yr) || isNaN(mo)) return null;
-  const pmo = prev ? (mo === 1 ? 12 : mo - 1) : mo;
-  const py = prev ? (mo === 1 ? yr - 1 : yr) : yr - 1;
-  return `${py}-${String(pmo).padStart(2,'0')}`;
-}
-function cmpMetricValue(rows, opt, cmpRow, key) {
-  if (__hasMetricValue(cmpRow, key)) return cmpRow[key];
-
-  // If the selected comparison row is the correct full month but that older
-  // row does not have newly-added website fields, look for the same metric in
-  // any repair/backfill row for the same comparison month. This does NOT change
-  // financial comparison values when they already exist on the full month row.
-  if (ptype === "month") {
-    const ym = __cmpMonthTarget(opt, selCmp === "prev");
-    if (ym) {
-      const candidates = (rows || []).filter(r => {
-        const p = String(r.period || "").trim();
-        const ps = String(r.period_start || "").slice(0,7);
-        return p === ym || p === `mtd_${ym}` || ps === ym;
-      }).filter(r => __hasMetricValue(r, key));
-      if (candidates.length) return bestRow(candidates)[key];
-    }
-  }
-
-  // Same idea for quarters and weeks: use another same-period repair row only
-  // when the chosen compare row lacks this specific metric.
-  if (ptype === "quarter" && cmpRow && cmpRow.period) {
-    const candidates = (rows || []).filter(r => String(r.period || "").trim() === String(cmpRow.period || "").trim())
-      .filter(r => __hasMetricValue(r, key));
-    if (candidates.length) return bestRow(candidates)[key];
-  }
-  if (ptype === "week" && cmpRow && cmpRow.period) {
-    const candidates = (rows || []).filter(r => String(r.period || "").trim() === String(cmpRow.period || "").trim())
-      .filter(r => __hasMetricValue(r, key));
-    if (candidates.length) return bestRow(candidates)[key];
-  }
-  return null;
-}
-
-function findCmp(rows, opt) {
-  if (!rows?.length || selCmp==="none") return { row:null, lbl:"" };
-  const prev = selCmp==="prev";
-  if (ptype==="quarter" && opt.pk) {
-    const match = opt.pk.match(/q(\d)_(\d{4})/);
-    if (match) {
-      const [,q,y] = match;
-      const qn = parseInt(q), yr = parseInt(y);
-      const pq = prev ? (qn===1?4:qn-1) : qn;
-      const py = prev ? (qn===1?yr-1:yr) : yr-1;
-      const pk = `q${pq}_${py}`;
-      if (py < 2024) return { row:null, lbl:"" };
-
-      // Business rule: compare selected/current quarter against the FULL comparison quarter.
-      // Example: Q3 2026 current-to-date compares vs full Q3 2025 for YOY.
-      return { row: bestRow(rows.filter(r=>r.period===pk)) || null, lbl: prev?`Q${pq} ${py}`:`Q${q} ${py}` };
-    }
-  }
-  if (ptype==="mtd") {
-    const yr=parseInt((opt.start||"").slice(0,4)), mo=parseInt((opt.start||"").slice(5,7));
-    const dayLimit = dateFromISO(opt.end).getDate();
-    if (!isNaN(yr) && !isNaN(mo) && !isNaN(dayLimit)) {
-      const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
-      const pk=`mtd_${py}-${String(pmo).padStart(2,'0')}`;
-      if (py < 2024) return { row:null, lbl:"" };
-      const rg = mtdRange(py, pmo, dayLimit);
-      const row = exactRow(rows, pk, rg.start, rg.end) || latestPeriodRow(rows, pk, rg.start, rg.end);
-      return { row, lbl:`${fmtD(rg.start)} – ${fmtD(rg.end)}${prev?'':' (YOY)'}` };
-    }
-  }
-  if (ptype==="month") {
-    const yr=parseInt((opt.start||"").slice(0,4)), mo=parseInt((opt.start||"").slice(5,7));
-    if (!isNaN(yr) && !isNaN(mo)) {
-      const [pmo,py] = prev ? [mo===1?12:mo-1, mo===1?yr-1:yr] : [mo, yr-1];
-      const pk=`${py}-${String(pmo).padStart(2,'0')}`;
-      const lbl=new Date(py,pmo-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
-      if (py < 2024) return { row:null, lbl:"" };
-      // Business rule: Month / MTD compares against the FULL comparison month.
-      // Example: Jul 1–3 2026 compares vs full July 2025 for YOY.
-      return { row:bestRow(rows.filter(r=>r.period===pk))||null, lbl:prev?lbl:`${lbl} (YOY)` };
-    }
-  }
-  if (ptype==="week") {
-    const days = prev ? 7 : 364;
-    try {
-      const ms=new Date(opt.start+'T12:00'); ms.setDate(ms.getDate()-days);
-      if (ms.getFullYear() < 2024) return { row:null, lbl:"" };
-      // Business rule: compare against the FULL comparison week, even when the current week is partial.
-      const me=new Date(ms); me.setDate(me.getDate()+6);
-      const pk=`week_${iso(ms)}`;
-      let exact = exactRow(rows, pk, iso(ms), iso(me));
-      let m = exact ? [exact] : rows.filter(r=>r.period===pk && normISODate(r.period_end)===iso(me));
-      if (!m.length) m=rows.filter(r=>r.period===pk);
-      if (!m.length) m=rows.filter(r=>normISODate(r.period_start)===iso(ms)&&normISODate(r.period_end)===iso(me));
-      return { row:bestRow(m)||null, lbl:`${fmtD(iso(ms))} – ${fmtD(iso(me))}${prev?'':' (YOY)'}` };
-    } catch(e) {}
-  }
-  return { row:null, lbl:"" };
-}
-
-/* ══════════════════════════════════════════════════════
-   FORMAT HELPERS
-══════════════════════════════════════════════════════ */
-function fv(v, f) {
-  if (v===null||v===undefined||v==="") return "—";
-  const n = parseFloat(v); if (isNaN(n)) return "—";
-  if (f==="$") { if(Math.abs(n)>=1e6) return "$"+(n/1e6).toFixed(2)+"M"; if(Math.abs(n)>=1000) return "$"+(n/1000).toFixed(1)+"K"; return "$"+n.toFixed(0); }
-  if (f==="%") return n.toFixed(1)+"%";
-  if (f==="x") return n.toFixed(2)+"x";
-  if (Math.abs(n)>=1e6) return (n/1e6).toFixed(1)+"M";
-  if (Math.abs(n)>=1000) return (n/1000).toFixed(1)+"K";
-  return n%1===0 ? n.toLocaleString() : n.toFixed(2);
-}
-function pctChg(c, p) {
-  const cv=parseFloat(c), pv=parseFloat(p);
-  if (isNaN(cv)||isNaN(pv)) return null;
-
-  // Avoid "YOY —" when both values are real zeros.
-  // If previous is 0, normal % change is mathematically undefined, but for dashboard readability:
-  // 0 vs 0 = 0.0%, current > 0 vs 0 = +100.0%, current 0 vs previous > 0 = -100.0%.
-  if (pv === 0) {
-    if (cv === 0) return "0.0";
-    return cv > 0 ? "100.0" : "-100.0";
-  }
-  return ((cv-pv)/Math.abs(pv)*100).toFixed(1);
-}
-function badge(pct, lbl, inv) {
-  if (pct===null||pct===undefined) return `<span class="bdg bdg-neu"><span class="bdg-lbl">${lbl||"vs"}</span>—</span>`;
-  const n=parseFloat(pct), up=n>=0, good=inv?!up:up;
-  const arr = up
-    ? `<svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M4 6V2M2 4l2-2 2 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`
-    : `<svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M4 2v4M2 4l2 2 2-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-  return `<span class="bdg ${good?'bdg-up':'bdg-dn'}">${arr}<span class="bdg-lbl">${lbl||"vs"}</span>${up?'+':''}${Math.abs(n).toFixed(1)}%</span>`;
-}
-function badgeAmber(txt) { return `<span class="bdg bdg-am">⚠ ${txt}</span>`; }
-
-function kcard(lbl, val, pct, cmpL, note, acc, inv) {
-  const n = pct!==null&&pct!==undefined ? parseFloat(pct) : null;
-  const col = n!==null ? ((inv?n<=0:n>=0)?"var(--gr)":"var(--rd)") : (acc||"var(--bd)");
-  // If cmpL is intentionally blank, do not show a YOY badge.
-  // Used for 2024 periods because there is no reliable 2023 baseline in the dashboard data.
-  const badgeHtml = cmpL === "" ? "" : badge(pct,cmpL||"vs",inv);
-  return `<div class="kc"><div class="kc-bar" style="background:${col}"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badgeHtml}</div>${note?`<div class="kc-note">${note}</div>`:""}</div>`;
-}
-function kcardAmber(lbl, val, warnTxt, note) {
-  return `<div class="kc"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">${lbl}</div><div class="kc-val">${val}</div><div class="kc-badges">${badgeAmber(warnTxt)}</div>${note?`<div class="kc-note" style="color:var(--am)">${note}</div>`:""}</div>`;
-}
-function kcardCompare(lbl, shopVal, shopPct, cmpL, shopNote, emmaVal, emmaNote, inv) {
-  const n = shopPct!==null&&shopPct!==undefined ? parseFloat(shopPct) : null;
-  const col = n!==null ? ((inv?n<=0:n>=0)?"var(--gr)":"var(--rd)") : "var(--bd)";
-  const badgeHtml = cmpL === "" ? "" : badge(shopPct,cmpL||"vs",inv);
-  return `<div class="kc kcmp-card"><div class="kc-bar" style="background:${col}"></div><div class="kc-lbl">${lbl}</div><div class="kcmp-grid"><div class="kcmp-item"><div class="kcmp-tag">Shopify</div><div class="kcmp-val">${shopVal}</div><div class="kcmp-sub">${shopNote || 'Current Shopify KPI source'}</div></div><div class="kcmp-item emma"><div class="kcmp-tag">Emma</div><div class="kcmp-val">${emmaVal}</div><div class="kcmp-sub">${emmaNote || 'Emma CRM snapshot'}</div></div></div><div class="kc-badges">${badgeHtml}</div><div class="kc-note">YOY badge shown for <strong>Shopify</strong>. Emma is displayed beside it as a reference snapshot.</div></div>`;
-}
-function skel(n) { return Array(n).fill(`<div class="kc sk"><div class="kc-lbl" style="width:55%;height:9px"> </div><div class="kc-val" style="height:21px;margin-top:8px"> </div></div>`).join(''); }
-
-function resolveGrossProfit(row) {
-  // Show real zero as $0. Do not turn 0 into "—".
-  // This matters for Cavali periods with Gross Sales but 100% discount / $0 Net Sales.
-  if (!row) return null;
-  const rawDirect = row.gross_profit;
-  if (rawDirect !== undefined && rawDirect !== null && String(rawDirect).trim() !== "") {
-    const direct = parseFloat(rawDirect);
-    if (!isNaN(direct)) return direct;
-  }
-  const ns = parseFloat(row.net_sales||0);
-  const gm = parseFloat(row.pct_gm||0);
-  if (ns > 0 && gm > 0) return ns * gm / 100;
-  const cogs = parseFloat(row.cogs||0);
-  if (ns > 0 && cogs > 0) return ns - cogs;
-  if (ns === 0 && cogs === 0) return 0;
-  return null;
-}
-
-const DEFS = {
-  web: [
-    { k:"sessions",         l:"Sessions",         f:"",  n:"ShopifyQL direct" },
-    { k:"unique_visitors",  l:"Unique Visitors",  f:"",  n:"online_store_visitors from ShopifyQL" },
-    { k:"pageviews",        l:"Pageviews",         f:"",  n:"pageviews from ShopifyQL" },
-    { k:"conversion_rate",  l:"Conv. Rate",        f:"%", n:"conversion_rate from ShopifyQL" },
-    { k:"checkout_abandonment_rate", l:"Checkout Abandonment Rate", f:"%", n:"(Reached checkout − completed checkout) ÷ reached checkout", inv:true },
-  ],
-  fin: [
-    { k:"gross_sales",    l:"Gross Sales",    f:"$" },
-    { k:"net_sales",      l:"Net Sales",      f:"$",  n:"Confirmed: all revenue figures are Net Sales" },
-    { k:"gross_profit",   l:"Gross Profit",   f:"$",  n:"FROM sales: net_sales − COGS (Shopify)", computed: true },
-    { k:"pct_gm",         l:"Gross Margin",   f:"%" },
-    { k:"total_discounts",l:"Discounts",      f:"$",  inv:true },
-    { k:"total_returns",  l:"Returns",        f:"$",  inv:true },
-    { k:"pct_discount",   l:"% Discount",     f:"%",  inv:true },
-    { k:"pct_returns",    l:"% Returns",      f:"%",  inv:true },
-    { k:"cogs",           l:"COGS",           f:"$",  inv:true },
-  ],
-  op: [
-    { k:"nb_orders",       l:"Orders",          f:"" },
-    { k:"nb_units",        l:"Units Sold",       f:"" },
-    { k:"units_per_order", l:"Units / Order",    f:"" },
-    { k:"aov",             l:"AOV",              f:"$", n:"Net Sales ÷ Orders" },
-  ],
-};
-
-const EMMA_DEFS = [
-  { k:"new_users", l:"New Users", f:"" },
-  { k:"sessions", l:"Sessions", f:"" },
-  { k:"cr_sessions", l:"CR% Sessions", f:"%" },
-  { k:"transactions", l:"Transactions", f:"" },
-  { k:"total_revenue", l:"Total Revenue", f:"$" },
-  { k:"avg_purchase_revenue", l:"Avg Purchase Revenue", f:"$" },
-];
-
-const EMMA_CORRO_MONTHLY = {
-  "2026-01": { new_users:31028, sessions:39564, cr_sessions:1.05, transactions:416, total_revenue:75561, avg_purchase_revenue:182 },
-  "2026-02": { new_users:16577, sessions:22841, cr_sessions:1.04, transactions:237, total_revenue:38674, avg_purchase_revenue:163 },
-  "2026-03": { new_users:18289, sessions:21793, cr_sessions:0.57, transactions:125, total_revenue:23542, avg_purchase_revenue:188 },
-  "2026-04": { new_users:17797, sessions:21055, cr_sessions:1.50, transactions:315, total_revenue:54249, avg_purchase_revenue:172 },
-  "2026-05": { new_users:30394, sessions:37443, cr_sessions:1.17, transactions:437, total_revenue:76807, avg_purchase_revenue:176 },
-  "2026-06": { new_users:19364, sessions:23842, cr_sessions:1.00, transactions:239, total_revenue:43723, avg_purchase_revenue:183 },
-};
-
-function _emmaMonthsInRange(startYm, endYm) {
-  const out = [];
-  let y = parseInt(String(startYm||'').slice(0,4), 10);
-  let m = parseInt(String(startYm||'').slice(5,7), 10);
-  const ey = parseInt(String(endYm||'').slice(0,4), 10);
-  const em = parseInt(String(endYm||'').slice(5,7), 10);
-  if (!y || !m || !ey || !em) return out;
-  while (y < ey || (y === ey && m <= em)) {
-    out.push(`${y}-${String(m).padStart(2,'0')}`);
-    m += 1;
-    if (m > 12) { m = 1; y += 1; }
-  }
-  return out;
-}
-
-function getEmmaCorroData(opt) {
-  if (brand !== "corro") return { state:"hidden-brand" };
-  if (ptype === "week") return { state:"na-week" };
-
-  const startYm = String(opt?.start || '').slice(0,7);
-  if (!startYm || !startYm.startsWith('2026-')) return { state:"na-year" };
-
-  if (ptype === "quarter") {
-    const endYm = String(opt?.end || '').slice(0,7);
-    const months = _emmaMonthsInRange(startYm, endYm);
-    if (!months.length) return { state:"no-data" };
-    const rows = months.map(ym => EMMA_CORRO_MONTHLY[ym]).filter(Boolean);
-    if (rows.length !== months.length) return { state:"no-data" };
-
-    const sums = rows.reduce((acc, r) => {
-      acc.new_users += +r.new_users || 0;
-      acc.sessions += +r.sessions || 0;
-      acc.transactions += +r.transactions || 0;
-      acc.total_revenue += +r.total_revenue || 0;
-      return acc;
-    }, { new_users:0, sessions:0, transactions:0, total_revenue:0 });
-
-    const cr = sums.sessions > 0 ? (sums.transactions / sums.sessions * 100) : null;
-    const apr = sums.transactions > 0 ? (sums.total_revenue / sums.transactions) : null;
-    return {
-      state:"ok",
-      mode:"quarter",
-      note:`Quarter calc from Emma monthly captures: ${months.join(', ')}`,
-      data:{
-        new_users:sums.new_users,
-        sessions:sums.sessions,
-        cr_sessions:cr,
-        transactions:sums.transactions,
-        total_revenue:sums.total_revenue,
-        avg_purchase_revenue:apr
-      }
-    };
-  }
-
-  const row = EMMA_CORRO_MONTHLY[startYm];
-  if (!row) return { state:"no-data" };
-  return {
-    state:"ok",
-    mode:"month",
-    note:`Emma monthly snapshot: ${startYm}`,
-    data: row
-  };
-}
-
-function renderEmma(opt) {
-  const box = document.getElementById('emma-box');
-  if (box) box.style.display = 'none';
-  safeHTML('s-emma', '');
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+HEADERS = [
+    "updated_at", "period", "period_start", "period_end",
+    "gross_sales", "net_sales", "gross_profit", "total_discounts",
+    "total_returns", "cogs",
+    "pct_discount", "pct_returns", "pct_gm",
+    "nb_orders", "nb_units", "aov", "units_per_order",
+    "sessions", "unique_visitors", "pageviews", "conversion_rate", "checkout_abandonment_rate",
+    "new_customers", "returning_customers",
+    "new_revenue", "returning_revenue",
+    "new_gross_profit", "returning_gross_profit",
+]
+
+AD_SPEND_DATA = {
+    "corro": {
+        "2024-01": {"spend": 82069,  "roas": 2.12, "cos": 0.472},
+        "2024-02": {"spend": 38738,  "roas": 2.94, "cos": 0.341},
+        "2024-03": {"spend": 39391,  "roas": 3.24, "cos": 0.309},
+        "2024-04": {"spend": 16371,  "roas": 6.22, "cos": 0.161},
+        "2024-05": {"spend": 7909,   "roas": 13.78,"cos": 0.073},
+        "2024-06": {"spend": 19752,  "roas": 4.98, "cos": 0.201},
+        "2024-07": {"spend": 10491,  "roas": 6.21, "cos": 0.161},
+        "2024-08": {"spend": 16110,  "roas": 5.34, "cos": 0.187},
+        "2024-09": {"spend": 18786,  "roas": 4.54, "cos": 0.220},
+        "2024-10": {"spend": 22284,  "roas": 3.95, "cos": 0.253},
+        "2024-11": {"spend": 30959,  "roas": 3.77, "cos": 0.265},
+        "2024-12": {"spend": 22994,  "roas": 4.84, "cos": 0.207},
+        "2025-01": {"spend": 32136,  "roas": 2.77, "cos": 0.362},
+        "2025-02": {"spend": 26531,  "roas": 4.16, "cos": 0.240},
+        "2025-03": {"spend": 32810,  "roas": 3.64, "cos": 0.275},
+        "2025-04": {"spend": 40677,  "roas": 3.19, "cos": 0.313},
+        "2025-05": {"spend": 59424,  "roas": 2.88, "cos": 0.348},
+        "2025-06": {"spend": 45524,  "roas": 3.23, "cos": 0.310},
+        "2025-07": {"spend": 51788,  "roas": 3.10, "cos": 0.322},
+        "2025-08": {"spend": 27828,  "roas": 3.72, "cos": 0.269},
+        "2025-09": {"spend": 36960,  "roas": 3.34, "cos": 0.300},
+        "2025-10": {"spend": 45790,  "roas": 2.95, "cos": 0.339},
+        "2025-11": {"spend": 41051,  "roas": 4.08, "cos": 0.245},
+        "2025-12": {"spend": 36657,  "roas": 3.55, "cos": 0.282},
+        "2026-01": {"spend": 33133,  "roas": 3.77, "cos": 0.265},
+        "2026-02": {"spend": 16470,  "roas": 4.56, "cos": 0.219},
+        "2026-03": {"spend": 0,      "roas": 0,    "cos": 0},
+        "2026-04": {"spend": 7883,   "roas": 3.85, "cos": 0.260},
+    },
+    "cavali": {},
 }
 
 
-/* ══════════════════════════════════════════════════════
-   FCS FORECAST (Corro only)
-══════════════════════════════════════════════════════ */
-function renderFCS(row) {
-  const el = document.getElementById("s-fcs"); if (!el) return;
-  if (brand !== "corro" || !row) { el.innerHTML = ""; return; }
-
-  // Forecast is only for the active/current month. For closed months,
-  // do not show a "projected" value because the month is already final.
-  const opt = getOpt();
-  const isCurrentOpenMonth = !!(opt && opt.cur && (ptype === "mtd" || ptype === "month"));
-  if (!isCurrentOpenMonth) { el.innerHTML = ""; return; }
-
-  const net = parseFloat(row.net_sales||0);
-  const today = new Date(), day = today.getDate();
-  const daysInMonth = new Date(today.getFullYear(), today.getMonth()+1, 0).getDate();
-  const rate = net / Math.max(1, day);
-  const fcs  = rate * daysInMonth;
-  const pct  = Math.round(day/daysInMonth*100);
-  el.innerHTML = `
-    <div class="kc-fcs">
-      <div class="kc-bar" style="background:#72AEFF;height:3px;position:absolute;top:0;left:0;right:0"></div>
-      <div class="kc-lbl">FCS — Linear Month Forecast (Net Sales)</div>
-      <div class="kc-val">${fv(fcs,"$")}</div>
-      <div class="kc-badges"><span class="bdg" style="background:rgba(114,174,255,.15);color:#72AEFF;border:1px solid rgba(114,174,255,.3)">Projected end of month</span></div>
-      <div class="kc-note">Day ${day}/${daysInMonth} (${pct}%) · Daily rate: ${fv(rate,"$")} · Actual so far: ${fv(net,"$")}</div>
-    </div>`;
-}
-/* ══════════════════════════════════════════════════════
-   REVENUE SHARE
-══════════════════════════════════════════════════════ */
-function renderRS(rsRows, row) {
-  const el  = document.getElementById("rs-grid"); if (!el) return;
-  const opt = getOpt();
-  const pk  = row?.period;
-  let ch = pk
-    ? (rsRows||[]).filter(r=>r.period===pk)
-    : (rsRows||[]).filter(r=>(r.period_start||"").slice(0,7)===(opt.start||"").slice(0,7));
-
-  if (brand==="cavali") {
-    ch = ch.map(r => {
-      const nm = CAVALI_RENAME[r.channel];
-      return nm===null ? null : { ...r, channel: nm||r.channel };
-    }).filter(Boolean);
-  } else if (brand==="corro") {
-    ch = ch.map(r => ({ ...r, channel: CORRO_RENAME[r.channel] || r.channel }));
-  }
-
-  // Do not clutter the breakdown with empty newly-added buckets.
-  ch = ch.filter(r => Math.abs(parseFloat(r.amount)||0) > 0 || Math.abs(parseFloat(r.pct)||0) > 0);
-
-  if (!ch.length) { el.innerHTML=`<div style="font-size:11px;color:var(--tx3)">No data for this period.</div>`; return; }
-
-  el.innerHTML = ch.map(r => {
-    const pct  = parseFloat(r.pct)||0;
-    const amt  = parseFloat(r.amount)||0;
-    const gp   = parseFloat(r.gross_profit)||0;
-    const gm   = parseFloat(r.gross_margin)||0;
-    const chg  = r.pct_chg&&r.pct_chg!==""?parseFloat(r.pct_chg):null;
-    const isEst= (r.gp_is_estimate||"").toLowerCase()==="true";
-    const col  = CH_COLORS[r.channel]||"#707070";
-    const chgH = chg!==null ? `<div style="font-size:9px;margin-top:3px;color:${chg>=0?'var(--gr)':'var(--rd)'}">${chg>=0?'▲':'▼'} ${Math.abs(chg).toFixed(1)}pp vs prev</div>` : "";
-    const gpH  = (gp > 0 && !isEst)
-      ? `<div class="rs-gp">GP: <span style="color:var(--gr)">${fv(gp,"$")}</span>${gm > 0 ? ` · <span style="color:var(--gr)">${gm.toFixed(1)}%</span>` : ""}</div>`
-      : "";
-    return `<div class="rs-card">
-      <div class="rs-name">${r.channel}</div>
-      <div class="rs-pct" style="color:${col}">${pct.toFixed(1)}%</div>
-      <div class="rs-amt">${fv(amt,"$")}</div>
-      ${chgH}${gpH}
-      <div class="rs-bar-wrap"><div class="rs-bar-fill" style="width:${Math.min(pct,100)}%;background:${col}"></div></div>
-    </div>`;
-  }).join('');
+SMARTRR_API_KEYS = {
+    # Store these in GitHub repository secrets. Do not commit them in HTML.
+    "cavali": os.environ.get("SMARTRR_API_KEY_CAVALI") or os.environ.get("SMARTRR_TOKEN_CAVALI") or "",
+    "corro":  os.environ.get("SMARTRR_API_KEY_CORRO")  or os.environ.get("SMARTRR_TOKEN_CORRO")  or "",
 }
 
-/* ══════════════════════════════════════════════════════
-   NEW vs RETURNING
-   Now reads from new_vs_returning tab (populated via REST orders_count)
-══════════════════════════════════════════════════════ */
-function renderNVR(nvrRows, kpiRow) {
-  const el  = document.getElementById("nvr-grid"); if (!el) return;
-  const opt = getOpt();
-  const pk  = kpiRow?.period;
-  let nvrRow = null;
 
-  if (nvrRows?.length) {
-    if (pk) nvrRow = nvrRows.find(r=>r.period===pk) || null;
-    if (!nvrRow) nvrRow = nvrRows.find(r=>(r.period_start||"").slice(0,7)===(opt.start||"").slice(0,7)) || null;
-  }
+# ─────────────────────────────────────────────────────────────────
+# GOOGLE SHEETS
+# ─────────────────────────────────────────────────────────────────
+def get_gc():
+    creds = Credentials.from_service_account_info(
+        json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
+    return gspread.authorize(creds)
 
-  // Fallback: read from kpiRow if nvr tab has no data yet
-  const src = nvrRow || kpiRow;
-  if (!src) {
-    el.innerHTML=`<div style="font-size:11px;color:var(--tx3);grid-column:1/-1">No new/returning data. Run pipeline v4 then refresh.</div>`;
-    return;
-  }
+# ─────────────────────────────────────────────────────────────────
+# SHOPIFY GQL — raw request
+# ─────────────────────────────────────────────────────────────────
+def gql(store_url, token, query):
+    """
+    Shopify GraphQL wrapper with retry/backoff.
 
-  const newRev  = parseFloat(src.new_revenue||0);
-  const retRev  = parseFloat(src.returning_revenue||0);
-  const newGP   = parseFloat(src.new_gross_profit||0);
-  const retGP   = parseFloat(src.returning_gross_profit||0);
-  const newNC   = parseInt(src.new_customers||0);
-  const retNC   = parseInt(src.returning_customers||0);
-  const total   = newRev + retRev;
+    Important for compare backfills: ShopifyQL can return GraphQL errors with
+    code THROTTLED even when HTTP status is 200. Older versions returned None
+    immediately, which wrote zero rows for some weeks. This waits for the
+    Shopify throttle window and retries before giving up.
+    """
+    endpoint = f"https://{store_url}/admin/api/{GQL_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
-  // Show real zeros as 0 / $0 instead of dashes. Some Cavali periods have
-  // actual $0 revenue because orders are fully discounted; that is not missing data.
-  const hasNvrData = !!nvrRow || ["new_customers","returning_customers","new_revenue","returning_revenue"].some(k => src[k] !== undefined && src[k] !== null && String(src[k]).trim() !== "");
-  const src_lbl = nvrRow ? "Pipeline v4 · REST orders_count" : "kpis_daily fallback";
-  const noDataNote = !hasNvrData ? `<div class="nvr-note">⚠ No revenue data — run pipeline v4</div>` : "";
+    for attempt in range(8):
+        try:
+            r = requests.post(endpoint, headers=headers, json={"query": query}, timeout=60)
+        except Exception as exc:
+            wait = min(60, (2 ** attempt) + random.random())
+            print(f"    GraphQL request error: {exc}; retrying in {wait:.1f}s")
+            time.sleep(wait)
+            continue
 
-  el.innerHTML = `
-    <div class="nvr-col">
-      <div class="nvr-title" style="color:var(--bl)">
-        <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="4" stroke="#72AEFF" stroke-width="1.5"/><path d="M5 3v4M3 5h4" stroke="#72AEFF" stroke-width="1.2" stroke-linecap="round"/></svg>
-        New Customers
-      </div>
-      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${Number.isFinite(newNC)?newNC:"—"}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">Revenue</span><span class="nvr-val">${fv(newRev,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">Gross Profit</span><span class="nvr-val nvr-gp">${fv(newGP,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(newRev/total*100).toFixed(1)+"%":"0.0%"}</span></div>
-      ${noDataNote}
-      <div class="nvr-note" style="color:var(--tx3)">${src_lbl}</div>
-    </div>
-    <div class="nvr-col">
-      <div class="nvr-title" style="color:var(--gr)">
-        <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M7 3c0-1.1-.9-2-2-2S3 1.9 3 3s.9 2 2 2 2-.9 2-2z" stroke="#2EE896" stroke-width="1.2"/><path d="M1.5 9c0-1.9 1.6-3.5 3.5-3.5S8.5 7.1 8.5 9" stroke="#2EE896" stroke-width="1.2" stroke-linecap="round"/></svg>
-        Returning Customers
-      </div>
-      <div class="nvr-row"><span class="nvr-lbl">Orders / Customers</span><span class="nvr-val">${Number.isFinite(retNC)?retNC:"—"}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">Revenue</span><span class="nvr-val">${fv(retRev,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">Gross Profit</span><span class="nvr-val nvr-gp">${fv(retGP,"$")}</span></div>
-      <div class="nvr-row"><span class="nvr-lbl">% of Total</span><span class="nvr-val">${total?(retRev/total*100).toFixed(1)+"%":"0.0%"}</span></div>
-      ${noDataNote}
-    </div>`;
-}
+        if r.status_code in (429, 500, 502, 503, 504):
+            retry_after = r.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else min(60, (2 ** attempt) + random.random())
+            except Exception:
+                wait = min(60, (2 ** attempt) + random.random())
+            print(f"    HTTP {r.status_code} GraphQL; retrying in {wait:.1f}s")
+            time.sleep(wait)
+            continue
 
-/* ══════════════════════════════════════════════════════
-   CAC to LTV
-══════════════════════════════════════════════════════ */
-function renderCAC(cacVal, ltvVal, source) {
-  const el = document.getElementById("s-cac"); if (!el) return;
-  const ltv = ltvVal > 0 ? ltvVal : DEFAULT_LTV_12M;
-  const cac = cacVal > 0 ? cacVal : DEFAULT_CAC_REF;
-  const hasActualCAC = cacVal > 0;
-  const hasManualLTV = ltvVal > 0;
-  const ratio = ltv / cac;
-  const health = ratio >= 3 ? "✅ Healthy (≥3x)" : ratio >= 2 ? "⚠ Acceptable (2–3x)" : "🔴 Low (<2x)";
-  const hcol   = ratio >= 3 ? "var(--gr)" : ratio >= 2 ? "var(--am)" : "var(--rd)";
-  const hbg    = ratio >= 3 ? "var(--gr-bg)" : ratio >= 2 ? "var(--am-bg)" : "var(--rd-bg)";
-  const hbd    = ratio >= 3 ? "var(--gr-bd)" : ratio >= 2 ? "var(--am-bd)" : "var(--rd-bd)";
-  const cacNote = hasActualCAC ? (source || "Calculated") : "Reference fallback: ~$47";
-  el.innerHTML = `
-    <div class="kc"><div class="kc-bar" style="background:var(--bl)"></div>
-      <div class="kc-lbl">LTV (12M)</div>
-      <div class="kc-val" style="color:var(--bl)">${fv(ltv,"$")}</div>
-      <div class="kc-note">${hasManualLTV?"Manual entry":"Shopify reference: $178"}</div></div>
-    <div class="kc"><div class="kc-bar" style="background:var(--gd)"></div>
-      <div class="kc-lbl">CAC${hasActualCAC&&source?" ("+source+")":""}</div>
-      <div class="kc-val" style="color:var(--gd)">${fv(cac,"$")}</div>
-      <div class="kc-note">${cacNote}</div></div>
-    <div class="kc"><div class="kc-bar" style="background:${hcol}"></div>
-      <div class="kc-lbl">LTV / CAC Ratio</div>
-      <div class="kc-val" style="color:${hcol}">${ratio.toFixed(2)}x</div>
-      <div class="kc-badges"><span class="bdg" style="background:${hbg};color:${hcol};border:1px solid ${hbd}">${health}</span></div>
-      <div class="kc-note">Target ≥ 3x${hasActualCAC?"":" · uses reference CAC"}</div></div>`;
-}
+        if r.status_code != 200:
+            print(f"    HTTP {r.status_code} — {r.text[:200]}")
+            return None
 
-/* ══════════════════════════════════════════════════════
-   CAVALI — SMARTRR PRODUCT VOLUME BY PRODUCT-VARIANT
-══════════════════════════════════════════════════════ */
-function renderSubsEmpty(reason) {
-  const el = document.getElementById("s-subs"); if (!el) return;
-  el.className = "smartrr-product-wrap";
-  el.innerHTML = `
-    <div class="kc-sub" style="max-width:260px">
-      <div class="kc-bar"></div>
-      <div class="kc-lbl" style="color:#D8B054">Smartrr Product Volume</div>
-      <div class="kc-val" style="color:#D8B054">—</div>
-      <div class="kc-note">${reason || "Run the updated pipeline to load period rows"}</div>
-    </div>`;
-}
+        d = r.json()
+        errs = d.get("errors") or []
+        if errs:
+            err_txt = json.dumps(errs, default=str)
+            throttled = "THROTTLED" in err_txt or "Rate limited" in err_txt
+            if throttled and attempt < 7:
+                wait = min(60, (2 ** attempt) + random.random())
+                # Shopify often includes windowResetAt in errors.extensions.cost.
+                try:
+                    reset_at = errs[0].get("extensions", {}).get("cost", {}).get("windowResetAt")
+                    if reset_at:
+                        reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                        now_utc = datetime.now(reset_dt.tzinfo)
+                        wait = max(wait, min(60, (reset_dt - now_utc).total_seconds() + 1))
+                except Exception:
+                    pass
+                print(f"    GQL throttled; retrying in {wait:.1f}s")
+                time.sleep(wait)
+                continue
 
-async function renderSubs() {
-  if (brand !== "cavali") return;
-  const el = document.getElementById("s-subs"); if (!el) return;
-  const statusEl = document.getElementById("smartrr-status");
-  const ft = document.getElementById("ft-smartrr");
-  const opt = getOpt();
+            print(f"    GQL errors: {errs}")
+            return None
 
-  el.className = "smartrr-product-wrap";
-  el.innerHTML = `<div class="smartrr-product-grid">${skel(4)}</div>`;
-  if (statusEl) statusEl.innerHTML = "";
+        return d.get("data")
 
-  const allRows = await fetchSmartrrProductRows();
-  const allDeliveryRows = await fetchSmartrrDeliveryRows();
-  const allSubscriberRows = await fetchSmartrrSubscribersRows();
+    print("    GQL retry limit reached; returning no data")
+    return None
 
-  if (!allRows || !allRows.length) {
-    if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-warn">⚠ Missing smartrr_product_volume tab. Run the updated pipeline/backfill.</div>`;
-    if (ft) { ft.textContent = "Smartrr"; ft.style.color = "var(--am)"; }
-    renderSubsEmpty("Missing smartrr_product_volume period rows");
-    return;
-  }
+# ─────────────────────────────────────────────────────────────────
+# ql_run — DEFINITIVO (verificado contra docs.shopify.dev 2026-01)
+#
+# Estructura oficial ShopifyqlQueryResponse:
+#   parseErrors  [String!]!    → [] si OK, ["msg..."] si error ShopifyQL
+#   tableData    ShopifyqlTableData | null
+#     columns    [ShopifyqlTableDataColumn!]!
+#     rows       JSON!  → lista de dicts {"col_name": "value"}
+# ─────────────────────────────────────────────────────────────────
+def ql_run(store_url, token, ql_query):
+    """
+    Ejecuta una ShopifyQL query contra la Admin API 2025-10+.
+    Devuelve lista de {columna: valor} o [] si no hay datos / error.
+    """
+    escaped = ql_query.replace("\\", "\\\\").replace('"', '\\"')
 
-  let rows = filterSmartrrRowsForCurrentPeriod(allRows, opt);
-
-  // v61: Current subscriber totals are a snapshot, not a sales-period metric.
-  // When the selected period is a brand-new empty MTD day (example: Jun 1),
-  // the sheet may have no order-volume rows for that exact day. In that case,
-  // keep the Smartrr section visible by falling back to the latest subscriber
-  // snapshot rows only. Sales-volume sections remain empty for the selected range.
-  let usedSubscriberSnapshotFallback = false;
-  if (!rows.length) {
-    const isSubSnapRow = (r) => {
-      const src = String(r.source || "").toLowerCase();
-      const filter = String(r.active_filter || "").toLowerCase();
-      return filter.includes("row_type=smartrr_subscribers") || src.includes("smartrr subscriber snapshot");
-    };
-    const normDate = (v) => {
-      const m = String(v || "").match(/^(\d{4}-\d{2}-\d{2})/);
-      return m ? m[1] : "";
-    };
-    const subRows = (allRows || []).filter(r => {
-      const rb = String(r.brand || brand || "").toLowerCase();
-      return (!rb || rb === String(brand || "").toLowerCase()) && isSubSnapRow(r);
-    });
-    const latestEnd = subRows.reduce((mx, r) => {
-      const d = normDate(r.period_end);
-      return d > mx ? d : mx;
-    }, "");
-    if (latestEnd) {
-      rows = subRows.filter(r => normDate(r.period_end) === latestEnd);
-      usedSubscriberSnapshotFallback = rows.length > 0;
-    }
-  }
-
-  const deliveryRows = (allDeliveryRows && allDeliveryRows.length) ? filterSmartrrRowsForCurrentPeriod(allDeliveryRows, opt) : rows;
-  const deliveryTabReady =
-    deliveryRows.some(r => String(r.clients_due_to_receive || r.clients_to_receive || r.delivery_due || "").trim() !== "");
-  if (!rows.length) {
-    if (statusEl) statusEl.innerHTML = `<div class="smartrr-badge smartrr-warn">⚠ No Smartrr product rows for ${fmtD(opt.start)} – ${fmtD(opt.end)}.</div>`;
-    if (ft) { ft.textContent = "Smartrr"; ft.style.color = "var(--am)"; }
-    renderSubsEmpty("No Smartrr rows matched this period");
-    return;
-  }
-
-  if (statusEl) statusEl.innerHTML = usedSubscriberSnapshotFallback
-    ? `<div class="smartrr-badge smartrr-warn">⚠ No sales/product rows for ${fmtD(opt.start)} – ${fmtD(opt.end)}. Showing latest Smartrr current subscriber totals.</div>`
-    : `<div class="smartrr-badge smartrr-ok">✓ Smartrr · Subscribers, subscription volume, and one-time sales separated</div>`;
-  if (ft) { ft.textContent = "Smartrr ✓"; ft.style.color = "var(--gr)"; }
-
-  const parseMaybeNumber = (v) => {
-    if (v === undefined || v === null) return null;
-    const s = String(v).trim();
-    if (!s || s === "-" || s === "—" || s.toLowerCase() === "null" || s.toLowerCase() === "none") return null;
-    const n = parseFloat(s.replace(/,/g, "").replace("USD", "").trim());
-    return Number.isFinite(n) ? n : null;
-  };
-  const firstNumber = (vals) => {
-    for (const v of vals) {
-      const n = parseMaybeNumber(v);
-      if (n !== null) return n;
-    }
-    return null;
-  };
-  // New subscribers must come only from Smartrr purchase-state rows.
-  // Do not fall back to total_quantity because that is sales volume.
-  const newOf = (r) => firstNumber([r.new_subscribers, r.subscribers]) ?? 0;
-  const qtyOf = (r) => firstNumber([r.total_quantity, r.quantity]) ?? 0;
-  // v16: current totals must come from global current fields only.
-  // Do NOT fall back to old *_to_date fields if they were created by the Shopify period fallback.
-  const totalOf = (r) => firstNumber([r.total_subscribers_current, r.current_total_subscribers, r.total_current, r.total_subscribers_to_date]);
-  const activeOf = (r) => firstNumber([r.active_subscribers_current, r.current_active_subscribers, r.active_current, r.active_subscribers_to_date]);
-  const pausedOf = (r) => firstNumber([r.paused_subscribers_current, r.current_paused_subscribers, r.paused_current, r.paused_subscribers_to_date]);
-  const pausedPeriodOf = (r) => firstNumber([
-    r.paused_subscribers_period,
-    r.paused_subscribers_in_period,
-    r.paused_in_period,
-    r.paused_period,
-    r.paused_qty_period
-  ]);
-  const hasSmartrrCurrentTotals = (r) => {
-    const src = String(r.source || "").toLowerCase();
-    const isPlainFallback = src.includes("fallback") && !src.includes("active/paused") && !src.includes("cancelled");
-    if (isPlainFallback) return false;
-    return activeOf(r) !== null || pausedOf(r) !== null || totalOf(r) !== null;
-  };
-  const dueOf = (r) => firstNumber([r.clients_due_to_receive, r.clients_to_receive, r.delivery_due]);
-  const showCount = (v) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toLocaleString();
-
-  const cleanProductName = (v) => {
-    let t = String(v || "").trim();
-    if (!t || !/[A-Za-z]/.test(t)) return "Other";
-    const low = t.toLowerCase();
-    if (low.includes("sin nombre") || low.includes("unknown product") || low.startsWith("[sin nombre")) return "Other";
-    // Hide technical UUID/id noise from the dashboard. Those rows are still counted under Other.
-    if (/id[=:\-]/i.test(t) && /[0-9a-f]{8}-[0-9a-f]{4}/i.test(t)) return "Other";
-
-    // Canonical subscription families. This prevents rows such as
-    // "The Premier Box" and "The Premier Box Subscription" from rendering as
-    // two different subscription products.
-    if (/premier/i.test(t)) return "The Premier Box";
-    if (/signature/i.test(t)) return "The Signature Box";
-    if (/junior/i.test(t) && /membership/i.test(t)) return "Cavali Club Junior Membership";
-    if (/cavali club/i.test(t) && /membership/i.test(t)) return "Cavali Club Membership";
-
-    return t.replace(/\s+/g, " ");
-  };
-
-  const volumeProductName = (v) => {
-    // For volume cards we keep the actual product/variant label. This is separate
-    // from subscriber grouping, where aliases are intentionally consolidated.
-    let t = String(v || "").trim();
-    if (!t || !/[A-Za-z]/.test(t)) return "Other";
-    const low = t.toLowerCase();
-    if (low.includes("sin nombre") || low.includes("unknown product") || low.startsWith("[sin nombre")) return "Other";
-    if (/id[=:\-]/i.test(t) && /[0-9a-f]{8}-[0-9a-f]{4}/i.test(t)) return "Other";
-    return t.replace(/\s+/g, " ");
-  };
-
-  const subscriptionVolumeProductName = (v) => {
-    const base = volumeProductName(v);
-    const low = base.toLowerCase();
-    if (low.includes("premier")) return "The Premier Box Subscription";
-    if (low.includes("signature")) return "The Signature Box Subscription";
-    if (low.includes("junior") && low.includes("membership")) return "Cavali Club Junior Membership";
-    if (low.includes("cavali club") && low.includes("membership")) return "Cavali Club Membership";
-    return base;
-  };
-
-  const isSubscriptionFamilyProduct = (r) => {
-    const product = String(r.product_variant || r.product || r.variant || "").toLowerCase();
-    return product.includes("subscription") || product.includes("membership") ||
-      product.includes("premier") || product.includes("signature");
-  };
-
-  const isSalesVolumeOnlyRow = (r) => {
-    const src = String(r.source || "").toLowerCase();
-    const filter = String(r.active_filter || "").toLowerCase();
-    return src.includes("sales volume only") || filter.includes("row_type=sales_volume_only");
-  };
-  const isOrderVolumeRow = (r) => {
-    const src = String(r.source || "").toLowerCase();
-    const filter = String(r.active_filter || "").toLowerCase();
-    return (src.includes("shopify") && src.includes("line_items")) ||
-      filter.includes("row_type=sales_volume_only") ||
-      filter.includes("row_type=subscription_sales_volume");
-  };
-  const isSmartrrSubscriberRow = (r) => {
-    const src = String(r.source || "").toLowerCase();
-    const filter = String(r.active_filter || "").toLowerCase();
-    // Subscriber rows are ONLY Smartrr subscriber snapshots. Never use Shopify/order-volume rows.
-    if (isOrderVolumeRow(r)) return false;
-    if (filter.includes("row_type=smartrr_subscribers") || src.includes("smartrr subscriber snapshot")) return true;
-    // Backward-compatible safety for older sheets: Smartrr purchase-state rows with current totals are subscriber rows
-    // only if they are not explicitly marked as sales/subscription volume.
-    if (filter.includes("sales_volume") || filter.includes("subscription_sales_volume") || src.includes("sales volume")) return false;
-    return (src.includes("smartrr purchase-state") || filter.includes("purchasestate")) && hasSmartrrCurrentTotals(r);
-  };
-  const isSubscriptionSalesVolumeRow = (r) => {
-    const src = String(r.source || "").toLowerCase();
-    const filter = String(r.active_filter || "").toLowerCase();
-    // Subscription sales volume is order volume only. It is NOT subscriber count and NOT current active totals.
-    return isOrderVolumeRow(r) && (
-      filter.includes("row_type=subscription_sales_volume") ||
-      src.includes("subscription sales volume")
-    );
-  };
-
-  const grouped = new Map();
-  rows.filter(isSmartrrSubscriberRow).forEach(r => {
-    const product = cleanProductName(r.product_variant || r.product || r.variant || "");
-    const cur = grouped.get(product) || {
-      product_variant: product,
-      new_subscribers: 0,
-      total_subscribers_to_date: null,
-      active_subscribers_to_date: null,
-      paused_subscribers_to_date: null,
-      paused_subscribers_in_period: 0,
-      gross_revenue: 0,
-      source: r.source || "Smartrr",
-      date_basis: r.date_basis || "Order Line Item Created Date",
-    };
-    cur.new_subscribers += newOf(r);
-    const t = totalOf(r), a = activeOf(r), p = pausedOf(r), pp = pausedPeriodOf(r);
-    const n = newOf(r);
-    if (hasSmartrrCurrentTotals(r)) {
-      if (a !== null) cur.active_subscribers_to_date = (cur.active_subscribers_to_date ?? 0) + a;
-      if (p !== null) cur.paused_subscribers_to_date = (cur.paused_subscribers_to_date ?? 0) + p;
-      if (t !== null) cur.total_subscribers_to_date = (cur.total_subscribers_to_date ?? 0) + t;
-    } else if (n > 0) {
-      cur.active_subscribers_to_date = Math.max(_num(cur.active_subscribers_to_date), n);
-      cur.paused_subscribers_to_date = cur.paused_subscribers_to_date ?? 0;
-      cur.total_subscribers_to_date = Math.max(_num(cur.total_subscribers_to_date), n);
-    }
-    cur.paused_subscribers_in_period += pp || 0;
-    cur.gross_revenue += _num(r.gross_revenue);
-    if (r.source) cur.source = r.source;
-    if (r.date_basis) cur.date_basis = r.date_basis;
-    grouped.set(product, cur);
-  });
-
-  const subscriptionSalesGrouped = new Map();
-  rows.filter(isSubscriptionSalesVolumeRow).forEach(r => {
-    const product = subscriptionVolumeProductName(r.product_variant || r.product || r.variant || "");
-    const cur = subscriptionSalesGrouped.get(product) || { product_variant: product, total_quantity: 0, gross_revenue: 0 };
-    cur.total_quantity += qtyOf(r);
-    cur.gross_revenue += _num(r.gross_revenue);
-    subscriptionSalesGrouped.set(product, cur);
-  });
-
-  const salesGrouped = new Map();
-  rows.filter(r => isOrderVolumeRow(r) && isSalesVolumeOnlyRow(r) && !isSubscriptionSalesVolumeRow(r)).forEach(r => {
-    const product = volumeProductName(r.product_variant || r.product || r.variant || "");
-    const cur = salesGrouped.get(product) || { product_variant: product, total_quantity: 0, gross_revenue: 0 };
-    cur.total_quantity += qtyOf(r);
-    cur.gross_revenue += _num(r.gross_revenue);
-    salesGrouped.set(product, cur);
-  });
-
-  const sorted = Array.from(grouped.values())
-    .sort((a, b) =>
-      (_num(b.total_subscribers_to_date) + _num(b.new_subscribers)) - (_num(a.total_subscribers_to_date) + _num(a.new_subscribers))
+    # parseErrors NO tiene subfields — es [String!]! (lista de strings)
+    q = (
+        f'{{ shopifyqlQuery(query: "{escaped}") {{ '
+        f'tableData {{ columns {{ name }} rows }} '
+        f'parseErrors }} }}'
     )
-    .slice(0, 12);
-  // When total-to-date is missing in the sheet row, reconstruct from active + paused
-  // so the card never shows a blank total while active/paused are known.
-  sorted.forEach(r => {
-    if ((r.total_subscribers_to_date === null || r.total_subscribers_to_date === undefined) &&
-        r.active_subscribers_to_date !== null && r.active_subscribers_to_date !== undefined) {
-      r.total_subscribers_to_date = _num(r.active_subscribers_to_date) + _num(r.paused_subscribers_to_date);
-    }
-  });
-  const palette = {"The Premier Box":"#A090FF", "The Signature Box":"#2EE896", "Other":"#5A7A98"};
+    data = gql(store_url, token, q)
+    if not data:
+        return []
 
-  const totalNew = sorted.reduce((a,r)=>a + _num(r.new_subscribers), 0);
-  const totalToDateKnown = sorted.some(r => r.total_subscribers_to_date !== null && r.total_subscribers_to_date !== undefined);
-  const activeKnown = sorted.some(r => r.active_subscribers_to_date !== null && r.active_subscribers_to_date !== undefined);
-  const pausedKnown = sorted.some(r => r.paused_subscribers_to_date !== null && r.paused_subscribers_to_date !== undefined);
-  const totalToDate = sorted.reduce((a,r)=>a + _num(r.total_subscribers_to_date), 0);
-  let totalActive = sorted.reduce((a,r)=>a + _num(r.active_subscribers_to_date), 0);
-  let totalPaused = sorted.reduce((a,r)=>a + _num(r.paused_subscribers_to_date), 0);
-  let totalCancelled = null;
-  let globalActiveKnown = activeKnown;
-  let globalPausedKnown = pausedKnown;
-  const subSnap = bestRow((allSubscriberRows || []).filter(r => String(r.brand || brand || "").toLowerCase() === String(brand || "").toLowerCase()));
-  if (subSnap) {
-    const snapActive = firstNumber([subSnap.active_subscribers_current, subSnap.active_subscribers, subSnap.active, subSnap.current_active, subSnap.active_subscriptions]);
-    const snapPaused = firstNumber([subSnap.paused_subscribers_current, subSnap.paused_subscribers, subSnap.paused, subSnap.current_paused, subSnap.paused_subscriptions]);
-    const snapCancelled = firstNumber([subSnap.cancelled_subscriptions, subSnap.canceled_subscriptions, subSnap.cancelled, subSnap.canceled]);
-    const snapTotal = firstNumber([subSnap.total_subscriptions_to_date, subSnap.total_subscriptions, subSnap.total_subscribers, subSnap.new_subscriptions]);
-    if (snapActive !== null) { totalActive = _num(snapActive); globalActiveKnown = true; }
-    if (snapPaused !== null) { totalPaused = _num(snapPaused); globalPausedKnown = true; }
-    if (snapCancelled !== null) totalCancelled = _num(snapCancelled);
-    if (snapTotal !== null) {
-    // Keep product totals from product-volume rows; snapshot totals stay in summary.
-    }
-  }
-  const activePausedRows = rows.filter(r => {
-    const src = String(r.source || "").toLowerCase();
-    return (src.includes("active/paused") || src.includes("smartrr active")) && !src.includes("fallback");
-  });
-  const globalActiveFromRows = activePausedRows.reduce((m, r) => Math.max(m, _num(activeOf(r))), 0);
-  const globalPausedFromRows = activePausedRows.reduce((m, r) => Math.max(m, _num(pausedOf(r))), 0);
-  if (globalActiveFromRows > totalActive) totalActive = globalActiveFromRows;
-  if (globalPausedFromRows > totalPaused) totalPaused = globalPausedFromRows;
-  const totalPausedInPeriod = sorted.reduce((a,r)=>a + _num(r.paused_subscribers_in_period), 0);
-  let totalToDateSummary = totalToDate;
-  if (subSnap) {
-    const snapTotal = firstNumber([subSnap.total_subscriptions_to_date, subSnap.total_subscriptions, subSnap.total_subscribers, subSnap.new_subscriptions]);
-    if (snapTotal !== null) totalToDateSummary = _num(snapTotal);
-  }
-  if ((totalCancelled === null || totalCancelled === undefined) && globalActiveKnown && globalPausedKnown && totalToDateSummary > 0 && totalActive >= 0 && totalPaused >= 0) {
-    totalCancelled = Math.max(0, totalToDateSummary - totalActive - totalPaused);
-  }
-  const totalGross = sorted.reduce((a,r)=>a + _num(r.gross_revenue), 0);
+    ql_obj = data.get("shopifyqlQuery") or {}
 
-  const newSubscriberRows = sorted.filter(r => _num(r.new_subscribers) > 0);
-  const newCards = newSubscriberRows.length ? newSubscriberRows.map(r => {
-    const product = cleanProductName(r.product_variant || "Other");
-    const col = palette[product] || "#72AEFF";
-    return `
-      <div class="kc-sub sm-sub-small">
-        <div class="kc-bar"></div>
-        <div class="kc-lbl" style="color:${col}">${product}</div>
-        <div class="sub-mini-label">New subscribers</div>
-        <div class="kc-val" style="color:${col}">${_num(r.new_subscribers).toLocaleString()}</div>
-        <div class="kc-note">Smartrr subscriber created in selected range only<br>Current active: ${showCount(r.active_subscribers_to_date)} · Current paused: ${showCount(r.paused_subscribers_to_date)}</div>
-      </div>`;
-  }).join('') : `<div style="font-size:12px;color:var(--tx3);padding:8px 2px">No new Smartrr subscribers created in selected range.</div>`;
+    # parseErrors = [String!]! — lista vacía [] cuando OK
+    errs = ql_obj.get("parseErrors") or []
+    if isinstance(errs, list) and len(errs) > 0:
+        print(f"    parseErrors: {errs}")
+        return []
 
-  const totalCards = sorted.map(r => {
-    const product = cleanProductName(r.product_variant || "Other");
-    const col = palette[product] || "#72AEFF";
-    const totalVal = r.total_subscribers_to_date !== null && r.total_subscribers_to_date !== undefined
-      ? r.total_subscribers_to_date
-      : null;
-    return `
-      <div class="kc-sub sm-sub-small">
-        <div class="kc-bar"></div>
-        <div class="kc-lbl" style="color:${col}">${product}</div>
-        <div class="sub-mini-label">Current active subscribers</div>
-        <div class="sub-total-box-row">
-          <div class="sub-total-box"><div class="sub-total-lbl">Current<br>active</div><div class="sub-total-val active">${showCount(r.active_subscribers_to_date)}</div></div>
-          <div class="sub-total-box"><div class="sub-total-lbl">Current<br>paused</div><div class="sub-total-val paused">${showCount(r.paused_subscribers_to_date)}</div></div>
-        </div>
-        <div class="kc-note">Current total: ${showCount(totalVal)} · Paused in period: ${showCount(r.paused_subscribers_in_period)}</div>
-      </div>`;
-  }).join('');
+    # tableData es null cuando hay parseErrors
+    td = ql_obj.get("tableData")
+    if not td:
+        return []
 
-  const subscriptionSalesSorted = Array.from(subscriptionSalesGrouped.values())
-    .sort((a,b) => _num(b.total_quantity) - _num(a.total_quantity))
-    .slice(0, 12);
-  const subscriptionSalesCards = subscriptionSalesSorted.map(r => {
-    const product = volumeProductName(r.product_variant || "Other");
-    const col = palette[cleanProductName(product)] || "#A090FF";
-    return `
-      <div class="kc-sub sm-sub-small">
-        <div class="kc-bar"></div>
-        <div class="kc-lbl" style="color:${col}">${product}</div>
-        <div class="sub-mini-label">Subscription sales qty</div>
-        <div class="kc-val" style="color:${col}">${_num(r.total_quantity).toLocaleString()}</div>
-        <div class="kc-note">Gross: ${fv(_num(r.gross_revenue),"$")}<br>Order sales quantity only · not subscriber count</div>
-      </div>`;
-  }).join('');
+    # rows = JSON! scalar → lista de dicts {"col_name": "value"}
+    rows = td.get("rows") or []
+    if not rows:
+        return []
 
-  const salesSorted = Array.from(salesGrouped.values())
-    .sort((a,b) => _num(b.total_quantity) - _num(a.total_quantity))
-    .slice(0, 12);
-  const salesCards = salesSorted.map(r => {
-    const product = volumeProductName(r.product_variant || "Other");
-    const col = palette[cleanProductName(product)] || "#72AEFF";
-    return `
-      <div class="kc-sub sm-sub-small">
-        <div class="kc-bar"></div>
-        <div class="kc-lbl" style="color:${col}">${product}</div>
-        <div class="sub-mini-label">Sales quantity</div>
-        <div class="kc-val" style="color:${col}">${_num(r.total_quantity).toLocaleString()}</div>
-        <div class="kc-note">Gross: ${fv(_num(r.gross_revenue),"$")}<br>Order sales quantity only · not subscriber count</div>
-      </div>`;
-  }).join('');
+    # Tipo esperado: lista de dicts
+    if isinstance(rows, list) and isinstance(rows[0], dict):
+        return rows
 
-  const deliveryTotal = 0;
+    # Fallback defensivo por si rows llega como string JSON
+    if isinstance(rows, str):
+        try:
+            parsed = json.loads(rows)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
 
-  el.innerHTML = `
-    <div class="smartrr-total-card">
-      <div class="kc-sub">
-        <div class="kc-bar"></div>
-        <div class="kc-lbl">New Subscribers</div>
-        <div class="kc-val">${totalNew.toLocaleString()}</div>
-        <div class="kc-note">Selected range: ${fmtD(opt.start)} – ${fmtD(opt.end)}<br>Smartrr subscriber-created rows only</div>
-      </div>
-      <div class="smartrr-total-note">
-        <strong>Subscription products from Smartrr (full product names)</strong>
-        <span>New subscribers in selected range: <strong>${totalNew.toLocaleString()}</strong></span>
-        <span>Current subscribers total: <strong>${(totalToDateSummary || totalToDateKnown) ? totalToDateSummary.toLocaleString() : "—"}</strong> · Current active: <strong>${globalActiveKnown ? totalActive.toLocaleString() : "—"}</strong> · Current paused: <strong>${globalPausedKnown ? totalPaused.toLocaleString() : "—"}</strong> · Cancelled: <strong>${totalCancelled !== null && totalCancelled !== undefined ? _num(totalCancelled).toLocaleString() : "—"}</strong></span>
-        <span>Paused subscriptions in selected range: <strong>${totalPausedInPeriod.toLocaleString()}</strong></span>
-        <span>Upcoming deliveries in selected range: <strong>Hidden for Cavali</strong></span>
-      </div>
-    </div>
-
-    <div class="smartrr-subtitle">New subscribers by subscription product (Smartrr only — not sales volume)</div>
-    <div class="smartrr-product-grid">${newCards}</div>
-
-    <div class="smartrr-subtitle">Current active subscribers by subscription product</div>
-    <div class="sub-total-grid">${totalCards}</div>
-
-    <div class="smartrr-subtitle">Subscription sales volume by product-variant (order quantity only — not subscriber count)</div>
-    <div class="smartrr-product-grid">${subscriptionSalesCards || '<div style="font-size:11px;color:var(--tx3)">No subscription sales volume in selected range.</div>'}</div>
-
-    <div class="smartrr-subtitle">One-time sales volume by product-variant (order quantity only)</div>
-    <div class="smartrr-product-grid">${salesCards || '<div style="font-size:11px;color:var(--tx3)">No one-time product sales in selected range.</div>'}</div>
-
-    `;
-}
-/* ══════════════════════════════════════════════════════
-   Q1 2026 SNAPSHOT
-══════════════════════════════════════════════════════ */
-
-async function renderQ1(kpiRows) {
-  const el   = document.getElementById("q1-grid");
-  const note = document.getElementById("q1-note");
-  if (!el) return;
-  const Q1_PK = "q1_2026", Q1_S = "2026-01-01", Q1_E = "2026-03-31";
-  let row = null;
-  if (kpiRows?.length) {
-    let m = kpiRows.filter(r=>r.period===Q1_PK);
-    if (!m.length) m = kpiRows.filter(r=>(r.period_start||"").trim()===Q1_S&&(r.period_end||"").trim()===Q1_E);
-    row = bestRow(m);
-  }
-  const prevQ = kpiRows?.length ? bestRow(kpiRows.filter(r=>r.period==="q4_2025")) : null;
-  if (!row) {
-    el.innerHTML=`<div style="font-size:11px;color:var(--tx3);padding:6px 0">Q1 2026 data not found. Run <strong style="color:var(--gd)">Backfill Historical Data</strong> action then refresh.</div>`;
-    if (note) note.innerHTML = "";
-    return;
-  }
-  const gp = resolveGrossProfit(row);
-  const fields = [
-    {k:"gross_sales",  l:"Gross Sales Q1",  f:"$"},
-    {k:"net_sales",    l:"Net Sales Q1",    f:"$"},
-    {k:"gross_profit", l:"Gross Profit Q1", f:"$", gp:true},
-    {k:"pct_gm",       l:"Gross Margin",    f:"%"},
-    {k:"nb_orders",    l:"Orders Q1",       f:""},
-    {k:"aov",          l:"AOV Q1",          f:"$"},
-  ];
-  el.innerHTML = fields.map(s => {
-    const val    = s.gp ? fv(gp,"$") : fv(row[s.k],s.f);
-    const cmpVal = s.gp ? (prevQ ? resolveGrossProfit(prevQ) : null) : (prevQ ? prevQ[s.k] : null);
-    return kcard(s.l, val, prevQ?pctChg(s.gp?gp:row[s.k], cmpVal):null, "Q4 25", "", "var(--gd)");
-  }).join('');
-  if (note) note.innerHTML = `Q1 2026 = Jan 1 – Mar 31, 2026. Updated: <strong>${row.updated_at||"—"}</strong>. Compared vs Q4 2025.`;
-}
-
-/* ══════════════════════════════════════════════════════
-   MANUAL DATA
-══════════════════════════════════════════════════════ */
-function mKey() { return `${brand}_${getOpt().val||"default"}`; }
-
-function loadManual() {
-  try { const d=localStorage.getItem("el_manual"); if(d) manualData=JSON.parse(d); } catch(e){}
-  try { const stored = localStorage.getItem("el_manual"); if (stored) manualData = JSON.parse(stored) || {}; } catch(e) {}
-  const m = manualData[mKey()]||{};
-  const setVal = (id, v) => { const el=document.getElementById(id); if(el) el.value=v||""; };
-  setVal("mi-spend",  m.spend||"");
-  setVal("mi-newcust",m.nc||"");
-  setVal("mi-ltv",    m.ltv||"");
-  setVal("mi-cac-ov", m.cacOv||"");
-  setVal("mi-ns",     m.ns||"");
-  setVal("mi-sea",    m.sea||"");
-  setVal("mi-sig",    m.sig||"");
-  setVal("mi-pre-sub",m.pre||"");
-  calcDerived();
-}
-
-function saveManual() {
-  manualData[mKey()] = {
-    spend: parseFloat(document.getElementById("mi-spend")?.value)||0,
-    nc:    parseInt(document.getElementById("mi-newcust")?.value)||0,
-    ltv:   parseFloat(document.getElementById("mi-ltv")?.value)||0,
-    cacOv: parseFloat(document.getElementById("mi-cac-ov")?.value)||0,
-    ns:    parseFloat(document.getElementById("mi-ns")?.value)||0,
-    sea:   parseInt(document.getElementById("mi-sea")?.value||0)||0,
-    sig:   parseInt(document.getElementById("mi-sig")?.value||0)||0,
-    pre:   parseInt(document.getElementById("mi-pre-sub")?.value||0)||0,
-  };
-  try { localStorage.setItem("el_manual", JSON.stringify(manualData)); } catch(e){}
-  const msg = document.getElementById("mi-msg");
-  if (msg) { msg.innerHTML = '<span class="saved-tag">✓ Saved</span>'; setTimeout(()=>msg.innerHTML="", 3000); }
-  render();
-}
-
-function clearManual() {
-  delete manualData[mKey()];
-  try { localStorage.setItem("el_manual", JSON.stringify(manualData)); } catch(e){}
-  ["mi-spend","mi-newcust","mi-ltv","mi-cac-ov","mi-ns","mi-sea","mi-sig","mi-pre-sub"].forEach(id=>{
-    const el=document.getElementById(id); if(el) el.value="";
-  });
-  calcDerived(); render();
-}
-
-function calcDerived() {
-  const spend = parseFloat(document.getElementById("mi-spend")?.value)||0;
-  const nc    = parseInt(document.getElementById("mi-newcust")?.value)||0;
-  const ltvIn = parseFloat(document.getElementById("mi-ltv")?.value)||0;
-  const ltv   = ltvIn > 0 ? ltvIn : DEFAULT_LTV_12M;
-  const cacOv = parseFloat(document.getElementById("mi-cac-ov")?.value)||0;
-  const nsOv  = parseFloat(document.getElementById("mi-ns")?.value)||0;
-  const roas  = nsOv>0&&spend>0 ? nsOv/spend : null;
-  const cacC  = nc>0&&spend>0   ? spend/nc   : null;
-  const cac   = cacOv>0 ? cacOv : cacC;
-  const ltvCac= cac&&ltv>0      ? ltv/cac    : null;
-  const dc = (l,v,f,c,n) => `<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div>${n?`<div class="kc-note">${n}</div>`:""}</div>`;
-  const der = document.getElementById("mi-derived");
-  if (der) der.innerHTML =
-    dc("G+M Ad Spend",  spend>0?spend:null, "$", "var(--gd)") +
-    dc("G+M ROAS",      roas,               "x", "var(--gr)", "Net Sales ÷ G+M spend") +
-    dc("CAC (G+M)",     cac,                "$", "var(--gd)", nc>0?"G+M spend ÷ new customers":"Enter new customers") +
-    dc("LTV / CAC",     ltvCac,             "x", "var(--gd)", "LTV-12M ÷ CAC") +
-    dc("LTV-12M",       ltv>0?ltv:null,     "$", "var(--pu)");
-  renderCAC(cac||0, ltvIn, spend>0?"G+M":"");
-}
-
-/* ══════════════════════════════════════════════════════
-   HELPERS
-══════════════════════════════════════════════════════ */
-function safeSet(id, val) { const el=document.getElementById(id); if(el) el.textContent=val; }
-function safeHTML(id, val) { const el=document.getElementById(id); if(el) el.innerHTML=val; }
+    return []
 
 
+def ql_row(store_url, token, ql_query):
+    rows = ql_run(store_url, token, ql_query)
+    return rows[-1] if rows else None
 
-/* ══════════════════════════════════════════════════════
-   EXTERNAL MARKETING SHEET — Total Shopify
-   Section 04 uses this sheet for Month/MTD and Quarter only.
-   Source: 1ROTaII-_S_0VntYvOZj8GFCoUnkQVcr1rPES0p-14mI / 'Total Shopify'
-══════════════════════════════════════════════════════ */
-let __marketingRowsCache = null;
-async function fetchMarketingRows(force=false){
-  if(__marketingRowsCache && !force) return __marketingRowsCache;
 
-  // IMPORTANT: sheet tabs with spaces must be requested as a real A1 range:
-  // 'Total Shopify'!A:Z. Requesting only Total%20Shopify can return HTTP 400.
-  const tabEsc = String(MARKETING_SHEET_TAB).replace(/'/g,"''");
-  const range = encodeURIComponent(`'${tabEsc}'!A:Z`);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MARKETING_SHEET_ID}/values/${range}?key=${AKEY}`;
-  const r = await fetch(url,{cache:"no-store"});
-  if(!r.ok){
-    const txt = await r.text().catch(()=>"");
-    throw new Error(`Marketing sheet HTTP ${r.status}: ${txt.slice(0,180)}`);
-  }
-  const d = await r.json();
-  __marketingRowsCache = __marketingValuesToRows(d.values||[]);
-  console.info("Marketing Total Shopify rows loaded", __marketingRowsCache.length, __marketingRowsCache.slice(0,3));
-  return __marketingRowsCache;
-}
-function __mkCleanHeader(v){return String(v||"").trim().toLowerCase().replace(/[^a-z0-9]/g,"");}
-function __marketingValuesToRows(values){
-  if(!Array.isArray(values) || !values.length) return [];
-  let headerIdx = -1;
-  for(let i=0;i<Math.min(values.length,40);i++){
-    const cleaned=(values[i]||[]).map(__mkCleanHeader);
-    const hasDate=cleaned.includes("date") || cleaned.includes("month");
-    const hasSpend=cleaned.includes("spend") || cleaned.includes("adspend");
-    const hasOrders=cleaned.includes("orders");
-    const hasSales=cleaned.includes("totalsales") || cleaned.includes("sales");
-    if(hasDate && (hasSpend || hasOrders || hasSales)){headerIdx=i;break;}
-  }
-  if(headerIdx<0) headerIdx=0;
-  const headers=(values[headerIdx]||[]).map(h=>String(h||"").trim());
-  const rows=[];
-  for(let i=headerIdx+1;i<values.length;i++){
-    const arr=values[i]||[];
-    if(!arr.some(x=>String(x||"").trim())) continue;
-    const obj={};
-    headers.forEach((h,j)=>{ if(h) obj[h]=arr[j]!==undefined?arr[j]:""; });
-    rows.push(obj);
-  }
-  return rows;
-}
-function _mkNum(v){
-  const s=String(v??"").replace(/[\$,%]/g,"").replace(/,/g,"").trim();
-  const n=parseFloat(s); return isNaN(n)?0:n;
-}
-function _mkMonthIndex(name){
-  const s=String(name||"").trim().toLowerCase().slice(0,3);
-  return MN.findIndex(x=>x.toLowerCase().slice(0,3)===s);
-}
-function _mkYearFromSuffix(v){
-  let y=parseInt(v,10);
-  if(isNaN(y)) return null;
-  if(y<10) y=2020+y;
-  else if(y<100) y=2000+y;
-  return y;
-}
-function _mkMetric(row, names){
-  for(const n of names){ if(row[n]!==undefined && row[n]!=="") return _mkNum(row[n]); }
-  const keys=Object.keys(row||{});
-  for(const n of names){
-    const nk=n.toLowerCase().replace(/[^a-z0-9]/g,'');
-    const key=keys.find(k=>k.toLowerCase().replace(/[^a-z0-9]/g,'')===nk);
-    if(key && row[key]!==undefined && row[key]!=="") return _mkNum(row[key]);
-  }
-  return 0;
-}
-function _mkRowsByMonth(rows){
-  const byMonth={};
-  let currentYear=null;
-  (rows||[]).forEach(r=>{
-    const raw=String(r.Date||r.date||r.Month||r.month||"").trim();
-    if(!raw) return;
+def _m(v):
+    if v is None:
+        return 0.0
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return 0.0
 
-    // Matches January-5 / January-6 / January-25 / January-2026.
-    let m=raw.match(/^([A-Za-z]+)\s*-\s*(\d{1,4})$/);
-    if(m){
-      const idx=_mkMonthIndex(m[1]);
-      const y=_mkYearFromSuffix(m[2]);
-      if(idx>=0 && y){
-        currentYear=y;
-        byMonth[`${y}-${String(idx+1).padStart(2,'0')}`]=r;
-      }
-      return;
+
+def _gm(v):
+    if v is None:
+        return 0.0
+    try:
+        f = float(str(v).replace("%", "").replace(",", "").strip())
+        return round(f * 100, 2) if abs(f) <= 1.0 else round(f, 2)
+    except Exception:
+        return 0.0
+
+
+def _until(e):
+    """ShopifyQL UNTIL es exclusivo cuando e == hoy. Pasamos e+1 para incluir el día actual."""
+    today = datetime.now(TIMEZONE).date()
+    if e >= today:
+        return e + timedelta(days=1)
+    return e
+
+# ─────────────────────────────────────────────────────────────────
+# FETCH: SALES
+# ─────────────────────────────────────────────────────────────────
+def fetch_sales(url, token, s, e):
+    e_ql = _until(e)
+    row  = ql_row(url, token,
+        f"FROM sales SHOW gross_sales, discounts, returns, net_sales, "
+        f"cost_of_goods_sold, gross_profit, gross_margin, orders "
+        f"SINCE {s} UNTIL {e_ql}")
+
+    if not row:
+        print(f"    ⚠ fetch_sales: sin datos para {s} → {e_ql}")
+        return {k: 0 for k in
+                ["gross_sales","discounts","returns","net_sales",
+                 "cogs","gross_profit","pct_gm","orders"]}
+
+    g  = round(_m(row.get("gross_sales")),        2)
+    d  = round(abs(_m(row.get("discounts"))),      2)
+    r  = round(abs(_m(row.get("returns"))),        2)
+    n  = round(_m(row.get("net_sales")),           2)
+    c  = round(_m(row.get("cost_of_goods_sold")),  2)
+    gp = round(_m(row.get("gross_profit")),        2)
+    gm = _gm(row.get("gross_margin"))
+    o  = int(abs(_m(row.get("orders"))))
+
+    print(f"    gross:{g:>12,.2f}  net:{n:>12,.2f}  gp:{gp:>10,.2f}  "
+          f"cogs:{c:>9,.2f}  gm:{gm:>5.1f}%  orders:{o}  [UNTIL {e_ql}]")
+
+    return {"gross_sales": g, "discounts": d, "returns": r, "net_sales": n,
+            "cogs": c, "gross_profit": gp, "pct_gm": gm, "orders": o}
+
+# ─────────────────────────────────────────────────────────────────
+# FETCH: SESSIONS
+# ─────────────────────────────────────────────────────────────────
+def fetch_sessions(url, token, s, e):
+    """
+    Section 01 source: Shopify only.
+
+    Formulas written to the dashboard:
+      - Traffic = sessions
+      - Unique Visitors = online_store_visitors
+      - Pageviews = pageviews
+      - CR% = ShopifyQL conversion_rate when available, fallback to Orders / Sessions
+      - Checkout Abandonment Rate = 100 - ShopifyQL checkout_conversion_rate when available
+
+    We do NOT query GA/Looker-only fields such as browser, screen_resolution,
+    or new_users. ShopifyQL confirmed those are not available here.
+
+    When available, Shopify's own bot classification is applied:
+      WHERE human_or_bot_session != 'human_bot'
+    If a metric is not available for any store/range, the function falls back
+    gracefully so the pipeline keeps running.
+    """
+    e_ql = _until(e)
+
+    def _first_nonzero(*vals):
+        for v in vals:
+            n = _m(v)
+            if n:
+                return n
+        return 0
+
+    base_row = ql_row(url, token,
+        f"FROM sessions SHOW online_store_visitors, sessions, pageviews, conversion_rate "
+        f"WHERE human_or_bot_session != 'human_bot' "
+        f"SINCE {s} UNTIL {e_ql}")
+
+    source = "ShopifyQL sessions + online_store_visitors + pageviews + conversion_rate; exclude human_bot"
+
+    if not base_row:
+        base_row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions, pageviews, conversion_rate "
+            f"SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors + pageviews + conversion_rate"
+
+    if not base_row:
+        # Minimal fallback if pageviews/conversion_rate are not accepted in any store.
+        base_row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions "
+            f"WHERE human_or_bot_session != 'human_bot' "
+            f"SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors; exclude human_bot"
+
+    if not base_row:
+        base_row = ql_row(url, token,
+            f"FROM sessions SHOW online_store_visitors, sessions SINCE {s} UNTIL {e_ql}")
+        source = "ShopifyQL sessions + online_store_visitors"
+
+    # Separate optional query: checkout_conversion_rate is not available in every shop/report.
+    checkout_rate = None
+    checkout_row = ql_row(url, token,
+        f"FROM sessions SHOW checkout_conversion_rate "
+        f"WHERE human_or_bot_session != 'human_bot' "
+        f"SINCE {s} UNTIL {e_ql}")
+    if not checkout_row:
+        checkout_row = ql_row(url, token,
+            f"FROM sessions SHOW checkout_conversion_rate SINCE {s} UNTIL {e_ql}")
+    if checkout_row:
+        checkout_rate = _gm(
+            checkout_row.get("checkout_conversion_rate")
+            or checkout_row.get("checkoutConversionRate")
+            or checkout_row.get("checkout conversion rate")
+        )
+
+    if not base_row:
+        print("    sessions: 0  online_store_visitors: 0  pageviews: 0  [ShopifyQL]")
+        return {"sessions": 0, "unique_visitors": 0, "pageviews": 0, "conversion_rate": 0, "checkout_abandonment_rate": "", "traffic_source": source}
+
+    sessions = int(abs(_m(base_row.get("sessions", 0))))
+    unique = int(abs(_m(base_row.get("online_store_visitors", 0))))
+    pageviews = int(abs(_m(base_row.get("pageviews", 0))))
+    conversion_rate = _gm(base_row.get("conversion_rate"))
+
+    # Abandonment = Reached checkout not completed / reached checkout.
+    # ShopifyQL exposes the inverse as checkout_conversion_rate when available.
+    checkout_abandonment = ""
+    if checkout_rate is not None and checkout_rate >= 0:
+        checkout_abandonment = round(max(0, min(100, 100 - checkout_rate)), 4)
+
+    print(f"    sessions: {sessions:,}  online_store_visitors: {unique:,}  pageviews: {pageviews:,}  cr:{conversion_rate}%  checkout_abandonment:{checkout_abandonment}  [{source}]")
+    return {
+        "sessions": sessions,
+        "unique_visitors": unique,
+        "pageviews": pageviews,
+        "conversion_rate": conversion_rate,
+        "checkout_abandonment_rate": checkout_abandonment,
+        "traffic_source": source,
     }
 
-    // Matches rows like February, March, April after January-6; keep the last explicit year.
-    m=raw.match(/^([A-Za-z]+)$/);
-    if(m && currentYear){
-      const idx=_mkMonthIndex(m[1]);
-      if(idx>=0){
-        byMonth[`${currentYear}-${String(idx+1).padStart(2,'0')}`]=r;
-        return;
-      }
+
+def fetch_orders_fulfilled(url, token, s, e):
+    e_ql = _until(e)
+    row  = ql_row(url, token,
+        f"FROM fulfillments SHOW orders_fulfilled SINCE {s} UNTIL {e_ql}")
+    if not row:
+        return None
+    v = int(abs(_m(row.get("orders_fulfilled", 0))))
+    print(f"    orders_fulfilled: {v:,}")
+    return v
+
+# ─────────────────────────────────────────────────────────────────
+# FETCH: REST ORDERS (new vs returning)
+# ─────────────────────────────────────────────────────────────────
+def rest(store_url, token, endpoint, params):
+    url     = f"https://{store_url}/admin/api/2024-01/{endpoint}"
+    headers = {"X-Shopify-Access-Token": token}
+    results = []
+
+    while url:
+        last_resp = None
+        for attempt in range(8):
+            r = requests.get(url, headers=headers, params=params, timeout=60)
+            last_resp = r
+
+            if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    sleep_for = float(retry_after) if retry_after else min(60, (2 ** attempt) + random.random())
+                except Exception:
+                    sleep_for = min(60, (2 ** attempt) + random.random())
+                print(f"    Shopify REST {r.status_code} on {endpoint}; retrying in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                continue
+
+            r.raise_for_status()
+            break
+        else:
+            if last_resp is not None:
+                last_resp.raise_for_status()
+            return results
+
+        data = r.json()
+        key  = list(data.keys())[0]
+        results.extend(data[key])
+
+        # Be gentle with Shopify REST pagination.
+        lim = r.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+        try:
+            used, cap = [int(x) for x in lim.split("/", 1)]
+            if cap and used / cap >= 0.75:
+                time.sleep(0.75)
+        except Exception:
+            pass
+
+        link = r.headers.get("Link", "")
+        url  = None
+        params = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+    return results
+
+
+
+
+
+CUSTOMER_ORDER_COUNT_CACHE = {}
+CUSTOMER_FIRST_ORDER_DATE_CACHE = {}
+
+
+def _shopify_rest_get_json_with_retry(store_url, token, endpoint, params=None, max_retries=7):
+    """Small REST GET helper for customer enrichment, with 429/5xx retry."""
+    url = f"https://{store_url}/admin/api/2024-01/{endpoint}"
+    headers = {"X-Shopify-Access-Token": token}
+    params = params or {}
+    last_resp = None
+    for attempt in range(max_retries):
+        r = requests.get(url, headers=headers, params=params, timeout=60)
+        last_resp = r
+        if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep_for = float(retry_after)
+                except Exception:
+                    sleep_for = 2.0
+            else:
+                sleep_for = min(45, (2 ** attempt) + random.random())
+            print(f"    Shopify REST {r.status_code} on {endpoint}; retrying in {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+            continue
+        r.raise_for_status()
+        lim = r.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+        try:
+            used, cap = [int(x) for x in lim.split("/", 1)]
+            if cap and used / cap >= 0.80:
+                time.sleep(0.75)
+        except Exception:
+            pass
+        return r.json()
+    if last_resp is not None:
+        last_resp.raise_for_status()
+    return {}
+
+
+def _order_customer_id(order):
+    customer = order.get("customer") or {}
+    cid = customer.get("id")
+    return str(cid) if cid not in (None, "") else ""
+
+
+def enrich_orders_with_customer_order_counts(store_url, token, orders):
+    """
+    Enrich each order with:
+      - customer.orders_count when available
+      - customer._first_order_created_at from Shopify Customer Orders
+
+    New vs Returning is then date-aware:
+      first-ever order before this order => Returning
+      this is the customer's first-ever order => New
+    This avoids the dashboard showing every Cavali subscription order as New.
+    """
+    ids = []
+    seen = set()
+    for o in orders or []:
+        cid = _order_customer_id(o)
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        customer = o.get("customer") or {}
+        current = customer.get("orders_count")
+        if current not in (None, ""):
+            try:
+                CUSTOMER_ORDER_COUNT_CACHE[cid] = int(current)
+            except Exception:
+                pass
+        if cid not in CUSTOMER_FIRST_ORDER_DATE_CACHE:
+            ids.append(cid)
+
+    for i, cid in enumerate(ids, 1):
+        try:
+            data = _shopify_rest_get_json_with_retry(
+                store_url, token, f"customers/{cid}/orders.json",
+                {"status": "any", "limit": 1, "order": "created_at asc", "fields": "id,created_at"}
+            )
+            first_order = (data.get("orders") or [{}])[0]
+            CUSTOMER_FIRST_ORDER_DATE_CACHE[cid] = first_order.get("created_at") or ""
+        except Exception as e:
+            print(f"    ⚠ first-order fallback cid={cid}: {e}")
+            CUSTOMER_FIRST_ORDER_DATE_CACHE[cid] = ""
+
+        # orders_count is only used as fallback if first-order lookup fails.
+        if cid not in CUSTOMER_ORDER_COUNT_CACHE:
+            try:
+                data = _shopify_rest_get_json_with_retry(store_url, token, f"customers/{cid}.json", {"fields": "id,orders_count"})
+                customer = data.get("customer") or {}
+                CUSTOMER_ORDER_COUNT_CACHE[cid] = int(customer.get("orders_count", 1) or 1)
+            except Exception as e:
+                print(f"    ⚠ customer orders_count fallback cid={cid}: {e}")
+                CUSTOMER_ORDER_COUNT_CACHE[cid] = 1
+
+        if i % 35 == 0:
+            time.sleep(0.5)
+
+    for o in orders or []:
+        cid = _order_customer_id(o)
+        if not cid:
+            continue
+        if not o.get("customer"):
+            o["customer"] = {"id": cid}
+        o["customer"]["orders_count"] = CUSTOMER_ORDER_COUNT_CACHE.get(cid, o["customer"].get("orders_count", 1))
+        o["customer"]["_first_order_created_at"] = CUSTOMER_FIRST_ORDER_DATE_CACHE.get(cid, "")
+    return orders
+
+
+def fetch_new_vs_returning(url, token, s, e):
+    orders = rest(url, token, "orders.json", {
+        "status":           "any",
+        "financial_status": "paid,partially_paid,partially_refunded,refunded",
+        "created_at_min":   f"{s}T00:00:00-05:00",
+        "created_at_max":   f"{e}T23:59:59-05:00",
+        "limit":            250,
+        "fields":           "id,subtotal_price,created_at,customer",
+    })
+    orders = enrich_orders_with_customer_order_counts(url, token, orders)
+
+    result = {
+        "new_customers":          0,
+        "returning_customers":    0,
+        "new_revenue":            0.0,
+        "returning_revenue":      0.0,
     }
 
-    // Fallback for real date values.
-    const d=new Date(raw+'T12:00');
-    if(!isNaN(d)) byMonth[`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`]=r;
-  });
-  return byMonth;
-}
-function calcMarketingFromTotalShopify(rows,opt){
-  const byMonth=_mkRowsByMonth(rows);
-  let months=[];
-  if(ptype==="quarter"){
-    const startY=parseInt(opt.start.slice(0,4),10), startM=parseInt(opt.start.slice(5,7),10);
-    const endY=parseInt(opt.end.slice(0,4),10), endM=parseInt(opt.end.slice(5,7),10);
-    let y=startY, m=startM;
-    while(y<endY || (y===endY && m<=endM)){
-      months.push(`${y}-${String(m).padStart(2,'0')}`);
-      m++; if(m>12){m=1;y++;}
+    for o in orders:
+        amt      = float(o.get("subtotal_price", 0) or 0)
+        customer = o.get("customer") or {}
+        first_dt = _parse_shopify_dt(customer.get("_first_order_created_at"))
+        order_dt = _parse_shopify_dt(o.get("created_at"))
+        if first_dt and order_dt:
+            is_returning = first_dt < order_dt
+        else:
+            count = int(customer.get("orders_count", 1) or 1)
+            is_returning = count > 1
+
+        if is_returning:
+            result["returning_customers"] += 1
+            result["returning_revenue"]   += amt
+        else:
+            result["new_customers"] += 1
+            result["new_revenue"]   += amt
+
+    result["new_revenue"]       = round(result["new_revenue"],       2)
+    result["returning_revenue"] = round(result["returning_revenue"],  2)
+
+    print(f"    new_customers:{result['new_customers']:>5}  "
+          f"new_rev:{result['new_revenue']:>10,.2f}  "
+          f"ret:{result['returning_customers']:>5}  "
+          f"ret_rev:{result['returning_revenue']:>10,.2f}")
+    return result
+
+
+def fetch_orders(url, token, s, e):
+    orders = rest(url, token, "orders.json", {
+        "status":           "any",
+        "financial_status": "paid,partially_paid,partially_refunded,refunded",
+        "created_at_min":   f"{s}T00:00:00-05:00",
+        "created_at_max":   f"{e}T23:59:59-05:00",
+        "limit":            250,
+        "fields":           "id,subtotal_price,created_at,line_items,source_name,tags,customer",
+    })
+    return enrich_orders_with_customer_order_counts(url, token, orders)
+
+
+def calc_units(orders):
+    return sum(
+        sum(int(li.get("quantity", 0) or 0) for li in o.get("line_items", []))
+        for o in orders
+    )
+
+
+def classify_revenue_channel(order):
+    """
+    Classify a Shopify order for the Revenue Share breakdown.
+
+    Business rule added for Corro:
+      - HITS must be separated from Wellington / Ecommerce.
+      - HITS is evaluated BEFORE POS/Wellington because a HITS order can also
+        have source_name=pos. Without this precedence it was being counted
+        inside Wellington (POS).
+      - Regular web/Shopify orders remain stored as "Online" for backwards
+        compatibility; dashboard.html presents this as "Ecommerce" for Corro.
+
+    This does not change total sales; it only redistributes the existing
+    revenue-share buckets.
+    """
+    src  = (order.get("source_name") or "").lower().strip()
+    tags = (order.get("tags") or "").lower().strip()
+
+    # HITS / HITS Hudson / HITS Houston / tags such as "missing hits Houston".
+    # Word-boundary matching avoids accidental partial-word matches.
+    is_hits = bool(re.search(r"\\bhits\\b", tags)) or bool(re.search(r"\\bhits\\b", src))
+    if is_hits:
+        return "HITS"
+
+    if src == "pos" or "wellington" in tags or bool(re.search(r"(^|[,;\\s])pos($|[,;\\s])", tags)):
+        return "Wellington (POS)"
+    if "concierge" in tags or "concierge" in src:
+        return "Concierge"
+    if src in ("web", "shopify", "", "online_store") or not src:
+        return "Online"
+    return "Others"
+
+
+def calc_rs(orders, overall_gm_pct):
+    """
+    Revenue share by channel.
+
+    Important: Gross Profit by channel is NOT estimated here anymore.
+    The dashboard only shows GP when a real channel-level GP source exists.
+    """
+    ch = {
+        "Wellington (POS)": 0.,
+        "HITS": 0.,
+        "Concierge": 0.,
+        "Online": 0.,
+        "Others": 0.,
     }
-  }else{
-    months=[opt.start.slice(0,7)];
-  }
+    total = 0.
 
-  let spend=0, orders=0, sales=0, matched=[];
-  months.forEach(ym=>{
-    const r=byMonth[ym];
-    if(!r) return;
-    spend += _mkMetric(r,["Spend","Ad Spend","Google+Meta Spend","Google + META Spend"]);
-    orders += _mkMetric(r,["Orders","Transactions"]);
-    sales += _mkMetric(r,["Total Sales","Sales","Net Sales"]);
-    matched.push(ym);
-  });
-  const roas = spend>0 ? sales/spend : null;
-  const cos  = sales>0 ? spend/sales*100 : null;
-  const cac  = orders>0 ? spend/orders : null;
-  const aov  = orders>0 ? sales/orders : null;
-  return {spend,orders,sales,roas,cos,cac,aov,matched,available:Object.keys(byMonth).sort()};
-}
-async function renderMarketingFromTotalShopify(opt, force=false){
-  if(ptype==="week"){
-    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">Month / MTD or Quarter only</div><div class="kc-note">Section 04 uses the Total Shopify monthly sheet, so weekly marketing KPIs are disabled.</div></div>`);
-    renderCAC(0,0,"Total Shopify sheet");
-    return true;
-  }
-  try{
-    const rows=await fetchMarketingRows(force);
-    const m=calcMarketingFromTotalShopify(rows,opt);
-    const note=m.matched.length?`Total Shopify: ${m.matched.join(', ')}`:`No month rows matched. Available: ${m.available.slice(-8).join(', ')}`;
-    const dc=(l,v,f,c,n)=>`<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div><div class="kc-note">${n||note}</div></div>`;
-    safeHTML("s-mkt",
-      dc("Ad Spend", m.spend>0?m.spend:null, "$", "var(--gd)", note)+
-      dc("ROAS", m.roas!==null&&m.roas!==undefined ? m.roas*100 : null, "%", m.roas?"var(--gr)":"var(--bd)", "Total Sales ÷ Spend")+
-      dc("CAC", m.cac, "$", "var(--gd)", "Spend ÷ Orders")+
-      dc("AOV", m.aov, "$", "var(--pu)", "Total Sales ÷ Orders")+
-      dc("COS", m.cos, "%", "var(--am)", "Spend ÷ Total Sales")
-    );
-    renderCAC(m.cac||0,0,"Total Shopify sheet");
-    return true;
-  }catch(e){
-    console.warn("Marketing Total Shopify fetch failed", e);
-    safeHTML("s-mkt", `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--rd)"></div><div class="kc-lbl">Marketing KPIs</div><div class="kc-val">—</div><div class="kc-note">Could not read Total Shopify sheet. Check API key access or share the Stats sheet as viewer.</div></div>`);
-    return true;
-  }
-}
+    for o in orders:
+        amt = float(o.get("subtotal_price", 0) or 0)
+        total += amt
+        channel = classify_revenue_channel(o)
+        ch[channel] = ch.get(channel, 0.) + amt
 
-/* ══════════════════════════════════════════════════════
-   MAIN RENDER
-══════════════════════════════════════════════════════ */
-async function render() {
-  const token = ++__renderToken;
-  const renderBrand = brand;
-  const renderPtype = ptype;
-  const opt = getOpt();
-  const renderOptVal = opt?.val || "";
-  const isStale = () => token !== __renderToken || renderBrand !== brand || renderPtype !== ptype || renderOptVal !== (getOpt()?.val || "");
+    # Diagnostics make the daily GitHub Actions run easy to validate without
+    # changing any dashboard functionality.
+    if orders:
+        print(
+            "    revenue channels: "
+            + " | ".join(f"{name}=${value:,.2f}" for name, value in ch.items())
+        )
 
-  renderSelbar();
+    result = {}
+    for k, v in ch.items():
+        pct = round(v / total * 100, 2) if total else 0
+        result[k] = {
+            "amount":         round(v, 2),
+            "pct":            pct,
+            "gross_profit":   "",
+            "gross_margin":   "",
+            "gp_is_estimate": False,
+        }
+    return result
 
-  const root = document.getElementById("app-root");
-  if (root) root.classList.toggle("is-cavali", renderBrand==="cavali");
-  safeSet("mi-num", renderBrand==="cavali" ? "07" : "06");
+# ─────────────────────────────────────────────────────────────────
+# BUILD KPI DICT
+# ─────────────────────────────────────────────────────────────────
+def build(sales, orders, nvr, sessions=0, orders_fulfilled=None):
+    g  = sales.get("gross_sales",  0)
+    d  = sales.get("discounts",    0)
+    r  = sales.get("returns",      0)
+    n  = sales.get("net_sales",    0)
+    c  = sales.get("cogs",         0)
+    gp = sales.get("gross_profit", 0)
+    gm = sales.get("pct_gm",       0)
+    nb = int(orders_fulfilled) if orders_fulfilled is not None \
+         else (sales.get("orders", 0) or len(orders))
 
-  const skelIds = { "s-web": 5, "s-emma": 6, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
-  Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
+    units = calc_units(orders)
+    aov   = round(n / nb,     2) if nb   else 0
+    upo   = round(units / nb, 2) if nb   else 0
+    pdisc = round(d / g * 100, 2) if g   else 0
+    pret  = round(r / g * 100, 2) if g   else 0
+    if isinstance(sessions, dict):
+        sess = int(sessions.get("sessions") or 0)
+        uv   = int(sessions.get("unique_visitors") or sessions.get("new_users") or 0)
+        pageviews = int(sessions.get("pageviews") or 0)
+        shopify_cr = sessions.get("conversion_rate")
+        checkout_abandonment_rate = sessions.get("checkout_abandonment_rate", "")
+    else:
+        sess = int(sessions or 0)
+        uv   = 0
+        pageviews = 0
+        shopify_cr = None
+        checkout_abandonment_rate = ""
+    # CR% = ShopifyQL conversion_rate when available. Fallback to Transactions / Sessions.
+    transactions = int(sales.get("orders", 0) or nb or 0)
+    try:
+        cr = round(float(shopify_cr), 4) if shopify_cr not in (None, "", "None") else (round(transactions / sess * 100, 4) if sess else 0)
+    except Exception:
+        cr = round(transactions / sess * 100, 4) if sess else 0
 
-  const ovEl  = document.getElementById("ov");
-  const ovLbl = document.getElementById("ov-lbl");
-  if (ovLbl) ovLbl.textContent = `Loading ${renderBrand==="corro"?"Corro":"Cavali"}...`;
-  if (ovEl) ovEl.classList.add("show");
+    gm_rate = gm / 100 if gm > 0 else (gp / n if n > 0 else 0)
+    new_gp  = round(nvr.get("new_revenue",       0) * gm_rate, 2)
+    ret_gp  = round(nvr.get("returning_revenue", 0) * gm_rate, 2)
 
-  const sid = SIDS[renderBrand];
-  const tabData = await fetchTabsBatch(sid, ["kpis_daily", "revenue_share", "new_vs_returning", "ad_spend"]);
-  if (isStale()) return;
-  const kpiR = tabData.kpis_daily || [];
-  const rsR  = tabData.revenue_share || [];
-  const nvrR = tabData.new_vs_returning || [];
-  const adR  = tabData.ad_spend || [];
-
-  const row              = findRow(kpiR, opt);
-  const { row:cmpRow, lbl:cmpLbl } = findCmp(kpiR, opt);
-  const cmpShort         = selCmp==="yoy"?"YOY":selCmp==="prev"?"PREV":"—";
-
-  // Website
-  const emmaForCompare = getEmmaCorroData(opt);
-  safeHTML("s-web", DEFS.web.map(s => {
-    const val = row ? fv(row[s.k], s.f) : "—";
-    const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
-    const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
-
-    const emmaComparable = brand === 'corro'
-      && emmaForCompare && emmaForCompare.state === 'ok'
-      && (s.k === 'sessions' || s.k === 'conversion_rate');
-
-    if (emmaComparable) {
-      const emmaKey = s.k === 'sessions' ? 'sessions' : 'cr_sessions';
-      const emmaVal = fv(emmaForCompare.data[emmaKey], s.f);
-      const emmaNote = s.k === 'sessions'
-        ? `Emma sessions · ${emmaForCompare.note || 'CRM snapshot'}`
-        : `Emma CR% Sessions · ${emmaForCompare.note || 'CRM snapshot'}`;
-      const shopNote = s.k === 'sessions'
-        ? 'Shopify sessions · ShopifyQL direct'
-        : 'Shopify conversion rate · ShopifyQL';
-      return kcardCompare(s.l, val, pct, cmpShort, shopNote, emmaVal, emmaNote, s.inv||false);
+    return {
+        "gross_sales":            g,
+        "net_sales":              n,
+        "gross_profit":           gp,
+        "total_discounts":        d,
+        "total_returns":          r,
+        "cogs":                   c,
+        "pct_discount":           pdisc,
+        "pct_returns":            pret,
+        "pct_gm":                 gm,
+        "nb_orders":              nb,
+        "nb_units":               units,
+        "aov":                    aov,
+        "units_per_order":        upo,
+        "sessions":               sess,
+        "unique_visitors":        uv,
+        "pageviews":              pageviews,
+        "conversion_rate":        cr,
+        "checkout_abandonment_rate": checkout_abandonment_rate,
+        "transactions":           transactions,
+        "new_customers":          nvr.get("new_customers",       0),
+        "returning_customers":    nvr.get("returning_customers", 0),
+        "new_revenue":            nvr.get("new_revenue",         0),
+        "returning_revenue":      nvr.get("returning_revenue",   0),
+        "new_gross_profit":       new_gp,
+        "returning_gross_profit": ret_gp,
     }
 
-    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, s.inv||false);
-  }).join(''));
-  renderEmma(opt);
 
-  // Financial
-  safeHTML("s-fin", DEFS.fin.map(s => {
-    let val, pct;
-    if (s.k === "gross_profit") {
-      const gpCur = row ? resolveGrossProfit(row) : null;
-      const gpCmp = cmpRow ? resolveGrossProfit(cmpRow) : null;
-      val = fv(gpCur, s.f);
-      pct = (gpCur !== null && gpCmp !== null) ? pctChg(gpCur, gpCmp) : null;
-    } else {
-      val = row ? fv(row[s.k], s.f) : "—";
-      const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
-      pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
+def make_kpi_row(now_str, period_key, s, e, cur):
+    return [
+        now_str, period_key, str(s), str(e),
+        cur.get("gross_sales",            0),
+        cur.get("net_sales",              0),
+        cur.get("gross_profit",           0),
+        cur.get("total_discounts",        0),
+        cur.get("total_returns",          0),
+        cur.get("cogs",                   0),
+        cur.get("pct_discount",           0),
+        cur.get("pct_returns",            0),
+        cur.get("pct_gm",                 0),
+        cur.get("nb_orders",              0),
+        cur.get("nb_units",               0),
+        cur.get("aov",                    0),
+        cur.get("units_per_order",        0),
+        cur.get("sessions",               0),
+        cur.get("unique_visitors",        0),
+        cur.get("pageviews",              0),
+        cur.get("conversion_rate",        0),
+        cur.get("checkout_abandonment_rate", ""),
+        cur.get("new_customers",          0),
+        cur.get("returning_customers",    0),
+        cur.get("new_revenue",            0),
+        cur.get("returning_revenue",      0),
+        cur.get("new_gross_profit",       0),
+        cur.get("returning_gross_profit", 0),
+    ]
+
+# ─────────────────────────────────────────────────────────────────
+# PERIODS
+# ─────────────────────────────────────────────────────────────────
+def get_periods():
+    today = datetime.now(TIMEZONE).date()
+    dow   = today.weekday()  # 0=Mon
+
+    mtd_s  = today.replace(day=1)
+    mtd_e  = today
+    mtd_pk = f"mtd_{today.strftime('%Y-%m')}"
+
+    prev_mo_end    = mtd_s - timedelta(days=1)
+    prev_mo_s      = prev_mo_end.replace(day=1)
+    prev_mo_mtd_e  = prev_mo_end.replace(day=min(today.day, prev_mo_end.day))
+    prev_mo_mtd_pk = f"mtd_{prev_mo_s.strftime('%Y-%m')}"
+
+    yoy_mtd_s = mtd_s.replace(year=mtd_s.year - 1)
+    yoy_mtd_e = today.replace(year=today.year - 1)
+    yoy_mtd_pk = f"mtd_{yoy_mtd_s.strftime('%Y-%m')}"
+
+    wk_s   = today - timedelta(days=dow)
+    wk_e   = today
+    wk_pk  = f"week_{wk_s}"
+
+    pwk_e  = wk_s - timedelta(days=1)
+    pwk_s  = pwk_e - timedelta(days=6)
+    pwk_pk = f"week_{pwk_s}"
+
+    yoy_wk_s = wk_s - timedelta(days=364)
+    yoy_wk_e = wk_e - timedelta(days=364)
+
+    mo_e   = mtd_s - timedelta(days=1)
+    mo_s   = mo_e.replace(day=1)
+    mo_pk  = mo_s.strftime("%Y-%m")
+
+    pmo_e  = mo_s - timedelta(days=1)
+    pmo_s  = pmo_e.replace(day=1)
+    pmo_pk = pmo_s.strftime("%Y-%m")
+
+    yoy_mo_s = mo_s.replace(year=mo_s.year - 1)
+    yoy_mo_e = mo_e.replace(year=mo_e.year - 1)
+
+    q_num = (today.month - 1) // 3 + 1
+    q_s   = today.replace(month=(q_num - 1) * 3 + 1, day=1)
+    q_e   = today
+    q_pk  = f"q{q_num}_{today.year}"
+
+    pq    = q_num - 1 if q_num > 1 else 4
+    pq_y  = today.year if q_num > 1 else today.year - 1
+    pq_s  = date(pq_y, (pq - 1) * 3 + 1, 1)
+    pq_em = pq * 3
+    pq_e  = date(pq_y, pq_em, calendar.monthrange(pq_y, pq_em)[1])
+    pq_pk = f"q{pq}_{pq_y}"
+
+    yoy_q_s  = q_s.replace(year=q_s.year - 1)
+    yoy_q_e  = today.replace(year=today.year - 1)
+    yoy_q_pk = f"q{q_num}_{today.year - 1}"
+
+    return {
+        "mtd":          (mtd_s,        mtd_e,         mtd_pk),
+        # Keep MTD comparison rows as exact date-to-date ranges (e.g. May 1–7 vs Apr 1–7).
+        "mtd_prev":     (prev_mo_s,    prev_mo_mtd_e, prev_mo_mtd_pk),
+        "mtd_yoy":      (yoy_mtd_s,    yoy_mtd_e,     yoy_mtd_pk),
+        "week":         (wk_s,         wk_e,           wk_pk),
+        "week_prev":    (pwk_s,        pwk_e,          pwk_pk),
+        "week_yoy":     (yoy_wk_s,     yoy_wk_e,       f"week_{yoy_wk_s}"),
+        "month":        (mo_s,         mo_e,            mo_pk),
+        "month_prev":   (pmo_s,        pmo_e,           pmo_pk),
+        "month_yoy":    (yoy_mo_s,     yoy_mo_e,        yoy_mo_s.strftime("%Y-%m")),
+        "quarter":      (q_s,          q_e,             q_pk),
+        "quarter_prev": (pq_s,         pq_e,            pq_pk),
+        "quarter_yoy":  (yoy_q_s,      yoy_q_e,         yoy_q_pk),
     }
-    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, s.inv||false);
-  }).join(''));
-
-  // Operational
-  safeHTML("s-op", DEFS.op.map(s => {
-    const val = row ? fv(row[s.k], s.f) : "—";
-    const cmpVal = row ? cmpMetricValue(kpiR, opt, cmpRow, s.k) : null;
-    const pct = row && cmpVal !== null ? pctChg(row[s.k], cmpVal) : null;
-    return kcard(s.l, val, pct, cmpShort, s.n||"", undefined, false);
-  }).join(''));
-
-  // FCS
-  renderFCS(row);
-
-  // Revenue Share
-  renderRS(rsR, row);
-
-  // New vs Returning
-  renderNVR(nvrR, row);
-
-  // Marketing KPIs — Section 04 now comes only from external "Total Shopify" sheet.
-  if (isStale()) return;
-  await renderMarketingFromTotalShopify(opt, false);
-  if (isStale()) return;
-
-  const ftManual = document.getElementById("ft-manual");
-  if (ftManual) ftManual.style.display = "none";
-  const ftRoas = document.getElementById("ft-roas");
-  if (ftRoas) { ftRoas.textContent = "ROAS: Total Shopify"; ftRoas.style.color = "var(--gd)"; }
-  const roasWarnEl = document.getElementById("roas-warn");
-  if (roasWarnEl) roasWarnEl.classList.remove("show");
-
-  if (isStale()) return;
-  if (renderBrand==="cavali") {
-    await renderSubs();
-    if (isStale()) return;
-  }
-
-  renderIbar(opt, cmpLbl);
-  loadManual();
-
-  if (row) {
-    const upd = row.updated_at||"";
-    safeSet("foot-txt", `Last updated: ${upd} · Shopify → Sheets → Dashboard`);
-    safeSet("sb-upd", upd.slice(0,10)||"Today");
-  }
-
-  if (ovEl) ovEl.classList.remove("show");
-}
-
-/* ══════════════════════════════════════════════════════
-   UI CONTROLS
-══════════════════════════════════════════════════════ */
-function togglePanel(id) { const el=document.getElementById(id); if(el) el.classList.toggle("open"); }
-function forceRefresh() {
-  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
-  try { Object.keys(localStorage).filter(k=>k.startsWith("el_sheet_cache__")).forEach(k=>localStorage.removeItem(k)); } catch(e) {}
-  const btn = document.querySelector(".rf-btn");
-  if (btn) btn.style.opacity = ".5";
-  render().then(()=>{ if(btn) btn.style.opacity="1"; });
-}
-function setBrand(b) {
-  b = (b === "corro" || b === "cavali") ? b : "corro";
-  brand = b;
-  __renderToken++;
-  document.querySelectorAll(".brand-btn").forEach(el=>el.classList.toggle("on",el.textContent.trim().toLowerCase()===b));
-  safeSet("ph-title", (b==="corro"?"Corro":"Cavali")+" — Performance");
-  ["s-web","s-emma","s-fin","s-op","s-mkt"].forEach((id,i)=>safeHTML(id, skel([5,6,9,4,4][i])));
-  safeHTML("rs-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
-  safeHTML("nvr-grid", `<div style="font-size:11px;color:var(--tx3)">Loading...</div>`);
-  _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
-  render();
-}
-function setPT(p, el) {
-  ptype = p;
-  document.querySelectorAll(".period-btn").forEach(x=>x.classList.remove("on"));
-  if (el) el.classList.add("on");
-  render();
-}
-function toggleTheme() {
-  const h=document.documentElement, dk=h.getAttribute("data-theme")==="dark";
-  h.setAttribute("data-theme", dk?"light":"dark");
-  const btn = document.getElementById("theme-btn");
-  if (btn) btn.textContent = dk?"☀":"☾";
-}
-
-setInterval(()=>{ render(); }, 15*60*1000);
-renderSelbar();
-setBrand("cavali");
-</script>
 
 
-<script>
-(function(){
-  const qs = new URLSearchParams(location.search);
-  const b = (qs.get("brand") || "").toLowerCase();
-  if ((b === "corro" || b === "cavali") && typeof window.setBrand === "function") {
-    setTimeout(function(){ window.setBrand(b); }, 0);
-  }
-})();
-</script>
+# ─────────────────────────────────────────────────────────────────
+# SMARTRR — product volume by Product-Variant using CREATED DATE
+# ─────────────────────────────────────────────────────────────────
+
+SMARTRR_PRODUCT_VOLUME_HEADERS = [
+    "updated_at", "brand", "period", "period_start", "period_end",
+    "product_variant", "sku",
+    "total_quantity", "new_subscribers",
+    # Named *_current so the dashboard JS reads them via activeOf / pausedOf / cancelledOf
+    "active_subscribers_current", "paused_subscribers_current", "cancelled_subscribers_current",
+    "gross_revenue", "source", "date_basis", "active_filter", "sample_line_ids",
+]
 
 
-<script>
-(function(){
-  function getSession(){
-    return window.__PORTAL_SESSION__ || (function(){
-      try { return JSON.parse(sessionStorage.getItem("corro_dashboard_auth_v3") || localStorage.getItem("corro_dashboard_auth_v3") || "null"); }
-      catch(e){ return null; }
-    })();
-  }
-  function norm(v){ return String(v||"").trim().toLowerCase(); }
-  function tokensOf(s){
-    const raw = String(s && (s.accessRaw || (Array.isArray(s.access) ? s.access.join(",") : s.access)) || "");
-    const low = raw.toLowerCase();
-    if (s && (s.all === true || low === "all" || low.includes("all reports") || low.includes("todos"))) return ["all"];
-    if (Array.isArray(s && s.access)) return s.access.map(norm);
-    return raw.split(/[;,|\/]+|\s+and\s+|\s+y\s+/i).map(norm).filter(Boolean);
-  }
-  function has(tokens, key){
-    if (tokens.includes("all")) return true;
-    const aliases = {
-      pareto:["pareto","pareto analysis","gp"],
-      frequency:["frequency","retention","ret"],
-      concierge:["concierge","concierge comm","concierge comm.","concierge communication","concierge communications"],
-      upsell:["upsell","up sell","upsell smile"],
-      sku_savvy:["sku savvy","sku savy","skusavvy","sku","operations"]
-    }[key] || [key];
-    return aliases.some(a => tokens.some(t => t === a || t.includes(a)));
-  }
-  function applySidebarAccess(){
-    const s = getSession();
-    const tokens = tokensOf(s);
-    const links = Array.from(document.querySelectorAll("[data-report-key]"));
-    links.forEach(a => {
-      const ok = has(tokens, a.getAttribute("data-report-key"));
-      a.classList.toggle("auth-hidden", !ok);
-      if (!ok) {
-        a.removeAttribute("href");
-        a.removeAttribute("target");
-      }
-    });
-    const anyVisible = links.some(a => !a.classList.contains("auth-hidden"));
-    const sec = document.querySelector(".sb-suite-sec");
-    if (sec) sec.classList.toggle("auth-hidden", !anyVisible);
-    const ops = document.querySelector(".sb-ops-sec");
-    const sku = document.querySelector('[data-report-key="sku_savvy"]');
-    if (ops && sku) ops.classList.toggle("auth-hidden", sku.classList.contains("auth-hidden"));
-  }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", applySidebarAccess);
-  else applySidebarAccess();
-})();
-</script>
+def _norm_txt(v):
+    return re.sub(r"\s+", " ", str(v or "").strip())
 
-</body>
-</html>
+
+def _norm_key(k):
+    return re.sub(r"[^a-z0-9]", "", str(k or "").lower())
+
+
+def _dig(obj, *paths):
+    """Return first non-empty nested value from a dict/list using dot paths."""
+    for path in paths:
+        cur = obj
+        ok = True
+        for part in path.split("."):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list):
+                try:
+                    cur = cur[int(part)]
+                except Exception:
+                    ok = False
+                    break
+            else:
+                ok = False
+                break
+        if ok and cur not in (None, ""):
+            return cur
+    return ""
+
+
+def _deep_values_for_keys(obj, key_names, depth=0, limit=80):
+    """Find values anywhere in a nested object for loose key-name matches."""
+    out = []
+    wanted = {_norm_key(k) for k in key_names}
+    if obj is None or depth > 8 or len(out) >= limit:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            nk = _norm_key(k)
+            if nk in wanted and v not in (None, ""):
+                out.append(v)
+            if isinstance(v, (dict, list)) and len(out) < limit:
+                out.extend(_deep_values_for_keys(v, key_names, depth + 1, limit - len(out)))
+    elif isinstance(obj, list):
+        for v in obj[:80]:
+            if len(out) >= limit:
+                break
+            out.extend(_deep_values_for_keys(v, key_names, depth + 1, limit - len(out)))
+    return out
+
+
+def _smartrr_items(payload):
+    """Normalize Smartrr list responses into a list."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in (
+        "data", "items", "results", "records", "purchaseStates", "purchase_states",
+        "purchaseState", "purchase_state", "subscriptions", "subscription_contracts", "contracts",
+    ):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            nested = _smartrr_items(val)
+            if nested:
+                return nested
+    return []
+
+
+def _smartrr_total_hint(payload):
+    if not isinstance(payload, dict):
+        return None
+    for path in ("total", "totalCount", "count", "meta.total", "pagination.total", "page.total"):
+        val = _dig(payload, path)
+        if val not in (None, ""):
+            try:
+                return int(float(str(val).replace(",", "")))
+            except Exception:
+                pass
+    return None
+
+
+def _smartrr_headers(api_key, mode="token"):
+    if mode == "bearer":
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+    return {
+        "x-smartrr-access-token": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def _smartrr_get(url, api_key, params=None):
+    r = requests.get(url, headers=_smartrr_headers(api_key, "token"), params=params, timeout=60)
+    if r.status_code in (401, 403):
+        rb = requests.get(url, headers=_smartrr_headers(api_key, "bearer"), params=params, timeout=60)
+        if rb.status_code < 400:
+            return rb
+    return r
+
+
+def _smartrr_status(subscription):
+    return str(
+        _dig(subscription, "purchaseStateStatus") or
+        _dig(subscription, "purchase_state_status") or
+        _dig(subscription, "status") or
+        _dig(subscription, "subscriptionStatus") or
+        _dig(subscription, "subscription_status") or
+        _dig(subscription, "state") or
+        _dig(subscription, "sts.0.purchaseStateStatus") or
+        _dig(subscription, "sts.0.status")
+    ).strip().lower()
+
+
+def _smartrr_status_group(subscription):
+    """Return active / paused / inactive for Smartrr purchase states.
+
+    Priority order:
+    1. Explicit cancelled/deleted markers → inactive (regardless of hint)
+    2. Explicit paused markers or status → paused
+    3. Hint (set from the API filter used) when status field is empty/missing
+    4. Explicit active status → active
+    5. Empty status with no hint → active (fallback, rare)
+    """
+    status = _smartrr_status(subscription)
+    hint = str(subscription.get("_smartrr_status_hint", "") if isinstance(subscription, dict) else "").strip().lower()
+
+    # 1 — Hard cancelled/deleted signals always win (even if hint says active/paused)
+    cancelled = (
+        _dig(subscription, "cancelledAt") or _dig(subscription, "cancelled_at") or
+        _dig(subscription, "deletedAt")   or _dig(subscription, "deleted_at")
+    )
+    if cancelled or status in ("cancelled", "canceled", "inactive", "expired", "deleted"):
+        return "inactive"
+
+    # 2 — Explicit paused fields
+    paused_marker = (
+        _dig(subscription, "pausedAt")        or _dig(subscription, "paused_at") or
+        _dig(subscription, "pauseStartedAt")  or _dig(subscription, "pause_started_at") or
+        _dig(subscription, "pausedUntil")     or _dig(subscription, "paused_until")
+    )
+    if paused_marker or status in ("paused", "pause", "pausing", "suspended"):
+        return "paused"
+
+    # 3 — When the status field returned nothing, trust the API filter hint.
+    #     (Smartrr sometimes omits purchaseStateStatus in the payload body even
+    #      though we filtered by it — the hint carries the requested_status value.)
+    if not status and hint:
+        if hint in ("paused", "pause", "pausing", "suspended"):
+            return "paused"
+        if hint in ("active", "activated"):
+            return "active"
+
+    # 4 — Explicit active
+    if status in ("active", "activated"):
+        return "active"
+
+    # 5 — Empty status, no hint → default active (was already the behaviour)
+    if status == "":
+        return "active"
+
+    # Any other unrecognised value → inactive
+    return "inactive"
+
+
+def _smartrr_is_active(subscription):
+    """Backward-compatible helper used by older diagnostics."""
+    return _smartrr_status_group(subscription) == "active"
+
+
+def _smartrr_is_active_or_paused(subscription):
+    return _smartrr_status_group(subscription) in ("active", "paused")
+
+
+def _parse_smartrr_date(v):
+    """Parse Smartrr/Shopify datetimes. Returns a date in local dashboard timezone."""
+    if v in (None, "", "ø", "null", "None"):
+        return None
+    s = str(v).strip()
+    # Smartrr UI often shows `2026-04-17 14:02:55.033`.
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(s[:26], fmt).date()
+        except Exception:
+            pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.astimezone(TIMEZONE)
+        return dt.date()
+    except Exception:
+        return None
+
+
+def _to_number(v, default=0.0):
+    if v in (None, "", "ø", "null", "None"):
+        return default
+    try:
+        return float(str(v).replace(",", "").replace("USD", "").strip())
+    except Exception:
+        return default
+
+
+def _money_to_usd(v):
+    n = _to_number(v, 0.0)
+    # Smartrr ORM price commonly comes as cents, e.g. 6900 = $69.
+    if abs(n) >= 1000:
+        return n / 100.0
+    return n
+
+
+def _first_deep(obj, keys):
+    vals = _deep_values_for_keys(obj, keys, limit=8)
+    for v in vals:
+        if v not in (None, "", "ø"):
+            return v
+    return ""
+
+
+def _candidate_line_dicts(obj, depth=0, out=None):
+    """Find nested dicts that look like Smartrr order line items."""
+    if out is None:
+        out = []
+    if obj is None or depth > 9:
+        return out
+    if isinstance(obj, dict):
+        keys = {_norm_key(k) for k in obj.keys()}
+        has_qty = any(k in keys for k in ("quantity", "qty"))
+        has_product = any(k in keys for k in (
+            "purchasableandpurchasablevariantname", "productvariant", "productvariantname",
+            "producttitle", "productname", "title", "name", "varianttitle", "variantname",
+        )) or bool(_first_deep(obj, [
+            "purchasable_and_purchasable_variant_name", "purchasableAndPurchasableVariantName",
+            "productTitle", "product_title", "productName", "product_name", "variantTitle", "variant_title",
+        ]))
+        has_created = any("created" in k for k in keys)
+        has_line_marker = any("lineitem" in k or "orderlineitem" in k for k in keys)
+        if has_qty and has_product and (has_created or has_line_marker):
+            out.append(obj)
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _candidate_line_dicts(v, depth + 1, out)
+    elif isinstance(obj, list):
+        for v in obj[:500]:
+            _candidate_line_dicts(v, depth + 1, out)
+    return out
+
+
+def _line_created_date(line):
+    # IMPORTANT: this intentionally uses the line item's Created Date, matching the Smartrr drilldown.
+    val = (
+        _dig(line, "createdDate") or _dig(line, "created_date") or
+        _dig(line, "createdAt") or _dig(line, "created_at") or
+        _dig(line, "created") or _dig(line, "lineCreatedDate") or
+        _dig(line, "orderLineItemCreatedDate") or
+        _first_deep(line, [
+            "createdDate", "created_date", "createdAt", "created_at", "created",
+            "lineCreatedDate", "orderLineItemCreatedDate",
+        ])
+    )
+    return _parse_smartrr_date(val)
+
+
+def _line_deleted(line):
+    val = (
+        _dig(line, "deletedAt") or _dig(line, "deleted_at") or
+        _dig(line, "deleted") or _first_deep(line, ["deletedAt", "deleted_at", "deleted"])
+    )
+    return bool(val and str(val).strip() not in ("", "ø", "null", "None"))
+
+
+def _line_product(line):
+    vals = [
+        _dig(line, "purchasable_and_purchasable_variant_name"),
+        _dig(line, "purchasableAndPurchasableVariantName"),
+        _dig(line, "productVariant"), _dig(line, "productVariantName"),
+        _dig(line, "product_variant"), _dig(line, "product_variant_name"),
+        _dig(line, "variantTitle"), _dig(line, "variant_title"),
+        _dig(line, "productTitle"), _dig(line, "product_title"),
+        _dig(line, "productName"), _dig(line, "product_name"),
+        _dig(line, "title"), _dig(line, "name"),
+        _first_deep(line, [
+            "purchasable_and_purchasable_variant_name", "purchasableAndPurchasableVariantName",
+            "productVariantName", "product_variant_name", "productTitle", "product_title",
+            "productName", "product_name", "variantTitle", "variant_title", "title", "name",
+        ]),
+    ]
+    for v in vals:
+        txt = _norm_txt(v)
+        if txt and txt not in ("ø", "Default Title"):
+            return txt
+    return "Other"
+
+
+def _line_sku(line):
+    vals = [
+        _dig(line, "sku"), _dig(line, "SKU"), _dig(line, "variant.sku"),
+        _dig(line, "purchasableVariant.sku"), _dig(line, "purchasable_variant.sku"),
+        _first_deep(line, ["sku", "SKU", "purchasableVariantSku", "purchasable_variant_sku"]),
+    ]
+    for v in vals:
+        txt = _norm_txt(v)
+        if txt:
+            return txt
+    return "ø"
+
+
+def _line_id(line):
+    vals = [
+        _dig(line, "id"), _dig(line, "lineItemId"), _dig(line, "line_item_id"),
+        _dig(line, "shopifyId"), _dig(line, "shopify_id"), _dig(line, "shopifyLineItemId"),
+        _first_deep(line, ["id", "lineItemId", "line_item_id", "shopifyId", "shopify_id", "shopifyLineItemId"]),
+    ]
+    for v in vals:
+        txt = _norm_txt(v)
+        if txt:
+            return txt
+    return ""
+
+
+def _line_quantity(line):
+    q = _dig(line, "quantity") or _dig(line, "qty") or _first_deep(line, ["quantity", "qty"])
+    n = _to_number(q, 1.0)
+    return int(n) if n and n > 0 else 1
+
+
+def _line_revenue(line, qty):
+    gross = (
+        _dig(line, "grossRevenue") or _dig(line, "gross_revenue") or
+        _dig(line, "shopIncome") or _dig(line, "shop_income") or
+        _dig(line, "totalPrice") or _dig(line, "total_price") or
+        _dig(line, "linePrice") or _dig(line, "line_price") or
+        ""
+    )
+    if gross not in (None, ""):
+        return _money_to_usd(gross)
+    price = (
+        _dig(line, "price") or _dig(line, "unitPrice") or _dig(line, "unit_price") or
+        _first_deep(line, ["price", "unitPrice", "unit_price"])
+    )
+    return _money_to_usd(price) * qty
+
+
+def fetch_smartrr_active_purchase_states(brand_name):
+    """Fetch ACTIVE and PAUSED purchase states once. No Shopify subscription-contract lookup."""
+    key = SMARTRR_API_KEYS.get(brand_name, "")
+    if brand_name != "cavali" or not key:
+        if brand_name == "cavali":
+            print("    ⚠ smartrr: SMARTRR_API_KEY_CAVALI missing")
+        return []
+
+    base_url = "https://api.smartrr.com/vendor/purchase-state"
+    states = []
+    seen = set()
+    page_size = 250
+
+    # User requirement: keep new subscribers for the selected period, but also show
+    # current ACTIVE, PAUSED, and CANCELLED subscriber totals per product.
+    for requested_status in ("ACTIVE", "PAUSED", "CANCELLED"):
+        page_number = 0
+        total_hint = None
+        fetched_for_status = 0
+
+        while page_number < 200:
+            params = {
+                "pageSize": page_size,
+                "pageNumber": page_number,
+                "filterEquals[purchaseStateStatus]": requested_status,
+                "include": "items,lineItems,orderLineItems,stLineItems,product,variant,purchasableVariant,orders",
+            }
+            r = _smartrr_get(base_url, key, params=params)
+            if r.status_code >= 400:
+                print(f"    ⚠ smartrr {requested_status} HTTP {r.status_code}: {(r.text or '')[:350]}")
+                break
+
+            payload = r.json()
+            items = _smartrr_items(payload)
+            total_hint = _smartrr_total_hint(payload)
+            if not items:
+                break
+
+            for sub in items:
+                if isinstance(sub, dict):
+                    sub = dict(sub)
+                    sub["_smartrr_status_hint"] = requested_status.lower()
+
+                if not _smartrr_is_active_or_paused(sub) and requested_status != "CANCELLED":
+                    continue
+
+                sid = str(
+                    _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or
+                    _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
+                    json.dumps(sub, sort_keys=True)[:200]
+                )
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                states.append(sub)
+                fetched_for_status += 1
+
+            if len(items) < page_size:
+                break
+            if total_hint is not None and (page_number + 1) * page_size >= total_hint:
+                break
+            page_number += 1
+
+        print(f"    smartrr {requested_status.lower()} purchase states fetched: {fetched_for_status}")
+
+    active_count = sum(1 for s in states if _smartrr_status_group(s) == "active")
+    paused_count = sum(1 for s in states if _smartrr_status_group(s) == "paused")
+    inactive_count = sum(1 for s in states if _smartrr_status_group(s) == "inactive")
+    paused_no_status = sum(
+        1 for s in states
+        if str(s.get("_smartrr_status_hint","")).strip().lower() == "paused"
+        and not _smartrr_status(s)
+    )
+    print(f"    smartrr active+paused purchase states fetched: active={active_count} paused={paused_count} inactive_filtered={inactive_count} total={len(states)}")
+    if paused_no_status:
+        print(f"    ⚠ smartrr: {paused_no_status} PAUSED records had empty purchaseStateStatus — classified via API filter hint")
+    return states
+
+
+def _smartrr_plan_text(sub):
+    """
+    Extract product/plan label from purchase-state root when stLineItems does not
+    expose usable product fields.
+    """
+    for fk in (
+        "planTitle", "plan_title",
+        "purchasableTitle", "purchasable_title",
+        "productTitle", "product_title",
+        "title", "name",
+        "planName", "plan_name",
+        "subscriptionTitle", "subscription_title",
+    ):
+        v = sub.get(fk) if isinstance(sub, dict) else ""
+        if v and str(v).strip() and re.search(r"[A-Za-z]", str(v)):
+            return str(v).strip()
+
+    for nested_k in ("plan", "purchasable", "subscription"):
+        nested = sub.get(nested_k) if isinstance(sub, dict) else None
+        if not isinstance(nested, dict):
+            continue
+        for fk in ("title", "name", "planTitle", "plan_title"):
+            v = nested.get(fk)
+            if v and str(v).strip() and re.search(r"[A-Za-z]", str(v)):
+                return str(v).strip()
+    return ""
+
+
+
+def _find_variant_gids_from_smartrr_states(states):
+    """Collect Shopify ProductVariant GIDs from Smartrr line-item variant objects."""
+    out = set()
+    def walk(obj, depth=0):
+        if obj is None or depth > 8:
+            return
+        if isinstance(obj, str):
+            m = re.search(r"gid://shopify/ProductVariant/\d+", obj)
+            if m:
+                out.add(m.group(0))
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in ("shopifyId", "shopifyProductVariantStorefrontId", "admin_graphql_api_id", "id") and isinstance(v, str):
+                    m = re.search(r"gid://shopify/ProductVariant/\d+", v)
+                    if m:
+                        out.add(m.group(0))
+                if isinstance(v, (dict, list, str)):
+                    walk(v, depth + 1)
+        elif isinstance(obj, list):
+            for v in obj[:500]:
+                walk(v, depth + 1)
+    for s in states or []:
+        walk(s)
+    return sorted(out)
+
+
+def fetch_shopify_product_variant_titles(store_url, token, variant_gids):
+    """
+    Resolve ProductVariant GIDs from Smartrr's stLineItems.vnt to Shopify product titles.
+    This is required because Smartrr often returns only the ProductVariant GID in vnt,
+    not the human product name.
+    """
+    ids = sorted({v for v in (variant_gids or []) if str(v).startswith("gid://shopify/ProductVariant/")})
+    result = {}
+    if not store_url or not token or not ids:
+        return result
+
+    for i in range(0, len(ids), 80):
+        chunk = ids[i:i + 80]
+        ids_arg = ",".join(json.dumps(x) for x in chunk)
+        q = f"""
+        {{
+          nodes(ids: [{ids_arg}]) {{
+            id
+            ... on ProductVariant {{
+              title
+              sku
+              product {{
+                title
+              }}
+            }}
+          }}
+        }}
+        """
+        data = gql(store_url, token, q) or {}
+        for node in data.get("nodes") or []:
+            if not node or not node.get("id"):
+                continue
+            product = (node.get("product") or {}).get("title") or ""
+            variant = node.get("title") or ""
+            sku = node.get("sku") or ""
+            label = product
+            if variant and variant.lower() not in ("default title", "default"):
+                label = f"{product} · {variant}" if product else variant
+            result[node["id"]] = {"product": label or product or variant or node["id"], "sku": sku or "ø"}
+        if i + 80 < len(ids):
+            time.sleep(0.35)
+
+    print(f"    smartrr product variant titles resolved: {len(result)} of {len(ids)} ProductVariant IDs")
+    return result
+
+
+def build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs, store_url=None, token=None):
+    """
+    Build Smartrr product rows for dashboard section 06.
+
+    Phase 1 (global totals): active/paused totals by product from current
+    purchase-state status (no date filter).
+
+    Phase 2 (period new): new subscribers in selected period using line/state
+    created date.
+
+    Returns (rows, active_total_by_norm, paused_total_by_norm) where the last
+    two dicts are keyed by _product_match_key(product) for loose matching.
+    """
+    if brand_name != "cavali" or not active_states:
+        return [], {}, {}
+
+    period_ranges = []
+    for pk, s, e in period_defs:
+        try:
+            period_ranges.append((
+                pk, str(s), str(e),
+                datetime.strptime(str(s), "%Y-%m-%d").date(),
+                datetime.strptime(str(e), "%Y-%m-%d").date(),
+            ))
+        except Exception:
+            pass
+
+    variant_title_map = {}
+    if store_url and token:
+        variant_gids = _find_variant_gids_from_smartrr_states(active_states)
+        variant_title_map = fetch_shopify_product_variant_titles(store_url, token, variant_gids)
+
+    if active_states:
+        first = active_states[0]
+        print(f"    smartrr debug: top-level keys = {list(first.keys())[:35]}")
+        for dbk in ("stLineItems", "lineItems", "orderLineItems", "items"):
+            v = first.get(dbk)
+            if isinstance(v, list) and v:
+                item0 = v[0]
+                print(f"    smartrr debug: {dbk}[0] FULL = {json.dumps(item0, default=str)[:800]}")
+                if isinstance(item0, dict):
+                    vnt0 = item0.get("vnt")
+                    print(f"    smartrr debug: {dbk}[0].vnt type={type(vnt0).__name__} value={json.dumps(vnt0, default=str)[:400] if vnt0 else 'NULL'}")
+        # Also dump the first state's top-level for name fields
+        print(f"    smartrr debug: first state FULL (no stLineItems) = {json.dumps({k:v for k,v in first.items() if k not in ('stLineItems','lineItems','orderLineItems','items','orders','discounts')}, default=str)[:600]}")
+
+    def _extract_product_name_from_st_line(st_line):
+        # First resolve Shopify ProductVariant GIDs found in Smartrr's vnt object.
+        for possible in (
+            _dig(st_line, "vnt.shopifyId"),
+            _dig(st_line, "vnt.shopifyProductVariantStorefrontId"),
+            _dig(st_line, "vnt.id"),
+            _dig(st_line, "variant.shopifyId"),
+            _dig(st_line, "purchasableVariant.shopifyId"),
+            _dig(st_line, "shopifyId"),
+        ):
+            if possible:
+                m = re.search(r"gid://shopify/ProductVariant/\d+", str(possible))
+                if m and m.group(0) in variant_title_map:
+                    return variant_title_map[m.group(0)].get("product") or ""
+        # Direct top-level name fields
+        for fk in (
+            "purchasableAndPurchasableVariantName",
+            "purchasable_and_purchasable_variant_name",
+            "productTitle", "product_title",
+            "variantTitle", "variant_title",
+            "title", "name",
+        ):
+            v = st_line.get(fk)
+            if v and str(v).strip() not in ("", "?", "Default Title"):
+                return str(v).strip()
+        # vnt first — it is the variant object confirmed in Smartrr's schema
+        for nested_key in ("vnt", "purchasable", "purchasableVariant", "variant", "product"):
+            nested = st_line.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for fk in (
+                "purchasableAndPurchasableVariantName",
+                "displayName", "display_name",
+                "productVariantName", "product_variant_name",
+                "name", "title",
+                "productTitle", "product_title",
+                "variantTitle", "variant_title",
+            ):
+                v = nested.get(fk)
+                if v and str(v).strip() not in ("", "?", "Default Title"):
+                    return str(v).strip()
+            # One level deeper (product inside vnt)
+            for sub_key in ("product", "purchasable"):
+                sub = nested.get(sub_key)
+                if isinstance(sub, dict):
+                    for fk in ("name", "title", "productTitle", "displayName"):
+                        v = sub.get(fk)
+                        if v and str(v).strip() not in ("", "?", "Default Title"):
+                            return str(v).strip()
+        return ""
+
+    def _extract_sku_from_st_line(st_line):
+        for possible in (
+            _dig(st_line, "vnt.shopifyId"),
+            _dig(st_line, "vnt.shopifyProductVariantStorefrontId"),
+            _dig(st_line, "vnt.id"),
+            _dig(st_line, "variant.shopifyId"),
+            _dig(st_line, "purchasableVariant.shopifyId"),
+            _dig(st_line, "shopifyId"),
+        ):
+            if possible:
+                m = re.search(r"gid://shopify/ProductVariant/\d+", str(possible))
+                if m and m.group(0) in variant_title_map:
+                    sku = variant_title_map[m.group(0)].get("sku")
+                    if sku:
+                        return sku
+        # currentSku is confirmed in Smartrr debug output
+        for fk in ("currentSku", "sku", "SKU"):
+            v = st_line.get(fk)
+            if v and str(v).strip():
+                return str(v).strip()
+        for nested_key in ("vnt", "purchasable", "purchasableVariant", "variant"):
+            nested = st_line.get(nested_key)
+            if isinstance(nested, dict):
+                for fk in ("sku", "SKU", "currentSku"):
+                    v = nested.get(fk)
+                    if v and str(v).strip():
+                        return str(v).strip()
+        return "?"
+
+    def _extract_qty(st_line):
+        qty_raw = st_line.get("quantity") or st_line.get("qty") or 1
+        try:
+            return max(1, int(float(str(qty_raw))))
+        except Exception:
+            return 1
+
+    def _extract_price(st_line, qty):
+        for fk in ("priceAfterDiscounts", "price_after_discounts", "basePrice", "base_price",
+                   "price", "linePrice", "line_price", "totalPrice", "total_price",
+                   "unitPrice", "unit_price", "priceAfterDiscount", "price_after_discount"):
+            v = st_line.get(fk)
+            if v not in (None, ""):
+                return _money_to_usd(v) * qty
+        for nested_key in ("purchasable", "purchasableVariant", "variant", "vnt"):
+            nested = st_line.get(nested_key)
+            if isinstance(nested, dict):
+                for fk in ("price", "unitPrice", "unit_price"):
+                    v = nested.get(fk)
+                    if v not in (None, ""):
+                        return _money_to_usd(v) * qty
+        return 0.0
+
+    def _get_state_created(sub):
+        # For Smartrr "New Subscriptions", use the purchase-state/subscription creation date,
+        # not the order line item created date and not Shopify order processed date.
+        # This matches Smartrr Advanced Analytics "New Subscriptions" cards.
+        for ck in (
+            "initialSubmissionDate", "initial_submission_date",
+            "externalSubscriptionCreatedDate", "external_subscription_created_date",
+            "createdDate", "created_date", "createdAt", "created_at",
+        ):
+            v = sub.get(ck)
+            if v:
+                d = _parse_smartrr_date(v)
+                if d:
+                    return d
+        return None
+
+    def _get_products_from_state(sub):
+        results = []
+        st_lines = sub.get("stLineItems") or sub.get("lineItems") or sub.get("orderLineItems") or []
+        # Fallback name from parent state (plan title, subscription title, etc.)
+        parent_name = _smartrr_plan_text(sub)
+
+        for st_line in (st_lines if isinstance(st_lines, list) else []):
+            if not isinstance(st_line, dict):
+                continue
+            if st_line.get("deletedAt") or st_line.get("deleted_at"):
+                continue
+            prod = _extract_product_name_from_st_line(st_line)
+            # If no name from line item fields, use parent state name
+            if not prod or not re.search(r"[A-Za-z]", prod):
+                prod = parent_name
+            if not prod or not re.search(r"[A-Za-z]", prod):
+                continue
+            sku = _extract_sku_from_st_line(st_line)
+            qty = _extract_qty(st_line)
+            price = _extract_price(st_line, qty)
+            results.append((prod, sku, qty, price))
+
+        if not results:
+            for line in _candidate_line_dicts(sub):
+                if _line_deleted(line):
+                    continue
+                prod = _line_product(line)
+                if not prod or prod in ("Unknown Product", "Other") or not re.search(r"[A-Za-z]", prod):
+                    prod = parent_name
+                if not prod or not re.search(r"[A-Za-z]", prod):
+                    continue
+                sku = _line_sku(line)
+                qty = _line_quantity(line)
+                price = _line_revenue(line, qty)
+                results.append((prod, sku, qty, price))
+
+        # Final fallback: use parent plan name directly with qty=1
+        if not results and parent_name and re.search(r"[A-Za-z]", parent_name):
+            results.append((parent_name, "?", 1, 0.0))
+
+        return results
+
+    active_total = {}
+    paused_total = {}
+    cancelled_total = {}
+    no_product_count = 0
+
+    for sub in active_states:
+        state_group = _smartrr_status_group(sub)
+        if state_group not in ("active", "paused", "inactive"):
+            continue
+
+        products = _get_products_from_state(sub)
+        if not products:
+            no_product_count += 1
+            prod = "Other"
+            products = [(prod, "ø", 1, 0.0)]
+
+        for prod, sku, qty, _ in products:
+            key = (prod, sku)
+            if state_group == "active":
+                active_total[key] = active_total.get(key, 0) + qty
+            elif state_group == "paused":
+                paused_total[key] = paused_total.get(key, 0) + qty
+            else:
+                cancelled_total[key] = cancelled_total.get(key, 0) + qty
+
+    total_active_global = sum(active_total.values())
+    total_paused_global = sum(paused_total.values())
+    total_cancelled_global = sum(cancelled_total.values())
+    print(f"    FASE 1 — Totales globales: active={total_active_global} paused={total_paused_global} cancelled={total_cancelled_global} sin_producto={no_product_count}")
+
+    new_items = []
+    skipped_no_date = 0
+    seen_sub_products = set()
+
+    # IMPORTANT: New Subscribers must match Smartrr's "New Subscriptions" metric.
+    # Therefore we count PURCHASE STATES created in the selected range.
+    # We include ACTIVE, PAUSED and CANCELLED purchase states, because a subscription
+    # can be created and cancelled in the same period and still counts as New in Smartrr.
+    # We do NOT use Shopify order sales quantity and do NOT use stLineItems.createdDate
+    # as the primary date, because those represent line/order activity, not subscriber creation.
+    for sub in active_states:
+        state_group = _smartrr_status_group(sub)
+        state_created = _get_state_created(sub)
+        if not state_created:
+            skipped_no_date += 1
+            continue
+
+        products = _get_products_from_state(sub)
+        if not products:
+            products = [("Other", "ø", 1, 0.0)]
+
+        sid = str(
+            _dig(sub, "id") or _dig(sub, "purchaseStateId") or _dig(sub, "shopifyId") or
+            _dig(sub, "subscriptionId") or _dig(sub, "subscription_id") or
+            json.dumps({k: sub.get(k) for k in ("createdDate", "shopifyId", "externalSubscriptionId") if isinstance(sub, dict)}, sort_keys=True)
+        )[:120]
+
+        for prod, sku, qty, gross in products:
+            # Subscriber count is one subscription, not line quantity. Keep product label for product breakdown.
+            if not prod or not re.search(r"[A-Za-z]", str(prod)):
+                prod = "Other"
+            dedupe = f"{sid}|{_product_match_key(prod)}|{sku}"
+            if dedupe in seen_sub_products:
+                continue
+            seen_sub_products.add(dedupe)
+            new_items.append({
+                "created": state_created,
+                "product": prod,
+                "sku": sku or "ø",
+                "qty": 1,
+                "gross": 0.0,
+                "id": sid,
+                "status": state_group,
+            })
+
+    print(f"    FASE 2 — Purchase states nuevos con fecha: {len(new_items)} items ? sin_fecha={skipped_no_date}")
+
+    rows = []
+    all_keys = set(active_total.keys()) | set(paused_total.keys()) | set(cancelled_total.keys())
+
+    for pk, ps, pe, ds, de in period_ranges:
+        new_buckets = {}
+        for item in new_items:
+            if ds <= item["created"] <= de:
+                key = (item["product"], item["sku"])
+                rec = new_buckets.setdefault(key, {"new": 0, "gross": 0.0, "ids": []})
+                rec["new"] += item["qty"]
+                rec["gross"] += item["gross"]
+                if len(rec["ids"]) < 5:
+                    rec["ids"].append(item["id"])
+
+        period_keys = all_keys | set(new_buckets.keys())
+        for prod, sku in sorted(
+            period_keys,
+            key=lambda k: (-(active_total.get(k, 0) + paused_total.get(k, 0) + new_buckets.get(k, {}).get("new", 0)), k[0].lower()),
+        ):
+            active_to_date = active_total.get((prod, sku), 0)
+            paused_to_date = paused_total.get((prod, sku), 0)
+            cancelled_to_date = cancelled_total.get((prod, sku), 0)
+            new_count = new_buckets.get((prod, sku), {}).get("new", 0)
+            gross = new_buckets.get((prod, sku), {}).get("gross", 0.0)
+            ids = new_buckets.get((prod, sku), {}).get("ids") or []
+
+            if active_to_date <= 0 and paused_to_date <= 0 and cancelled_to_date <= 0 and new_count <= 0:
+                continue
+
+            rows.append([
+                now_str, brand_name, pk, ps, pe,
+                prod, sku,
+                0, new_count,
+                active_to_date, paused_to_date, cancelled_to_date,
+                0,
+                "Smartrr subscriber snapshot + current ACTIVE/PAUSED/CANCELLED totals",
+                "Smartrr purchase-state/subscription created date for new subscribers",
+                "purchaseStateStatus=ACTIVE/PAUSED/CANCELLED;row_type=smartrr_subscribers",
+                "; ".join(ids),
+            ])
+
+    print(f"    smartrr_product_volume FINAL: {len(new_items)} items de fecha — {len(rows)} filas — skipped_sin_fecha={skipped_no_date}")
+
+    # Build normalized-key dicts so merge can match even when product names differ slightly
+    active_norm = {}
+    paused_norm = {}
+    cancelled_norm = {}
+    for (prod, sku), qty in active_total.items():
+        nk = _product_match_key(prod)
+        active_norm[nk] = active_norm.get(nk, 0) + qty
+    for (prod, sku), qty in paused_total.items():
+        nk = _product_match_key(prod)
+        paused_norm[nk] = paused_norm.get(nk, 0) + qty
+    for (prod, sku), qty in cancelled_total.items():
+        nk = _product_match_key(prod)
+        cancelled_norm[nk] = cancelled_norm.get(nk, 0) + qty
+
+    return rows, active_norm, paused_norm, cancelled_norm
+
+
+# SMARTRR fallback — period product rows from Shopify order line_items
+# ─────────────────────────────────────────────────────────────────
+
+def _shopify_line_product(li):
+    """Keep the product/variant name exactly as Shopify/Smartrr displays it."""
+    for k in ("title", "name", "product_title", "variant_title"):
+        v = li.get(k) if isinstance(li, dict) else None
+        if v not in (None, ""):
+            txt = str(v).strip()
+            if txt:
+                return txt
+    return "Other"
+
+
+def _shopify_line_sku(li):
+    for k in ("sku", "variant_id", "product_id"):
+        v = li.get(k) if isinstance(li, dict) else None
+        if v not in (None, ""):
+            txt = str(v).strip()
+            if txt:
+                return txt
+    return "ø"
+
+
+def _shopify_line_revenue(li):
+    qty = int(_to_number((li or {}).get("quantity"), 0) or 0)
+    for k in ("price", "pre_tax_price", "discounted_price"):
+        v = (li or {}).get(k)
+        if v not in (None, ""):
+            try:
+                return round(float(v) * max(qty, 1), 2)
+            except Exception:
+                pass
+    return 0.0
+
+
+def _is_subscription_line_item(li, product_label=""):
+    """True only for subscription-created line items, not normal sales volume."""
+    if not isinstance(li, dict):
+        return False
+    # Shopify REST usually exposes this when the order line was created from a selling plan.
+    if li.get("selling_plan_allocation"):
+        return True
+    if li.get("selling_plan_id") or li.get("selling_plan_name"):
+        return True
+    # Some apps store the subscription/contract identifiers in properties.
+    props = li.get("properties") or []
+    if isinstance(props, list):
+        for p in props:
+            if not isinstance(p, dict):
+                continue
+            k = str(p.get("name") or p.get("key") or "").lower()
+            v = str(p.get("value") or "").lower()
+            if "subscription" in k or "selling_plan" in k or "contract" in k or "subscription" in v:
+                return True
+    txt = f"{product_label} {li.get('title','')} {li.get('name','')} {li.get('variant_title','')}".lower()
+    # Name fallback only when the product explicitly says subscription/membership.
+    return ("subscription" in txt) or ("membership" in txt)
+
+def build_smartrr_product_volume_from_orders(now_str, brand_name, period, start, end, orders):
+    """
+    Cavali order-volume rows from Shopify order line_items.
+
+    HARD SEPARATION:
+      - row_type=subscription_sales_volume: Shopify line items that clearly came from a selling plan/subscription.
+      - row_type=sales_volume_only: one-time Shopify line items only.
+      - new_subscribers is ALWAYS 0 here. Subscriber counts come only from Smartrr purchase-state rows.
+      - active/paused/cancelled are NEVER stored here. They are injected/displayed from Smartrr subscriber rows.
+    """
+    if brand_name != "cavali":
+        return []
+
+    buckets = {}
+    for o in orders or []:
+        for li in (o.get("line_items") or []):
+            qty = int(_to_number(li.get("quantity"), 0) or 0)
+            if qty <= 0:
+                continue
+            product = _shopify_line_product(li)
+            sku = _shopify_line_sku(li)
+            is_sub = bool(_is_subscription_line_item(li, product))
+            key = (product, sku, is_sub)
+            rec = buckets.setdefault(key, {"qty": 0, "gross": 0.0, "ids": []})
+            rec["qty"] += qty
+            rec["gross"] += _shopify_line_revenue(li)
+            lid = str(li.get("id") or li.get("admin_graphql_api_id") or "")[:80]
+            if lid and len(rec["ids"]) < 5:
+                rec["ids"].append(lid)
+
+    rows = []
+    for (product, sku, is_sub), v in sorted(buckets.items(), key=lambda kv: (-kv[1]["qty"], kv[0][0].lower(), kv[0][2])):
+        qty = int(v["qty"])
+        rows.append([
+            now_str, brand_name, period, str(start), str(end),
+            product, sku,
+            qty, 0,
+            0, 0, 0,
+            round(v["gross"], 2),
+            "Shopify order line_items — Subscription Sales Volume only" if is_sub else "Shopify order line_items — One-Time Sales Volume only",
+            "Shopify order processed date",
+            "row_type=subscription_sales_volume" if is_sub else "row_type=sales_volume_only",
+            "; ".join(v["ids"]),
+        ])
+
+    if rows:
+        print(f"    smartrr_product_volume order-volume rows for {period}: {len(rows)}")
+        for r in rows[:8]:
+            print(f"      volume row: {r[5]} · sku={r[6]} · sales_qty={r[7]} · new_subscribers={r[8]} · active={r[9]} · gross={r[12]} · {r[15]}")
+    return rows
+
+
+def _product_match_key(product):
+    """Loose match key so Smartrr and Shopify product labels merge reliably.
+
+    Examples:
+      - "The Premier Box Subscription" -> "premierbox"
+      - "THE SIGNATURE BOX / Quarterly" -> "signaturebox"
+      - "Cavali Club Membership - Annual" -> "cavaliclubmembership"
+    """
+    raw = str(product or "").lower()
+    if "signature" in raw:
+        return "signaturebox"
+    if "premier" in raw:
+        return "premierbox"
+    if "junior" in raw and "membership" in raw:
+        return "cavaliclubjuniormembership"
+    if "cavali club" in raw and "membership" in raw:
+        return "cavaliclubmembership"
+    if "welcome" in raw and "box" in raw:
+        return "welcomebox"
+    if "sona" in raw and "bundle" in raw:
+        return "sonabundle"
+    if "cheese" in raw and "kniv" in raw:
+        return "cavaliclubcheeseknives"
+    if "kriste" in raw or "training course" in raw:
+        return "kristekehoetrainingcourse"
+    if "fly spray" in raw:
+        return "stopbuggnflyspray16oz"
+    if "spicy pony" in raw or "candle" in raw:
+        return "stablestylespicyponycandle"
+    p = raw
+    for word in ("subscription", "default title", "quarterly", "monthly", "annual", "yearly"):
+        p = p.replace(word, "")
+    p = re.sub(r"[^a-z0-9]+", "", p)
+    return p
+
+
+def _is_blank_number(v):
+    return v in (None, "", "None", "null", "ø")
+
+
+def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None, paused_norm=None, cancelled_norm=None):
+    """
+    Prefer period rows from Shopify orders for Sales Volume. New Subscribers come only
+    from Smartrr purchase-state rows. Enrich volume rows with Smartrr ACTIVE,
+    PAUSED and CANCELLED totals-to-date when Smartrr exposes usable product line data.
+
+    active_norm / paused_norm: global totals keyed by _product_match_key(product).
+    These are injected into ALL rows (including fallback) so the dashboard always
+    shows real current totals per product even when the Shopify fallback is used.
+
+    Key detail: match by normalized product name first, not only exact product+SKU,
+    because Smartrr and Shopify can label the same item differently.
+    """
+    order_rows = order_rows or []
+    active_rows = active_rows or []
+
+    # Column indexes for SMARTRR_PRODUCT_VOLUME_HEADERS
+    IDX_PERIOD = 2
+    IDX_PRODUCT = 5
+    IDX_SKU = 6
+    IDX_TOTAL_QTY = 7
+    IDX_NEW = 8
+    IDX_ACTIVE = 9    # active_subscribers_current
+    IDX_PAUSED = 10   # paused_subscribers_current
+    IDX_CANCELLED = 11  # cancelled_subscribers_current  ← NEW
+    IDX_GROSS = 12
+    IDX_SOURCE = 13
+    IDX_DATE_BASIS = 14
+    IDX_FILTER = 15
+    IDX_SAMPLE = 16
+
+    active_exact = {}
+    active_product = {}
+    for r in active_rows:
+        try:
+            exact_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
+            active_exact[exact_key] = r
+            loose_key = (str(r[IDX_PERIOD]), _product_match_key(r[IDX_PRODUCT]))
+            prev = active_product.get(loose_key)
+            r_total = _to_number(r[IDX_ACTIVE], 0) + _to_number(r[IDX_PAUSED], 0)
+            p_total = (_to_number(prev[IDX_ACTIVE], 0) + _to_number(prev[IDX_PAUSED], 0)) if prev else -1
+            if not prev or r_total > p_total:
+                active_product[loose_key] = r
+        except Exception:
+            pass
+
+    merged = []
+    # IMPORTANT v55:
+    # Do NOT mark Smartrr subscriber rows as "used" when they are used only to
+    # enrich Shopify volume rows with current active/paused totals. A volume row
+    # and a subscriber row are two different concepts and must both be written.
+    used_active = set()
+
+    for r in order_rows:
+        try:
+            key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
+            loose_key = (str(r[IDX_PERIOD]), _product_match_key(r[IDX_PRODUCT]))
+            a = active_exact.get(key) or active_product.get(loose_key)
+            row = list(r)
+            while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+                row.append("")
+
+            if a:
+                # Enrich order-volume row with current totals for context, but
+                # keep the separate Smartrr subscriber row in the output so
+                # New Subscribers remains visible and does not get swallowed by volume.
+                # used_active is intentionally NOT updated here.
+                if len(a) > IDX_ACTIVE and not _is_blank_number(a[IDX_ACTIVE]):
+                    row[IDX_ACTIVE] = a[IDX_ACTIVE]
+                if len(a) > IDX_PAUSED and not _is_blank_number(a[IDX_PAUSED]):
+                    row[IDX_PAUSED] = a[IDX_PAUSED]
+                if len(a) > IDX_CANCELLED and not _is_blank_number(a[IDX_CANCELLED]):
+                    row[IDX_CANCELLED] = a[IDX_CANCELLED]
+                # Preserve Shopify row_type/source/date_basis. These rows are sales-volume rows,
+                # not subscriber rows. Only enrich their current totals.
+                if len(a) > IDX_SAMPLE and a[IDX_SAMPLE] not in (None, "") and not row[IDX_SAMPLE]:
+                    row[IDX_SAMPLE] = a[IDX_SAMPLE]
+
+            if len(row) > IDX_ACTIVE and _is_blank_number(row[IDX_ACTIVE]):
+                row[IDX_ACTIVE] = 0
+            if len(row) > IDX_PAUSED and _is_blank_number(row[IDX_PAUSED]):
+                row[IDX_PAUSED] = 0
+            if len(row) > IDX_CANCELLED and _is_blank_number(row[IDX_CANCELLED]):
+                row[IDX_CANCELLED] = 0
+            merged.append(row)
+        except Exception:
+            merged.append(r)
+
+    for r in active_rows:
+        try:
+            active_key = (str(r[IDX_PERIOD]), str(r[IDX_PRODUCT]), str(r[IDX_SKU]))
+            if active_key not in used_active:
+                row = list(r)
+                while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+                    row.append("")
+                if _is_blank_number(row[IDX_NEW]):
+                    row[IDX_NEW] = 0
+                if _is_blank_number(row[IDX_TOTAL_QTY]):
+                    row[IDX_TOTAL_QTY] = row[IDX_NEW]
+                if _is_blank_number(row[IDX_ACTIVE]):
+                    row[IDX_ACTIVE] = 0
+                if _is_blank_number(row[IDX_PAUSED]):
+                    row[IDX_PAUSED] = 0
+                if _is_blank_number(row[IDX_CANCELLED]):
+                    row[IDX_CANCELLED] = 0
+                merged.append(row)
+        except Exception:
+            merged.append(r)
+
+    # Phase 3: inject global Smartrr totals into ALL rows that still have
+    # blank or fallback-derived active/paused counts.
+    if active_norm or paused_norm:
+        for row in merged:
+            try:
+                nk = _product_match_key(str(row[IDX_PRODUCT]))
+                src = str(row[IDX_SOURCE] if len(row) > IDX_SOURCE else "").lower()
+                is_fallback = "fallback" in src and "active/paused" not in src
+                a_real = active_norm.get(nk) if active_norm else None
+                p_real = (paused_norm or {}).get(nk, 0)
+                c_real = (cancelled_norm or {}).get(nk, 0)
+
+                # Fuzzy prefix match: handles cases where Smartrr adds "Monthly",
+                # "Annual", etc. to a name that Shopify shows shorter (or vice versa).
+                if a_real is None and active_norm and len(nk) >= 8:
+                    for ak, av in active_norm.items():
+                        if len(ak) >= 8 and (ak.startswith(nk) or nk.startswith(ak)):
+                            a_real = av
+                            p_real = (paused_norm or {}).get(ak, 0)
+                            c_real = (cancelled_norm or {}).get(ak, 0)
+                            break
+
+                if a_real is not None and (_is_blank_number(row[IDX_ACTIVE]) or is_fallback):
+                    row[IDX_ACTIVE] = a_real
+                    row[IDX_PAUSED] = p_real
+                    if len(row) > IDX_CANCELLED:
+                        row[IDX_CANCELLED] = c_real
+                    # Keep original row_type/source so sales-volume rows never become subscriber rows.
+            except Exception:
+                pass
+        print(f"    smartrr_product_volume phase3: global totals injected into rows using active_norm({len(active_norm)} products)")
+
+    if active_rows:
+        print(f"    smartrr_product_volume merge: {len(order_rows)} order rows + {len(active_rows)} active/paused rows => {len(merged)} rows")
+    else:
+        print(f"    smartrr_product_volume merge: active/paused rows unavailable; using {len(order_rows)} order fallback rows")
+    return merged
+
+
+def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
+    """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet("smartrr_product_volume")
+    except Exception:
+        ws = sh.add_worksheet("smartrr_product_volume", rows=1000, cols=len(SMARTRR_PRODUCT_VOLUME_HEADERS))
+
+    vals = ws.get_all_values()
+    keep = []
+    replace = {str(p).strip() for p in periods_to_replace if p}
+    if len(vals) >= 2:
+        h = vals[0]
+        for r in vals[1:]:
+            m = _row_to_map(h, r)
+            if str(m.get("period", "")).strip() not in replace:
+                keep.append(_map_to_row(SMARTRR_PRODUCT_VOLUME_HEADERS, m))
+
+    cleaned_rows = []
+    for r in rows or []:
+        row = list(r)
+        while len(row) < len(SMARTRR_PRODUCT_VOLUME_HEADERS):
+            row.append("")
+        # Minimum safeguard: product card totals cannot be empty.
+        if _is_blank_number(row[9]):
+            row[9] = row[8] if not _is_blank_number(row[8]) else row[7]
+        if len(row) > 10 and _is_blank_number(row[10]):
+            row[10] = 0
+        cleaned_rows.append(row[:len(SMARTRR_PRODUCT_VOLUME_HEADERS)])
+
+    merged = keep + cleaned_rows
+    merged = sorted(
+        merged,
+        key=lambda r: (
+            str(r[1]),
+            _safe_date(r[3]),
+            str(r[2]),
+            -(_to_number(r[9], 0) + _to_number(r[10], 0)),
+            str(r[5]).lower(),
+        )
+    )
+
+    ws.clear()
+    ws.append_row(SMARTRR_PRODUCT_VOLUME_HEADERS)
+    if merged:
+        ws.append_rows(merged, value_input_option="USER_ENTERED")
+    print(f"    smartrr_product_volume: {len(cleaned_rows)} refreshed rows; {len(merged)} total rows")
+
+
+# HELPERS SHEETS
+# ─────────────────────────────────────────────────────────────────
+def _safe_date(v):
+    try:    return datetime.strptime(str(v), "%Y-%m-%d").date()
+    except: return date(1900, 1, 1)
+
+
+def _parse_shopify_dt(v):
+    """Parse Shopify datetime strings safely for new vs returning logic."""
+    if not v:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(TIMEZONE)
+        return dt
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s.replace("Z", "+0000"), fmt)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(TIMEZONE)
+            return dt
+        except Exception:
+            continue
+    return None
+
+
+def _row_to_map(headers, row):
+    return {h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)}
+
+
+def _map_to_row(headers, m):
+    return [m.get(h, "") for h in headers]
+
+# ─────────────────────────────────────────────────────────────────
+# WRITE — upsert (no borra datos históricos)
+# ─────────────────────────────────────────────────────────────────
+def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
+    sh = gc.open_by_key(sheet_id)
+
+    # ── kpis_daily ──────────────────────────────────────────────
+    try:    ws = sh.worksheet("kpis_daily")
+    except: ws = sh.add_worksheet("kpis_daily", rows=600, cols=40)
+
+    existing_vals = ws.get_all_values()
+    existing = {}
+    if len(existing_vals) >= 2:
+        ex_h = existing_vals[0]
+        for r in existing_vals[1:]:
+            m  = _row_to_map(ex_h, r)
+            pk = str(m.get("period", "")).strip()
+            if pk:
+                existing[pk] = _map_to_row(HEADERS, m)
+    for r in kpi_rows:
+        existing[str(r[1]).strip()] = r
+
+    merged = sorted(existing.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
+    ws.clear()
+    ws.append_row(HEADERS)
+    if merged:
+        ws.append_rows(merged, value_input_option="USER_ENTERED")
+    print(f"    kpis_daily: {len(merged)} rows")
+
+    # ── revenue_share ────────────────────────────────────────────
+    try:    ws_rs = sh.worksheet("revenue_share")
+    except: ws_rs = sh.add_worksheet("revenue_share", rows=600, cols=12)
+
+    rs_headers = [
+        "updated_at", "period", "channel",
+        "amount", "pct",
+        "gross_profit", "gross_margin",
+        "pct_prev", "pct_chg",
+        "gp_is_estimate",
+    ]
+    rs_vals = ws_rs.get_all_values()
+    existing_rs = {}
+    if len(rs_vals) >= 2:
+        ex_h = rs_vals[0]
+        for r in rs_vals[1:]:
+            m  = _row_to_map(ex_h, r)
+            p  = str(m.get("period",  "")).strip()
+            ch = str(m.get("channel", "")).strip()
+            if p and ch:
+                existing_rs[(p, ch)] = _map_to_row(rs_headers, m)
+    for r in rs_rows:
+        existing_rs[(str(r[1]).strip(), str(r[2]).strip())] = r
+
+    sorted_rs = sorted(existing_rs.values(), key=lambda r: (str(r[2]), str(r[1])))
+    rs_idx    = {(str(r[2]).strip(), str(r[1]).strip()): r for r in sorted_rs}
+
+    for r in sorted_rs:
+        ch = str(r[2]).strip()
+        pk = str(r[1]).strip()
+        prev_pk = None
+        if pk.startswith("mtd_"):
+            yr, mo  = map(int, pk[4:].split("-"))
+            pmo     = mo - 1 if mo > 1 else 12
+            py      = yr if mo > 1 else yr - 1
+            prev_pk = f"mtd_{py}-{str(pmo).zfill(2)}"
+        elif pk.startswith("week_"):
+            try:
+                d_      = datetime.strptime(pk[5:], "%Y-%m-%d").date()
+                prev_pk = f"week_{d_ - timedelta(days=7)}"
+            except Exception:
+                pass
+        elif len(pk) == 7 and "-" in pk:
+            yr, mo  = int(pk[:4]), int(pk[5:])
+            pmo     = mo - 1 if mo > 1 else 12
+            py      = yr if mo > 1 else yr - 1
+            prev_pk = f"{py}-{str(pmo).zfill(2)}"
+        elif pk.startswith("q") and "_" in pk:
+            parts   = pk[1:].split("_")
+            q, yr   = int(parts[0]), int(parts[1])
+            pq      = q - 1 if q > 1 else 4
+            py      = yr if q > 1 else yr - 1
+            prev_pk = f"q{pq}_{py}"
+
+        prev_row = rs_idx.get((ch, prev_pk)) if prev_pk else None
+        pct_now  = float(r[4]) if r[4] not in ("", "None") else None
+        pct_prev = float(prev_row[4]) if prev_row and prev_row[4] not in ("", "None") else None
+        pct_chg  = round(pct_now - pct_prev, 2) \
+                   if pct_now is not None and pct_prev is not None else None
+        while len(r) < len(rs_headers):
+            r.append("")
+        r[7] = pct_prev if pct_prev is not None else ""
+        r[8] = pct_chg  if pct_chg  is not None else ""
+
+    merged_rs = sorted(existing_rs.values(), key=lambda r: (str(r[1]), str(r[2])))
+    ws_rs.clear()
+    ws_rs.append_row(rs_headers)
+    if merged_rs:
+        ws_rs.append_rows(merged_rs, value_input_option="USER_ENTERED")
+    print(f"    revenue_share: {len(merged_rs)} rows")
+
+    # ── new_vs_returning ─────────────────────────────────────────
+    try:    ws_nvr = sh.worksheet("new_vs_returning")
+    except: ws_nvr = sh.add_worksheet("new_vs_returning", rows=300, cols=12)
+
+    nvr_headers = [
+        "updated_at", "period", "period_start", "period_end",
+        "new_customers", "returning_customers",
+        "new_revenue", "returning_revenue",
+        "new_gross_profit", "returning_gross_profit",
+    ]
+    nvr_vals = ws_nvr.get_all_values()
+    existing_nvr = {}
+    if len(nvr_vals) >= 2:
+        ex_h = nvr_vals[0]
+        for r in nvr_vals[1:]:
+            m  = _row_to_map(ex_h, r)
+            pk = str(m.get("period", "")).strip()
+            if pk:
+                existing_nvr[pk] = _map_to_row(nvr_headers, m)
+    for r in nvr_rows:
+        existing_nvr[str(r[1]).strip()] = r
+
+    merged_nvr = sorted(existing_nvr.values(), key=lambda r: (_safe_date(r[2]), str(r[1])))
+    ws_nvr.clear()
+    ws_nvr.append_row(nvr_headers)
+    if merged_nvr:
+        ws_nvr.append_rows(merged_nvr, value_input_option="USER_ENTERED")
+    print(f"    new_vs_returning: {len(merged_nvr)} rows")
+
+    # ── ad_spend ─────────────────────────────────────────────────
+    try:    ws_ad = sh.worksheet("ad_spend")
+    except: ws_ad = sh.add_worksheet("ad_spend", rows=200, cols=10)
+
+    ad_headers = [
+        "updated_at", "brand", "period", "period_start", "period_end",
+        "ad_spend", "roas", "cos", "cac_auto",
+    ]
+    now_str    = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    brand_data = AD_SPEND_DATA.get(brand_name, {})
+
+    nc_by_month = {}
+    for r in merged:
+        pk = str(r[1]).strip()
+        if len(pk) == 7 and "-" in pk and not pk.startswith("mtd_"):
+            try:
+                nc_by_month[pk] = int(float(r[HEADERS.index("new_customers")] or 0))
+            except Exception:
+                pass
+
+    ad_rows = []
+    for mo, vals in sorted(brand_data.items()):
+        if not vals.get("spend"):
+            continue
+        yr, mn = int(mo[:4]), int(mo[5:])
+        ps     = f"{mo}-01"
+        pe     = f"{mo}-{calendar.monthrange(yr, mn)[1]:02d}"
+        nc     = nc_by_month.get(mo, 0)
+        spend  = vals.get("spend", 0)
+        cac_auto = round(spend / nc, 2) if nc > 0 else ""
+        ad_rows.append([
+            now_str, brand_name, mo, ps, pe,
+            spend, vals.get("roas", 0), vals.get("cos", 0), cac_auto,
+        ])
+
+    ws_ad.clear()
+    ws_ad.append_row(ad_headers)
+    if ad_rows:
+        ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED")
+    print(f"    ad_spend: {len(ad_rows)} months")
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────
+def main():
+    gc      = get_gc()
+    P       = get_periods()
+    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+
+    for brand_name, cfg in STORES.items():
+        print(f"\n{'='*60}\n  {brand_name.upper()}\n{'='*60}")
+        url, token = cfg["url"], cfg["token"]
+        kpi_rows, rs_rows, nvr_rows = [], [], []
+        smartrr_order_rows = []
+
+        periods_to_run = [
+            {"label": "MTD",          "cur": "mtd",          "is_snapshot": False},
+            # These MTD snapshots are required by the dashboard so Previous Period and YOY compare MTD vs MTD,
+            # never current partial month vs a full month.
+            {"label": "MTD_PREV",     "cur": "mtd_prev",     "is_snapshot": True},
+            {"label": "MTD_YOY",      "cur": "mtd_yoy",      "is_snapshot": True},
+            {"label": "WEEK",         "cur": "week",         "is_snapshot": False},
+            {"label": "MONTH",        "cur": "month",        "is_snapshot": False},
+            {"label": "QUARTER",      "cur": "quarter",      "is_snapshot": False},
+            {"label": "WEEK_PREV",    "cur": "week_prev",    "is_snapshot": True},
+            {"label": "WEEK_YOY",     "cur": "week_yoy",     "is_snapshot": True},
+            {"label": "MONTH_PREV",   "cur": "month_prev",   "is_snapshot": True},
+            {"label": "MONTH_YOY",    "cur": "month_yoy",    "is_snapshot": True},
+            {"label": "QUARTER_PREV", "cur": "quarter_prev", "is_snapshot": True},
+            {"label": "QUARTER_YOY",  "cur": "quarter_yoy",  "is_snapshot": True},
+        ]
+
+        for it in periods_to_run:
+            label    = it["label"]
+            cur_k    = it["cur"]
+            s, e, pk = P[cur_k]
+            if pk is None:
+                continue
+
+            print(f"\n  [{label}] {s} → {e}  (period='{pk}')")
+
+            sal  = fetch_sales(url, token, s, e)
+            sess = fetch_sessions(url, token, s, e)
+            of   = fetch_orders_fulfilled(url, token, s, e)
+            ords = fetch_orders(url, token, s, e)
+            if brand_name == "cavali":
+                smartrr_order_rows.extend(build_smartrr_product_volume_from_orders(now_str, brand_name, pk, s, e, ords))
+            nvr  = fetch_new_vs_returning(url, token, s, e)
+
+            cur = build(sal, ords, nvr, sess, of)
+            kpi_rows.append(make_kpi_row(now_str, pk, s, e, cur))
+
+            gm_pct = sal.get("pct_gm", 0)
+            rs     = calc_rs(ords, gm_pct)
+            for ch, v in rs.items():
+                rs_rows.append([
+                    now_str, pk, ch,
+                    v["amount"], v["pct"],
+                    v["gross_profit"], v["gross_margin"],
+                    "", "",
+                    str(v["gp_is_estimate"]),
+                ])
+
+            nvr_rows.append([
+                now_str, pk, str(s), str(e),
+                nvr.get("new_customers",          0),
+                nvr.get("returning_customers",    0),
+                nvr.get("new_revenue",            0),
+                nvr.get("returning_revenue",      0),
+                cur.get("new_gross_profit",       0),
+                cur.get("returning_gross_profit", 0),
+            ])
+
+        write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
+
+        if brand_name == "cavali":
+            # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.
+            # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
+            active_states = fetch_smartrr_active_purchase_states(brand_name)
+            period_defs = [(r[1], r[2], r[3]) for r in kpi_rows if r and r[1] and r[2] and r[3]]
+            active_rows, active_norm, paused_norm, cancelled_norm = build_smartrr_product_volume_rows(now_str, brand_name, active_states, period_defs, url, token)
+            smartrr_rows = merge_smartrr_product_volume_rows(smartrr_order_rows, active_rows, active_norm, paused_norm, cancelled_norm)
+            write_smartrr_product_volume(gc, cfg["sheet_id"], smartrr_rows, [p[0] for p in period_defs])
+
+        print(f"\n  ✓ {brand_name.upper()} — {len(kpi_rows)} periods written")
+        for row in kpi_rows:
+            print(f"    {row[1]:<24}  {row[2]} → {row[3]}"
+                  f"  gross:{float(row[4] or 0):>12,.2f}"
+                  f"  net:{float(row[5] or 0):>12,.2f}"
+                  f"  gp:{float(row[6] or 0):>10,.2f}"
+                  f"  new_cust:{int(row[20] or 0):>5}")
+
+
+if __name__ == "__main__":
+    main()
