@@ -666,11 +666,11 @@ def classify_revenue_channel(order):
 
     # HITS / HITS Hudson / HITS Houston / tags such as "missing hits Houston".
     # Word-boundary matching avoids accidental partial-word matches.
-    is_hits = bool(re.search(r"\\bhits\\b", tags)) or bool(re.search(r"\\bhits\\b", src))
+    is_hits = bool(re.search(r"\bhits\b", tags)) or bool(re.search(r"\bhits\b", src))
     if is_hits:
         return "HITS"
 
-    if src == "pos" or "wellington" in tags or bool(re.search(r"(^|[,;\\s])pos($|[,;\\s])", tags)):
+    if src == "pos" or "wellington" in tags or bool(re.search(r"(^|[,;\s])pos($|[,;\s])", tags)):
         return "Wellington (POS)"
     if "concierge" in tags or "concierge" in src:
         return "Concierge"
