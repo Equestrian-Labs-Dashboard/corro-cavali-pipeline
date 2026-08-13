@@ -2442,6 +2442,108 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
         ws_ad.append_rows(ad_rows, value_input_option="USER_ENTERED")
     print(f"    ad_spend: {len(ad_rows)} months")
 
+
+# ─────────────────────────────────────────────────────────────────
+# CAVALI INVENTORY — PRODUCT TAG SNAPSHOT
+# Business rule from Ceci:
+#   • Collective products carry the separate tags "Shopify Collective" and "Cavali".
+#   • Products shared between both Shopify stores carry "CAVALI INVENTORY SPLIT".
+#
+# Tags are intentionally counted independently. A product can therefore appear
+# in both Shopify Collective and Cavali when both product tags are present.
+# ─────────────────────────────────────────────────────────────────
+
+CAVALI_INVENTORY_TAG_HEADERS = [
+    "updated_at", "brand", "tag",
+    "products", "active_products", "variants", "inventory_units",
+    "source", "note",
+]
+
+CAVALI_INVENTORY_TAGS = [
+    "Shopify Collective",
+    "Cavali",
+    "CAVALI INVENTORY SPLIT",
+]
+
+
+def _product_tag_set(product):
+    raw = (product or {}).get("tags") or ""
+    if isinstance(raw, list):
+        vals = raw
+    else:
+        vals = str(raw).split(",")
+    return {str(x).strip().lower() for x in vals if str(x).strip()}
+
+
+def fetch_cavali_inventory_tag_snapshot(store_url, token, now_str):
+    """
+    Current Cavali catalog snapshot grouped by the exact Shopify PRODUCT tags
+    requested by the business. This is inventory classification, not order tags.
+    """
+    products = rest(store_url, token, "products.json", {
+        "limit": 250,
+        "fields": "id,title,tags,status,variants",
+    })
+
+    rows = []
+    for tag in CAVALI_INVENTORY_TAGS:
+        target = tag.lower()
+        matched = [p for p in products if target in _product_tag_set(p)]
+
+        active_products = sum(
+            1 for p in matched
+            if str(p.get("status") or "active").lower() == "active"
+        )
+        variants = 0
+        inventory_units = 0
+
+        for p in matched:
+            for v in (p.get("variants") or []):
+                variants += 1
+                try:
+                    inventory_units += int(float(v.get("inventory_quantity") or 0))
+                except Exception:
+                    pass
+
+        note = (
+            "Independent product tag; overlap with other tag cards is intentional."
+            if tag in ("Shopify Collective", "Cavali")
+            else "Products split between both Shopify stores."
+        )
+
+        rows.append([
+            now_str, "cavali", tag,
+            len(matched), active_products, variants, inventory_units,
+            "Shopify product tags",
+            note,
+        ])
+
+    print(
+        "    cavali inventory tags: "
+        + " | ".join(f"{r[2]}={r[3]} products/{r[6]} units" for r in rows)
+    )
+    return rows
+
+
+def write_cavali_inventory_tags(gc, sheet_id, rows):
+    """Replace only the current Cavali inventory-tag snapshot tab."""
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet("cavali_inventory_tags")
+    except Exception:
+        ws = sh.add_worksheet(
+            "cavali_inventory_tags",
+            rows=20,
+            cols=len(CAVALI_INVENTORY_TAG_HEADERS)
+        )
+
+    ws.clear()
+    ws.append_row(CAVALI_INVENTORY_TAG_HEADERS)
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"    cavali_inventory_tags: {len(rows)} current tag rows")
+
+
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
@@ -2517,6 +2619,10 @@ def main():
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
 
         if brand_name == "cavali":
+            # Cavali Inventory: current Shopify PRODUCT tags requested by Ceci.
+            inventory_tag_rows = fetch_cavali_inventory_tag_snapshot(url, token, now_str)
+            write_cavali_inventory_tags(gc, cfg["sheet_id"], inventory_tag_rows)
+
             # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.
             # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
             active_states = fetch_smartrr_active_purchase_states(brand_name)
