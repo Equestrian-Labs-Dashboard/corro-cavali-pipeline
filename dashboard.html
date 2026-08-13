@@ -222,6 +222,12 @@ select:focus{border-color:var(--gr)}
 .smartrr-warn{background:var(--am-bg);color:var(--am);border:1px solid var(--am-bd)}
 .cavali-only{display:none}
 .is-cavali .cavali-only{display:block}
+.inv-tag-grid{display:grid;grid-template-columns:repeat(3,minmax(170px,1fr));gap:7px;width:100%}
+.inv-tag-card{background:var(--sf);border:1px solid var(--bd);border-radius:9px;padding:13px 14px;position:relative;overflow:hidden}
+.inv-tag-card .kc-val{font-size:28px}
+.inv-tag-meta{font-size:10px;color:var(--tx2);margin-top:6px;line-height:1.5}
+.inv-tag-note{font-size:9px;color:var(--tx3);margin-top:5px;line-height:1.35}
+@media(max-width:760px){.inv-tag-grid{grid-template-columns:1fr}}
 .corro-only{display:block}
 .is-cavali .corro-only{display:none}
 .foot{margin-top:20px;padding-top:12px;border-top:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:7px}
@@ -442,6 +448,15 @@ select:focus{border-color:var(--gr)}
     <div class="kg" id="s-subs"></div>
   </div>
 
+  <!-- 07 · Cavali Inventory by Shopify Product Tags -->
+  <div class="cavali-only" id="cavali-inventory-sec">
+    <div class="sec"><div class="sec-num">07</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--bl)">Cavali Inventory — Shopify Product Tags</div><div class="sec-line"></div></div>
+    <div class="ibar" style="margin-bottom:8px">
+      Available from <span>July 2026 onward</span>. Current Shopify catalog snapshot. Tags are independent: a Collective product may also carry the separate <span>Cavali</span> tag.
+    </div>
+    <div class="inv-tag-grid" id="s-cavali-inventory">${""}</div>
+  </div>
+
   <div class="sec">
     <div class="sec-num" id="mi-num">06</div>
     <div class="sec-line"></div>
@@ -648,6 +663,96 @@ function smartrrProductBucket(name) {
 function filterSmartrrRowsForCurrentPeriod(rows, opt) {
   return filterRowsForCurrentPeriod(rows, opt);
 }
+
+/* ══════════════════════════════════════════════════════
+   CAVALI INVENTORY — SHOPIFY PRODUCT TAGS
+   Source tab: cavali_inventory_tags
+══════════════════════════════════════════════════════ */
+const CAVALI_INVENTORY_START_DATE = "2026-07-01";
+let _cavaliInventoryTagCache = null, _cavaliInventoryTagTs = 0;
+
+async function fetchCavaliInventoryTagRows() {
+  if (brand !== "cavali") return [];
+  if (_cavaliInventoryTagCache && Date.now() - _cavaliInventoryTagTs < 10 * 60 * 1000) {
+    return _cavaliInventoryTagCache;
+  }
+  const rows = await fetchTab(SIDS.cavali, "cavali_inventory_tags", { silent: true });
+  _cavaliInventoryTagCache = Array.isArray(rows) ? rows : [];
+  _cavaliInventoryTagTs = Date.now();
+  return _cavaliInventoryTagCache;
+}
+
+function cavaliInventoryApplies(opt) {
+  if (!opt) return false;
+  const end = String(opt.end || "");
+  return end >= CAVALI_INVENTORY_START_DATE;
+}
+
+async function renderCavaliInventoryTags(opt) {
+  if (brand !== "cavali") return;
+
+  const section = document.getElementById("cavali-inventory-sec");
+  const el = document.getElementById("s-cavali-inventory");
+  if (!section || !el) return;
+
+  // Business rule: this inventory classification starts in July 2026.
+  // Before 2026-07-01 the section did not exist, so hide it completely
+  // instead of showing zeros that could be misread as historical data.
+  if (!cavaliInventoryApplies(opt)) {
+    section.style.display = "none";
+    return;
+  }
+
+  section.style.display = "";
+  el.innerHTML = skel(3);
+  const rows = await fetchCavaliInventoryTagRows();
+
+  if (!rows.length) {
+    el.innerHTML = `<div class="kc" style="grid-column:1/-1">
+      <div class="kc-bar" style="background:var(--am)"></div>
+      <div class="kc-lbl">Cavali Inventory Tags</div>
+      <div class="kc-val">—</div>
+      <div class="kc-note">Run Daily Dashboard Pipeline once with the updated pipeline.py to create cavali_inventory_tags.</div>
+    </div>`;
+    return;
+  }
+
+  const wanted = ["Shopify Collective", "Cavali", "CAVALI INVENTORY SPLIT"];
+  const colors = {
+    "Shopify Collective": "var(--pu)",
+    "Cavali": "var(--gr)",
+    "CAVALI INVENTORY SPLIT": "var(--bl)",
+  };
+
+  const byTag = {};
+  rows.forEach(r => { byTag[String(r.tag || "").trim()] = r; });
+
+  el.innerHTML = wanted.map(tag => {
+    const r = byTag[tag] || {};
+    const products = Math.max(0, parseInt(String(r.products || "0").replace(/,/g,""), 10) || 0);
+    const active = Math.max(0, parseInt(String(r.active_products || "0").replace(/,/g,""), 10) || 0);
+    const variants = Math.max(0, parseInt(String(r.variants || "0").replace(/,/g,""), 10) || 0);
+    const units = parseInt(String(r.inventory_units || "0").replace(/,/g,""), 10) || 0;
+    const color = colors[tag] || "var(--bl)";
+    const note = tag === "CAVALI INVENTORY SPLIT"
+      ? "Product tag for inventory split between both Shopify stores."
+      : "Exact Shopify product tag · tags are counted independently.";
+
+    return `<div class="inv-tag-card">
+      <div class="kc-bar" style="background:${color}"></div>
+      <div class="kc-lbl" style="color:${color}">${tag}</div>
+      <div class="kc-val">${products.toLocaleString("en-US")}</div>
+      <div class="kc-badges"><span class="bdg bdg-neu">Products</span></div>
+      <div class="inv-tag-meta">
+        Active products: <strong>${active.toLocaleString("en-US")}</strong><br>
+        Variants: <strong>${variants.toLocaleString("en-US")}</strong><br>
+        Inventory units: <strong>${units.toLocaleString("en-US")}</strong>
+      </div>
+      <div class="inv-tag-note">${note}</div>
+    </div>`;
+  }).join("");
+}
+
 /* ══════════════════════════════════════════════════════
    DATE HELPERS
 ══════════════════════════════════════════════════════ */
@@ -2134,7 +2239,7 @@ async function render() {
 
   const root = document.getElementById("app-root");
   if (root) root.classList.toggle("is-cavali", renderBrand==="cavali");
-  safeSet("mi-num", renderBrand==="cavali" ? "07" : "06");
+  safeSet("mi-num", renderBrand==="cavali" ? "08" : "06");
 
   const skelIds = { "s-web": 5, "s-emma": 6, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
@@ -2232,6 +2337,8 @@ async function render() {
   if (renderBrand==="cavali") {
     await renderSubs();
     if (isStale()) return;
+    await renderCavaliInventoryTags(opt);
+    if (isStale()) return;
   }
 
   renderIbar(opt, cmpLbl);
@@ -2251,7 +2358,7 @@ async function render() {
 ══════════════════════════════════════════════════════ */
 function togglePanel(id) { const el=document.getElementById(id); if(el) el.classList.toggle("open"); }
 function forceRefresh() {
-  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0;
+  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0; _cavaliInventoryTagCache = null; _cavaliInventoryTagTs = 0;
   try { Object.keys(localStorage).filter(k=>k.startsWith("el_sheet_cache__")).forEach(k=>localStorage.removeItem(k)); } catch(e) {}
   const btn = document.querySelector(".rf-btn");
   if (btn) btn.style.opacity = ".5";
