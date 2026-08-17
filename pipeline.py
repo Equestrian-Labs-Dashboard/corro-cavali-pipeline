@@ -2493,7 +2493,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
 #
 # IMPORTANT:
 #   - This section is displayed only for Cavali.
-#   - It is available from July 2026 onward in dashboard.html.
+#   - It is available from August 2026 onward in dashboard.html.
 #   - It does NOT change any sales/financial/Smartrr/HITS logic.
 #   - Split Corro-side inventory is intentionally NOT labeled as the total
 #     company split inventory because Jordyn confirmed the remaining portion
@@ -2507,14 +2507,21 @@ CAVALI_INVENTORY_HEADERS = [
     "is_complete_total", "note",
 ]
 
-COLLECTIVE_PRODUCT_TAG = os.environ.get("CAVALI_COLLECTIVE_TAG", "Shopify Collective")
+# Collective validation (Cavali Shopify / Sidekick, Aug 2026):
+#   - 5 products use exact tag "Shopify Collective" and are supplied via Kensington.
+#   - 40 products use exact tag "ALL COLLECTIVE" and are held at Cavali Club HQ.
+# Together these make the current Collective catalog.
+COLLECTIVE_PRODUCT_TAGS = [
+    os.environ.get("CAVALI_COLLECTIVE_TAG", "Shopify Collective"),
+    os.environ.get("CAVALI_ALL_COLLECTIVE_TAG", "ALL COLLECTIVE"),
+]
 SPLIT_PRODUCT_TAG = os.environ.get("CAVALI_SPLIT_TAG", "CAVALI INVENTORY SPLIT")
 
-# Location-name defaults come from the operations reports / HITS configuration.
-COLLECTIVE_LOCATION_NAME = os.environ.get(
-    "CAVALI_COLLECTIVE_LOCATION_NAME",
-    "Cavali Club via Shopify Collective",
-)
+# Current operational locations confirmed in Shopify / Jordyn's inventory context.
+COLLECTIVE_LOCATION_NAMES = [
+    os.environ.get("CAVALI_COLLECTIVE_HQ_LOCATION", "Cavali Club HQ"),
+    os.environ.get("CAVALI_COLLECTIVE_SUPPLIER_LOCATION", "Kensington via Shopify Collective"),
+]
 WELLINGTON_LOCATION_NAME = os.environ.get(
     "CAVALI_WELLINGTON_LOCATION_NAME",
     "New Wellington Warehouse",
@@ -2581,6 +2588,95 @@ def _fetch_tagged_products(store_url, token, exact_tag):
         p for p in (products or [])
         if target and target in _inventory_tag_set(p)
     ]
+
+
+def _fetch_collective_products(store_url, token):
+    """
+    Cavali Collective catalog confirmed from Shopify in Aug 2026.
+
+    Include products carrying either exact PRODUCT tag:
+      - Shopify Collective
+      - ALL COLLECTIVE
+
+    This matches the two Collective populations currently visible in Cavali
+    Shopify (supplier-managed Kensington + Cavali Club HQ inventory).
+    """
+    products = rest(store_url, token, "products.json", {
+        "limit": 250,
+        "fields": "id,title,tags,status,variants",
+    })
+
+    targets = {
+        str(tag or "").strip().lower()
+        for tag in COLLECTIVE_PRODUCT_TAGS
+        if str(tag or "").strip()
+    }
+
+    matched = []
+    for p in products or []:
+        tags = _inventory_tag_set(p)
+        if tags.intersection(targets):
+            matched.append(p)
+
+    print(
+        "    collective product-tag match: "
+        f"{len(matched)} products using "
+        + " + ".join(COLLECTIVE_PRODUCT_TAGS)
+    )
+    return matched
+
+
+def _summarize_products_across_locations(store_url, token, products, wanted_location_names):
+    """
+    Sum AVAILABLE inventory for the supplied product population across only
+    the requested Shopify locations. Product/variant counts are counted once.
+    """
+    locations = _fetch_locations(store_url, token)
+    selected = []
+
+    for wanted in wanted_location_names:
+        loc = _find_location(locations, wanted)
+        if loc:
+            selected.append(loc)
+        else:
+            print(
+                f"    ⚠ collective inventory location not found: '{wanted}'. "
+                "Available: "
+                + ", ".join(str(x.get("name") or "") for x in locations[:20])
+            )
+
+    variants = []
+    for p in products or []:
+        variants.extend(p.get("variants") or [])
+
+    item_ids = _inventory_item_ids(products)
+    total_units = 0
+    location_breakdown = []
+
+    for loc in selected:
+        levels = _inventory_levels_for_location(
+            store_url, token, item_ids, loc.get("id")
+        )
+        units = sum(int(v or 0) for v in levels.values())
+        total_units += units
+        location_breakdown.append(
+            f"{str(loc.get('name') or '')}={units}"
+        )
+
+    print(
+        "    collective inventory locations: "
+        + (" | ".join(location_breakdown) if location_breakdown else "none found")
+    )
+
+    return {
+        "inventory_units": total_units,
+        "products": len(products or []),
+        "variants": len(variants),
+        "location_name": " + ".join(
+            str(loc.get("name") or "") for loc in selected
+        ) or "Cavali Collective locations",
+        "location_found": bool(selected),
+    }
 
 
 def _inventory_item_ids(products):
@@ -2677,28 +2773,41 @@ def _summarize_tag_inventory(store_url, token, exact_tag, wanted_location_name):
 
 def fetch_cavali_inventory_snapshot(now_str):
     """
-    Build the four Cavali Inventory KPI rows.
+    Build Cavali Inventory KPI rows from the operational definition supplied
+    by Ceci/Jordyn and validated against the current Shopify catalogs.
 
-    Collective source:
-      Cavali Shopify + exact PRODUCT tag "Shopify Collective"
-      + inventory at "Cavali Club via Shopify Collective".
+    COLLECTIVE
+      Cavali Shopify:
+        exact product tags "Shopify Collective" OR "ALL COLLECTIVE"
+      Inventory locations:
+        Cavali Club HQ + Kensington via Shopify Collective
+      KPI = total AVAILABLE units across those two locations.
 
-    Split source:
-      Corro Shopify + exact PRODUCT tag "CAVALI INVENTORY SPLIT"
-      + inventory at New Wellington Warehouse / Corro Trailer 1.
+    SPLIT
+      Corro Shopify:
+        exact product tag "CAVALI INVENTORY SPLIT"
+      Corro-side inventory locations:
+        New Wellington Warehouse + Corro Trailer 1
 
-    The split Corro total = Wellington + Trailer.
-    It is explicitly marked incomplete as a company-wide split total because
-    the remaining split inventory allocated to Cavali Shopify is not included.
+    Important:
+      The Split Corro Side Total is NOT the company-wide split total because
+      Jordyn confirmed the remaining split allocation in Cavali Shopify is not
+      included in the Corro-side report.
+
+    This section starts in August 2026 only.
     """
     cavali_cfg = STORES["cavali"]
     corro_cfg = STORES["corro"]
 
-    collective = _summarize_tag_inventory(
-        cavali_cfg["url"], cavali_cfg["token"],
-        COLLECTIVE_PRODUCT_TAG,
-        COLLECTIVE_LOCATION_NAME,
+    collective_products = _fetch_collective_products(
+        cavali_cfg["url"], cavali_cfg["token"]
     )
+    collective = _summarize_products_across_locations(
+        cavali_cfg["url"], cavali_cfg["token"],
+        collective_products,
+        COLLECTIVE_LOCATION_NAMES,
+    )
+
     split_wh = _summarize_tag_inventory(
         corro_cfg["url"], corro_cfg["token"],
         SPLIT_PRODUCT_TAG,
@@ -2710,7 +2819,6 @@ def fetch_cavali_inventory_snapshot(now_str):
         CORRO_TRAILER_LOCATION_NAME,
     )
 
-    # Product/variant counts for split are the same exact-tag catalog population.
     split_products = max(split_wh["products"], split_trailer["products"])
     split_variants = max(split_wh["variants"], split_trailer["variants"])
     split_corroside_units = (
@@ -2725,9 +2833,10 @@ def fetch_cavali_inventory_snapshot(now_str):
         [
             snapshot_date, snapshot_month, now_str, "cavali", "Collective Inventory",
             collective["inventory_units"], collective["products"], collective["variants"],
-            collective["location_name"], "Cavali Shopify", COLLECTIVE_PRODUCT_TAG,
+            collective["location_name"], "Cavali Shopify",
+            "Shopify Collective + ALL COLLECTIVE",
             "true",
-            "Products sold through Collective; inventory strictly held in Cavali Club Shopify.",
+            "All current Collective inventory in Cavali Shopify across Cavali Club HQ and Kensington via Shopify Collective.",
         ],
         [
             snapshot_date, snapshot_month, now_str, "cavali", "Split Inventory — Wellington WH",
@@ -2754,7 +2863,8 @@ def fetch_cavali_inventory_snapshot(now_str):
 
     print(
         "    cavali inventory: "
-        f"Collective={collective['inventory_units']} units | "
+        f"Collective={collective['inventory_units']} units "
+        f"({collective['products']} products/{collective['variants']} variants) | "
         f"Split WH={split_wh['inventory_units']} | "
         f"Split Trailer={split_trailer['inventory_units']} | "
         f"Split Corro-side total={split_corroside_units}"
@@ -2771,8 +2881,8 @@ def write_cavali_inventory(gc, sheet_id, rows):
         return
 
     snapshot_date = str(rows[0][0] or "")[:10]
-    if snapshot_date < "2026-07-01":
-        print("    cavali_inventory: skipped before 2026-07-01")
+    if snapshot_date < "2026-08-01":
+        print("    cavali_inventory: skipped before 2026-08-01")
         return
 
     sh = open_sheet_with_retry(gc, sheet_id)
@@ -2802,7 +2912,7 @@ def write_cavali_inventory(gc, sheet_id, rows):
             for row in existing[1:]:
                 updated_at = get_old(row, "updated_at", "")
                 old_date = str(updated_at)[:10]
-                if old_date >= "2026-07-01":
+                if old_date >= "2026-08-01":
                     migrated.append([
                         old_date, old_date[:7], updated_at,
                         get_old(row, "brand", "cavali"),
@@ -2829,6 +2939,8 @@ def write_cavali_inventory(gc, sheet_id, rows):
         if not row:
             continue
         row_date = str(row[0] if len(row) else "")[:10]
+        if row_date < "2026-08-01":
+            continue
         if row_date != snapshot_date:
             kept.append(row)
 
