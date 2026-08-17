@@ -452,7 +452,7 @@ select:focus{border-color:var(--gr)}
   <div class="cavali-only" id="cavali-inventory-sec">
     <div class="sec"><div class="sec-num">07</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--bl)">Cavali Inventory — Collective & Split</div><div class="sec-line"></div></div>
     <div class="ibar" style="margin-bottom:8px">
-      Available from <span>July 2026 onward</span>. Historical inventory snapshot for the selected period: Collective inventory is held in Cavali Shopify; Split inventory shown here is the Corro-side inventory at Wellington + Corro Trailer and does not include the remaining split allocation in Cavali Shopify.
+      Available from <span>August 2026 onward</span>. Inventory snapshot for the selected period: Collective includes the Cavali Shopify Collective catalog across Cavali Club HQ + Kensington via Shopify Collective. Split inventory shown here is the Corro-side inventory at Wellington + Corro Trailer and does not include the remaining split allocation in Cavali Shopify.
     </div>
     <div class="inv-tag-grid" id="s-cavali-inventory">${""}</div>
   </div>
@@ -665,10 +665,10 @@ function filterSmartrrRowsForCurrentPeriod(rows, opt) {
 }
 
 /* ══════════════════════════════════════════════════════
-   CAVALI INVENTORY — SHOPIFY PRODUCT TAGS
+   CAVALI INVENTORY — COLLECTIVE + SPLIT
    Source tab: cavali_inventory
 ══════════════════════════════════════════════════════ */
-const CAVALI_INVENTORY_START_DATE = "2026-07-01";
+const CAVALI_INVENTORY_START_DATE = "2026-08-01";
 let _cavaliInventoryTagCache = null, _cavaliInventoryTagTs = 0;
 
 async function fetchCavaliInventoryTagRows() {
