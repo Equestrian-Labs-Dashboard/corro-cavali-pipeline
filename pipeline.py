@@ -2501,7 +2501,7 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
 # ─────────────────────────────────────────────────────────────────
 
 CAVALI_INVENTORY_HEADERS = [
-    "updated_at", "brand", "metric",
+    "snapshot_date", "snapshot_month", "updated_at", "brand", "metric",
     "inventory_units", "products", "variants",
     "location_name", "source_store", "product_tag",
     "is_complete_total", "note",
@@ -2718,30 +2718,33 @@ def fetch_cavali_inventory_snapshot(now_str):
         + int(split_trailer["inventory_units"] or 0)
     )
 
+    snapshot_date = str(now_str)[:10]
+    snapshot_month = snapshot_date[:7]
+
     rows = [
         [
-            now_str, "cavali", "Collective Inventory",
+            snapshot_date, snapshot_month, now_str, "cavali", "Collective Inventory",
             collective["inventory_units"], collective["products"], collective["variants"],
             collective["location_name"], "Cavali Shopify", COLLECTIVE_PRODUCT_TAG,
             "true",
             "Products sold through Collective; inventory strictly held in Cavali Club Shopify.",
         ],
         [
-            now_str, "cavali", "Split Inventory — Wellington WH",
+            snapshot_date, snapshot_month, now_str, "cavali", "Split Inventory — Wellington WH",
             split_wh["inventory_units"], split_wh["products"], split_wh["variants"],
             split_wh["location_name"], "Corro Shopify", SPLIT_PRODUCT_TAG,
             "false",
             "Corro-side split inventory currently available at New Wellington Warehouse.",
         ],
         [
-            now_str, "cavali", "Split Inventory — Corro Trailer",
+            snapshot_date, snapshot_month, now_str, "cavali", "Split Inventory — Corro Trailer",
             split_trailer["inventory_units"], split_trailer["products"], split_trailer["variants"],
             split_trailer["location_name"], "Corro Shopify", SPLIT_PRODUCT_TAG,
             "false",
             "Corro-side split inventory currently available at Corro Trailer 1.",
         ],
         [
-            now_str, "cavali", "Split Inventory — Corro Side Total",
+            snapshot_date, snapshot_month, now_str, "cavali", "Split Inventory — Corro Side Total",
             split_corroside_units, split_products, split_variants,
             "New Wellington Warehouse + Corro Trailer 1", "Corro Shopify", SPLIT_PRODUCT_TAG,
             "false",
@@ -2761,24 +2764,82 @@ def fetch_cavali_inventory_snapshot(now_str):
 
 def write_cavali_inventory(gc, sheet_id, rows):
     """
-    Replace ONLY the Cavali inventory snapshot tab.
-    No KPI/sales/Smartrr/revenue-share sheets are modified here.
+    Guarda snapshots diarios históricos SOLO para Cavali Inventory.
+    No toca ninguna otra pestaña ni lógica del dashboard.
     """
+    if not rows:
+        return
+
+    snapshot_date = str(rows[0][0] or "")[:10]
+    if snapshot_date < "2026-07-01":
+        print("    cavali_inventory: skipped before 2026-07-01")
+        return
+
     sh = open_sheet_with_retry(gc, sheet_id)
     try:
         ws = sh.worksheet("cavali_inventory")
     except Exception:
         ws = sh.add_worksheet(
             "cavali_inventory",
-            rows=30,
+            rows=5000,
             cols=len(CAVALI_INVENTORY_HEADERS)
         )
+        ws.append_row(CAVALI_INVENTORY_HEADERS)
+
+    existing = ws.get_all_values()
+
+    # Upgrade only this one sheet if it still has the old schema.
+    if not existing or existing[0] != CAVALI_INVENTORY_HEADERS:
+        migrated = []
+        if existing:
+            old_header = existing[0]
+            idx = {h: i for i, h in enumerate(old_header)}
+
+            def get_old(row, name, default=""):
+                i = idx.get(name)
+                return row[i] if i is not None and i < len(row) else default
+
+            for row in existing[1:]:
+                updated_at = get_old(row, "updated_at", "")
+                old_date = str(updated_at)[:10]
+                if old_date >= "2026-07-01":
+                    migrated.append([
+                        old_date, old_date[:7], updated_at,
+                        get_old(row, "brand", "cavali"),
+                        get_old(row, "metric"),
+                        get_old(row, "inventory_units", "0"),
+                        get_old(row, "products", "0"),
+                        get_old(row, "variants", "0"),
+                        get_old(row, "location_name"),
+                        get_old(row, "source_store"),
+                        get_old(row, "product_tag"),
+                        get_old(row, "is_complete_total"),
+                        get_old(row, "note"),
+                    ])
+
+        ws.clear()
+        ws.append_row(CAVALI_INVENTORY_HEADERS)
+        if migrated:
+            ws.append_rows(migrated, value_input_option="USER_ENTERED")
+        existing = [CAVALI_INVENTORY_HEADERS] + migrated
+
+    # Re-run same day = replace only that day's 4 Cavali Inventory rows.
+    kept = [CAVALI_INVENTORY_HEADERS]
+    for row in existing[1:]:
+        if not row:
+            continue
+        row_date = str(row[0] if len(row) else "")[:10]
+        if row_date != snapshot_date:
+            kept.append(row)
+
+    kept.extend(rows)
 
     ws.clear()
-    ws.append_row(CAVALI_INVENTORY_HEADERS)
-    if rows:
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"    cavali_inventory: {len(rows)} KPI rows")
+    ws.append_rows(kept, value_input_option="USER_ENTERED")
+    print(
+        f"    cavali_inventory: saved {len(rows)} KPI rows for {snapshot_date}; "
+        f"historical rows={max(0, len(kept)-1)}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
