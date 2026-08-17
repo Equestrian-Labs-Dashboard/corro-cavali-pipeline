@@ -2444,29 +2444,50 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
 
 
 # ─────────────────────────────────────────────────────────────────
-# CAVALI INVENTORY — PRODUCT TAG SNAPSHOT
-# Business rule from Ceci:
-#   • Collective products carry the separate tags "Shopify Collective" and "Cavali".
-#   • Products shared between both Shopify stores carry "CAVALI INVENTORY SPLIT".
+# CAVALI INVENTORY — COLLECTIVE + SPLIT
+# Source of truth:
+#   - Ceci / Jordyn inventory definition (Aug 2026)
+#   - Collective: products sold through Collective; inventory strictly held
+#     in Cavali Club Shopify.
+#   - Split: products NOT sold through Collective whose inventory is split
+#     between Corro and Cavali Shopifys. The operational report exposes the
+#     Corro-side quantities at New Wellington Warehouse + Corro Trailer 1.
 #
-# Tags are intentionally counted independently. A product can therefore appear
-# in both Shopify Collective and Cavali when both product tags are present.
+# IMPORTANT:
+#   - This section is displayed only for Cavali.
+#   - It is available from July 2026 onward in dashboard.html.
+#   - It does NOT change any sales/financial/Smartrr/HITS logic.
+#   - Split Corro-side inventory is intentionally NOT labeled as the total
+#     company split inventory because Jordyn confirmed the remaining portion
+#     allocated to Cavali Shopify is not included in that report.
 # ─────────────────────────────────────────────────────────────────
 
-CAVALI_INVENTORY_TAG_HEADERS = [
-    "updated_at", "brand", "tag",
-    "products", "active_products", "variants", "inventory_units",
-    "source", "note",
+CAVALI_INVENTORY_HEADERS = [
+    "updated_at", "brand", "metric",
+    "inventory_units", "products", "variants",
+    "location_name", "source_store", "product_tag",
+    "is_complete_total", "note",
 ]
 
-CAVALI_INVENTORY_TAGS = [
-    "Shopify Collective",
-    "Cavali",
-    "CAVALI INVENTORY SPLIT",
-]
+COLLECTIVE_PRODUCT_TAG = os.environ.get("CAVALI_COLLECTIVE_TAG", "Shopify Collective")
+SPLIT_PRODUCT_TAG = os.environ.get("CAVALI_SPLIT_TAG", "CAVALI INVENTORY SPLIT")
+
+# Location-name defaults come from the operations reports / HITS configuration.
+COLLECTIVE_LOCATION_NAME = os.environ.get(
+    "CAVALI_COLLECTIVE_LOCATION_NAME",
+    "Cavali Club via Shopify Collective",
+)
+WELLINGTON_LOCATION_NAME = os.environ.get(
+    "CAVALI_WELLINGTON_LOCATION_NAME",
+    "New Wellington Warehouse",
+)
+CORRO_TRAILER_LOCATION_NAME = os.environ.get(
+    "CAVALI_CORRO_TRAILER_LOCATION_NAME",
+    "Corro Trailer 1",
+)
 
 
-def _product_tag_set(product):
+def _inventory_tag_set(product):
     raw = (product or {}).get("tags") or ""
     if isinstance(raw, list):
         vals = raw
@@ -2475,73 +2496,251 @@ def _product_tag_set(product):
     return {str(x).strip().lower() for x in vals if str(x).strip()}
 
 
-def fetch_cavali_inventory_tag_snapshot(store_url, token, now_str):
+def _fetch_locations(store_url, token):
+    """Return Shopify locations available to the store."""
+    try:
+        return rest(store_url, token, "locations.json", {
+            "limit": 250,
+            "fields": "id,name,active",
+        })
+    except Exception as exc:
+        print(f"    ⚠ inventory locations fetch failed for {store_url}: {exc}")
+        return []
+
+
+def _find_location(locations, wanted_name):
     """
-    Current Cavali catalog snapshot grouped by the exact Shopify PRODUCT tags
-    requested by the business. This is inventory classification, not order tags.
+    Prefer exact location-name match, then case-insensitive contains match.
+    This avoids hard-coding location IDs while still allowing env overrides.
+    """
+    wanted = str(wanted_name or "").strip().lower()
+    if not wanted:
+        return None
+
+    for loc in locations or []:
+        if str(loc.get("name") or "").strip().lower() == wanted:
+            return loc
+
+    for loc in locations or []:
+        nm = str(loc.get("name") or "").strip().lower()
+        if wanted in nm or nm in wanted:
+            return loc
+
+    return None
+
+
+def _fetch_tagged_products(store_url, token, exact_tag):
+    """
+    Pull products and retain only exact PRODUCT-tag matches.
+    Inventory uses variants/inventory_item_id, never order tags.
     """
     products = rest(store_url, token, "products.json", {
         "limit": 250,
         "fields": "id,title,tags,status,variants",
     })
+    target = str(exact_tag or "").strip().lower()
+    return [
+        p for p in (products or [])
+        if target and target in _inventory_tag_set(p)
+    ]
 
-    rows = []
-    for tag in CAVALI_INVENTORY_TAGS:
-        target = tag.lower()
-        matched = [p for p in products if target in _product_tag_set(p)]
 
-        active_products = sum(
-            1 for p in matched
-            if str(p.get("status") or "active").lower() == "active"
+def _inventory_item_ids(products):
+    ids = []
+    seen = set()
+    for p in products or []:
+        for v in p.get("variants") or []:
+            iid = v.get("inventory_item_id")
+            if iid in (None, ""):
+                continue
+            iid = str(iid)
+            if iid not in seen:
+                seen.add(iid)
+                ids.append(iid)
+    return ids
+
+
+def _inventory_levels_for_location(store_url, token, inventory_item_ids, location_id):
+    """
+    Fetch available units for a set of inventory items at one exact Shopify
+    location. Shopify accepts inventory_item_ids in batches.
+    """
+    if not inventory_item_ids or location_id in (None, ""):
+        return {}
+
+    out = {}
+    batch_size = 50
+
+    for i in range(0, len(inventory_item_ids), batch_size):
+        batch = inventory_item_ids[i:i + batch_size]
+        try:
+            levels = rest(store_url, token, "inventory_levels.json", {
+                "inventory_item_ids": ",".join(batch),
+                "location_ids": str(location_id),
+                "limit": 250,
+            })
+        except Exception as exc:
+            print(f"    ⚠ inventory_levels failed for location {location_id}: {exc}")
+            continue
+
+        for level in levels or []:
+            iid = str(level.get("inventory_item_id") or "")
+            if not iid:
+                continue
+            try:
+                available = int(float(level.get("available") or 0))
+            except Exception:
+                available = 0
+            out[iid] = available
+
+    return out
+
+
+def _summarize_tag_inventory(store_url, token, exact_tag, wanted_location_name):
+    """
+    Summarize exact tagged products at the requested Shopify inventory location.
+    """
+    products = _fetch_tagged_products(store_url, token, exact_tag)
+    locations = _fetch_locations(store_url, token)
+    loc = _find_location(locations, wanted_location_name)
+
+    product_count = len(products)
+    variants = []
+    for p in products:
+        variants.extend(p.get("variants") or [])
+    variant_count = len(variants)
+
+    if not loc:
+        print(
+            f"    ⚠ inventory location not found on {store_url}: "
+            f"'{wanted_location_name}'. Available: "
+            + ", ".join(str(x.get("name") or "") for x in locations[:20])
         )
-        variants = 0
-        inventory_units = 0
+        return {
+            "inventory_units": 0,
+            "products": product_count,
+            "variants": variant_count,
+            "location_name": wanted_location_name,
+            "location_found": False,
+        }
 
-        for p in matched:
-            for v in (p.get("variants") or []):
-                variants += 1
-                try:
-                    inventory_units += int(float(v.get("inventory_quantity") or 0))
-                except Exception:
-                    pass
+    item_ids = _inventory_item_ids(products)
+    levels = _inventory_levels_for_location(store_url, token, item_ids, loc.get("id"))
+    units = sum(int(v or 0) for v in levels.values())
 
-        note = (
-            "Independent product tag; overlap with other tag cards is intentional."
-            if tag in ("Shopify Collective", "Cavali")
-            else "Products split between both Shopify stores."
-        )
+    return {
+        "inventory_units": units,
+        "products": product_count,
+        "variants": variant_count,
+        "location_name": str(loc.get("name") or wanted_location_name),
+        "location_found": True,
+    }
 
-        rows.append([
-            now_str, "cavali", tag,
-            len(matched), active_products, variants, inventory_units,
-            "Shopify product tags",
-            note,
-        ])
+
+def fetch_cavali_inventory_snapshot(now_str):
+    """
+    Build the four Cavali Inventory KPI rows.
+
+    Collective source:
+      Cavali Shopify + exact PRODUCT tag "Shopify Collective"
+      + inventory at "Cavali Club via Shopify Collective".
+
+    Split source:
+      Corro Shopify + exact PRODUCT tag "CAVALI INVENTORY SPLIT"
+      + inventory at New Wellington Warehouse / Corro Trailer 1.
+
+    The split Corro total = Wellington + Trailer.
+    It is explicitly marked incomplete as a company-wide split total because
+    the remaining split inventory allocated to Cavali Shopify is not included.
+    """
+    cavali_cfg = STORES["cavali"]
+    corro_cfg = STORES["corro"]
+
+    collective = _summarize_tag_inventory(
+        cavali_cfg["url"], cavali_cfg["token"],
+        COLLECTIVE_PRODUCT_TAG,
+        COLLECTIVE_LOCATION_NAME,
+    )
+    split_wh = _summarize_tag_inventory(
+        corro_cfg["url"], corro_cfg["token"],
+        SPLIT_PRODUCT_TAG,
+        WELLINGTON_LOCATION_NAME,
+    )
+    split_trailer = _summarize_tag_inventory(
+        corro_cfg["url"], corro_cfg["token"],
+        SPLIT_PRODUCT_TAG,
+        CORRO_TRAILER_LOCATION_NAME,
+    )
+
+    # Product/variant counts for split are the same exact-tag catalog population.
+    split_products = max(split_wh["products"], split_trailer["products"])
+    split_variants = max(split_wh["variants"], split_trailer["variants"])
+    split_corroside_units = (
+        int(split_wh["inventory_units"] or 0)
+        + int(split_trailer["inventory_units"] or 0)
+    )
+
+    rows = [
+        [
+            now_str, "cavali", "Collective Inventory",
+            collective["inventory_units"], collective["products"], collective["variants"],
+            collective["location_name"], "Cavali Shopify", COLLECTIVE_PRODUCT_TAG,
+            "true",
+            "Products sold through Collective; inventory strictly held in Cavali Club Shopify.",
+        ],
+        [
+            now_str, "cavali", "Split Inventory — Wellington WH",
+            split_wh["inventory_units"], split_wh["products"], split_wh["variants"],
+            split_wh["location_name"], "Corro Shopify", SPLIT_PRODUCT_TAG,
+            "false",
+            "Corro-side split inventory currently available at New Wellington Warehouse.",
+        ],
+        [
+            now_str, "cavali", "Split Inventory — Corro Trailer",
+            split_trailer["inventory_units"], split_trailer["products"], split_trailer["variants"],
+            split_trailer["location_name"], "Corro Shopify", SPLIT_PRODUCT_TAG,
+            "false",
+            "Corro-side split inventory currently available at Corro Trailer 1.",
+        ],
+        [
+            now_str, "cavali", "Split Inventory — Corro Side Total",
+            split_corroside_units, split_products, split_variants,
+            "New Wellington Warehouse + Corro Trailer 1", "Corro Shopify", SPLIT_PRODUCT_TAG,
+            "false",
+            "Wellington + Trailer only. Does NOT include the remaining split inventory allocated to Cavali Shopify.",
+        ],
+    ]
 
     print(
-        "    cavali inventory tags: "
-        + " | ".join(f"{r[2]}={r[3]} products/{r[6]} units" for r in rows)
+        "    cavali inventory: "
+        f"Collective={collective['inventory_units']} units | "
+        f"Split WH={split_wh['inventory_units']} | "
+        f"Split Trailer={split_trailer['inventory_units']} | "
+        f"Split Corro-side total={split_corroside_units}"
     )
     return rows
 
 
-def write_cavali_inventory_tags(gc, sheet_id, rows):
-    """Replace only the current Cavali inventory-tag snapshot tab."""
+def write_cavali_inventory(gc, sheet_id, rows):
+    """
+    Replace ONLY the Cavali inventory snapshot tab.
+    No KPI/sales/Smartrr/revenue-share sheets are modified here.
+    """
     sh = gc.open_by_key(sheet_id)
     try:
-        ws = sh.worksheet("cavali_inventory_tags")
+        ws = sh.worksheet("cavali_inventory")
     except Exception:
         ws = sh.add_worksheet(
-            "cavali_inventory_tags",
-            rows=20,
-            cols=len(CAVALI_INVENTORY_TAG_HEADERS)
+            "cavali_inventory",
+            rows=30,
+            cols=len(CAVALI_INVENTORY_HEADERS)
         )
 
     ws.clear()
-    ws.append_row(CAVALI_INVENTORY_TAG_HEADERS)
+    ws.append_row(CAVALI_INVENTORY_HEADERS)
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"    cavali_inventory_tags: {len(rows)} current tag rows")
+    print(f"    cavali_inventory: {len(rows)} KPI rows")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2619,9 +2818,9 @@ def main():
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
 
         if brand_name == "cavali":
-            # Cavali Inventory: current Shopify PRODUCT tags requested by Ceci.
-            inventory_tag_rows = fetch_cavali_inventory_tag_snapshot(url, token, now_str)
-            write_cavali_inventory_tags(gc, cfg["sheet_id"], inventory_tag_rows)
+            # Cavali Inventory: Collective + Split inventory per operations definition.
+            cavali_inventory_rows = fetch_cavali_inventory_snapshot(now_str)
+            write_cavali_inventory(gc, cfg["sheet_id"], cavali_inventory_rows)
 
             # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.
             # This matches the Smartrr drilldown where April uses line-item Created Date within Apr 1–Apr 30.
