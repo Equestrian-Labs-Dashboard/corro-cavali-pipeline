@@ -132,6 +132,44 @@ def get_gc():
         json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
+
+def open_sheet_with_retry(gc, sheet_id, attempts=7):
+    """
+    Open a Google Sheet with retry/backoff for temporary Google API outages.
+
+    This specifically protects the Daily pipeline from transient errors such as:
+      gspread.exceptions.APIError: APIError: [503]: The service is currently unavailable.
+
+    It does not change any spreadsheet logic or data; it only retries the same
+    read operation when Google temporarily returns 429/5xx.
+    """
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return gc.open_by_key(sheet_id)
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc)
+            transient = any(code in msg for code in (
+                "[429]", "[500]", "[502]", "[503]", "[504]",
+                "service is currently unavailable",
+                "RESOURCE_EXHAUSTED",
+            ))
+
+            if not transient or attempt >= attempts - 1:
+                raise
+
+            wait = min(45, (2 ** attempt) + random.uniform(0.5, 1.5))
+            print(
+                f"    ⚠ Google Sheets temporary error opening sheet "
+                f"(attempt {attempt + 1}/{attempts}): {exc}"
+            )
+            print(f"    ⏳ retrying Google Sheets in {wait:.1f}s...")
+            time.sleep(wait)
+
+    raise last_error
+
 # ─────────────────────────────────────────────────────────────────
 # SHOPIFY GQL — raw request
 # ─────────────────────────────────────────────────────────────────
@@ -2186,7 +2224,7 @@ def merge_smartrr_product_volume_rows(order_rows, active_rows, active_norm=None,
 
 def write_smartrr_product_volume(gc, sheet_id, rows, periods_to_replace):
     """Upsert Smartrr product-volume rows without leaving stale rows for refreshed periods."""
-    sh = gc.open_by_key(sheet_id)
+    sh = open_sheet_with_retry(gc, sheet_id)
     try:
         ws = sh.worksheet("smartrr_product_volume")
     except Exception:
@@ -2276,7 +2314,7 @@ def _map_to_row(headers, m):
 # WRITE — upsert (no borra datos históricos)
 # ─────────────────────────────────────────────────────────────────
 def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
-    sh = gc.open_by_key(sheet_id)
+    sh = open_sheet_with_retry(gc, sheet_id)
 
     # ── kpis_daily ──────────────────────────────────────────────
     try:    ws = sh.worksheet("kpis_daily")
@@ -2726,7 +2764,7 @@ def write_cavali_inventory(gc, sheet_id, rows):
     Replace ONLY the Cavali inventory snapshot tab.
     No KPI/sales/Smartrr/revenue-share sheets are modified here.
     """
-    sh = gc.open_by_key(sheet_id)
+    sh = open_sheet_with_retry(gc, sheet_id)
     try:
         ws = sh.worksheet("cavali_inventory")
     except Exception:
