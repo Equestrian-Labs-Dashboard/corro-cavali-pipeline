@@ -222,12 +222,6 @@ select:focus{border-color:var(--gr)}
 .smartrr-warn{background:var(--am-bg);color:var(--am);border:1px solid var(--am-bd)}
 .cavali-only{display:none}
 .is-cavali .cavali-only{display:block}
-.inv-tag-grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:7px;width:100%}
-.inv-tag-card{background:var(--sf);border:1px solid var(--bd);border-radius:9px;padding:13px 14px;position:relative;overflow:hidden}
-.inv-tag-card .kc-val{font-size:28px}
-.inv-tag-meta{font-size:10px;color:var(--tx2);margin-top:6px;line-height:1.5}
-.inv-tag-note{font-size:9px;color:var(--tx3);margin-top:5px;line-height:1.35}
-@media(max-width:760px){.inv-tag-grid{grid-template-columns:1fr}}
 .corro-only{display:block}
 .is-cavali .corro-only{display:none}
 .foot{margin-top:20px;padding-top:12px;border-top:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:7px}
@@ -449,14 +443,6 @@ select:focus{border-color:var(--gr)}
   </div>
 
   <!-- 07 · Cavali Inventory by Shopify Product Tags -->
-  <div class="cavali-only" id="cavali-inventory-sec">
-    <div class="sec"><div class="sec-num">07</div><div class="sec-line"></div><div class="sec-lbl" style="color:var(--bl)">Cavali Inventory — Collective & Split</div><div class="sec-line"></div></div>
-    <div class="ibar" style="margin-bottom:8px">
-      Available from <span>August 2026 onward</span>. Inventory snapshot for the selected period: Collective includes the Cavali Shopify Collective catalog across Cavali Club HQ + Kensington via Shopify Collective. Split inventory shown here is the Corro-side inventory at Wellington + Corro Trailer and does not include the remaining split allocation in Cavali Shopify.
-    </div>
-    <div class="inv-tag-grid" id="s-cavali-inventory">${""}</div>
-  </div>
-
   <div class="sec">
     <div class="sec-num" id="mi-num">06</div>
     <div class="sec-line"></div>
@@ -662,126 +648,6 @@ function smartrrProductBucket(name) {
 
 function filterSmartrrRowsForCurrentPeriod(rows, opt) {
   return filterRowsForCurrentPeriod(rows, opt);
-}
-
-/* ══════════════════════════════════════════════════════
-   CAVALI INVENTORY — COLLECTIVE + SPLIT
-   Source tab: cavali_inventory
-══════════════════════════════════════════════════════ */
-const CAVALI_INVENTORY_START_DATE = "2026-08-01";
-let _cavaliInventoryTagCache = null, _cavaliInventoryTagTs = 0;
-
-async function fetchCavaliInventoryTagRows() {
-  if (brand !== "cavali") return [];
-  if (_cavaliInventoryTagCache && Date.now() - _cavaliInventoryTagTs < 10 * 60 * 1000) {
-    return _cavaliInventoryTagCache;
-  }
-  const rows = await fetchTab(SIDS.cavali, "cavali_inventory", { silent: true });
-  _cavaliInventoryTagCache = Array.isArray(rows) ? rows : [];
-  _cavaliInventoryTagTs = Date.now();
-  return _cavaliInventoryTagCache;
-}
-
-function cavaliInventoryApplies(opt) {
-  if (!opt) return false;
-  const end = String(opt.end || "");
-  return end >= CAVALI_INVENTORY_START_DATE;
-}
-
-function cavaliInventorySnapshotForPeriod(rows, opt) {
-  if (!Array.isArray(rows) || !rows.length || !opt) return null;
-
-  const start = String(opt.start || "");
-  const end = String(opt.end || "");
-
-  const valid = rows
-    .filter(r => {
-      const d = String(r.snapshot_date || "");
-      return d && d >= start && d <= end;
-    })
-    .sort((a,b) => String(a.snapshot_date || "").localeCompare(String(b.snapshot_date || "")));
-
-  if (!valid.length) return null;
-
-  const latestDate = String(valid[valid.length - 1].snapshot_date || "");
-  return {
-    snapshot_date: latestDate,
-    rows: valid.filter(r => String(r.snapshot_date || "") === latestDate)
-  };
-}
-
-async function renderCavaliInventoryTags(opt) {
-  if (brand !== "cavali") return;
-
-  const section = document.getElementById("cavali-inventory-sec");
-  const el = document.getElementById("s-cavali-inventory");
-  if (!section || !el) return;
-
-  if (!cavaliInventoryApplies(opt)) {
-    section.style.display = "none";
-    return;
-  }
-
-  section.style.display = "";
-  el.innerHTML = skel(4);
-
-  const allRows = await fetchCavaliInventoryTagRows();
-  const snap = cavaliInventorySnapshotForPeriod(allRows, opt);
-
-  if (!snap) {
-    el.innerHTML = `<div class="kc" style="grid-column:1/-1">
-      <div class="kc-bar" style="background:var(--am)"></div>
-      <div class="kc-lbl">Cavali Inventory</div>
-      <div class="kc-val">—</div>
-      <div class="kc-note">
-        No historical inventory snapshot is available for this selected period.
-        A newer snapshot is intentionally not reused as historical data.
-      </div>
-    </div>`;
-    return;
-  }
-
-  const wanted = [
-    "Collective Inventory",
-    "Split Inventory — Wellington WH",
-    "Split Inventory — Corro Trailer",
-    "Split Inventory — Corro Side Total",
-  ];
-
-  const colors = {
-    "Collective Inventory": "var(--pu)",
-    "Split Inventory — Wellington WH": "var(--gd)",
-    "Split Inventory — Corro Trailer": "var(--gr)",
-    "Split Inventory — Corro Side Total": "var(--bl)",
-  };
-
-  const byMetric = {};
-  snap.rows.forEach(r => { byMetric[String(r.metric || "").trim()] = r; });
-
-  el.innerHTML = wanted.map(metric => {
-    const r = byMetric[metric] || {};
-    const units = parseInt(String(r.inventory_units || "0").replace(/,/g,""), 10) || 0;
-    const products = Math.max(0, parseInt(String(r.products || "0").replace(/,/g,""), 10) || 0);
-    const variants = Math.max(0, parseInt(String(r.variants || "0").replace(/,/g,""), 10) || 0);
-    const color = colors[metric] || "var(--bl)";
-    const isTotal = metric === "Split Inventory — Corro Side Total";
-
-    return `<div class="inv-tag-card">
-      <div class="kc-bar" style="background:${color}"></div>
-      <div class="kc-lbl" style="color:${color}">${metric}</div>
-      <div class="kc-val">${units.toLocaleString("en-US")}</div>
-      <div class="kc-badges">
-        <span class="bdg ${isTotal ? "bdg-am" : "bdg-neu"}">Inventory Units</span>
-      </div>
-      <div class="inv-tag-meta">
-        Snapshot: <strong>${snap.snapshot_date}</strong><br>
-        Products: <strong>${products.toLocaleString("en-US")}</strong><br>
-        Variants: <strong>${variants.toLocaleString("en-US")}</strong><br>
-        Location: <strong>${String(r.location_name || "—")}</strong>
-      </div>
-      <div class="inv-tag-note">${String(r.note || "")}</div>
-    </div>`;
-  }).join("");
 }
 
 /* ══════════════════════════════════════════════════════
@@ -2270,7 +2136,7 @@ async function render() {
 
   const root = document.getElementById("app-root");
   if (root) root.classList.toggle("is-cavali", renderBrand==="cavali");
-  safeSet("mi-num", renderBrand==="cavali" ? "08" : "06");
+  safeSet("mi-num", renderBrand==="cavali" ? "07" : "06");
 
   const skelIds = { "s-web": 5, "s-emma": 6, "s-fin": 9, "s-op": 4, "s-mkt": 4 };
   Object.entries(skelIds).forEach(([id, n]) => safeHTML(id, skel(n)));
@@ -2368,8 +2234,6 @@ async function render() {
   if (renderBrand==="cavali") {
     await renderSubs();
     if (isStale()) return;
-    await renderCavaliInventoryTags(opt);
-    if (isStale()) return;
   }
 
   renderIbar(opt, cmpLbl);
@@ -2389,7 +2253,7 @@ async function render() {
 ══════════════════════════════════════════════════════ */
 function togglePanel(id) { const el=document.getElementById(id); if(el) el.classList.toggle("open"); }
 function forceRefresh() {
-  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0; _cavaliInventoryTagCache = null; _cavaliInventoryTagTs = 0;
+  cache = {}; __marketingRowsCache = null; _smartrrRowsCache = null; _smartrrRowsTs = 0; _smartrrDeliveryCache = null; _smartrrDeliveryTs = 0
   try { Object.keys(localStorage).filter(k=>k.startsWith("el_sheet_cache__")).forEach(k=>localStorage.removeItem(k)); } catch(e) {}
   const btn = document.querySelector(".rf-btn");
   if (btn) btn.style.opacity = ".5";
