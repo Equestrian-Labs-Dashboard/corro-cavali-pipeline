@@ -1,5 +1,5 @@
 """
-Pipeline CORRO / CAVALI v4.5 — CORRECTO REAL
+Pipeline CORRO / CAVALI v4.6 — LTV 12M COHORT
 =============================================
 Cambios clave de esta versión:
 - Cavali sección 06 YA NO usa la pestaña vieja de resumen Smartrr.
@@ -11,6 +11,8 @@ Cambios clave de esta versión:
   new_subscribers = nuevos del rango seleccionado.
 - Si Smartrr no entrega líneas utilizables, usa fallback de Shopify order line_items para no dejar vacío.
 - Mantiene kpis_daily, revenue_share, new_vs_returning y ad_spend.
+- Agrega ltv_monthly sin alterar el LTV manual/reference del dashboard.
+- LTV automático: cohorte Shopify con 12 meses cerrados; la cohorte avanza una vez por mes.
 
 EJECUCIÓN:
   python -u pipeline.py
@@ -65,6 +67,18 @@ HEADERS = [
     "new_customers", "returning_customers",
     "new_revenue", "returning_revenue",
     "new_gross_profit", "returning_gross_profit",
+]
+
+LTV_MONTHLY_HEADERS = [
+    "updated_at", "brand",
+    "cohort_month", "cohort_start", "cohort_end",
+    "measurement_start", "measurement_end",
+    "cohort_customers",
+    "net_sales_12m", "gross_profit_12m",
+    "net_sales_with_cost_recorded", "net_sales_without_cost_recorded",
+    "cost_coverage_pct",
+    "ltv_revenue_12m", "ltv_gross_profit_12m",
+    "gp_reliable", "method", "source", "status",
 ]
 
 AD_SPEND_DATA = {
@@ -357,6 +371,155 @@ def fetch_sales(url, token, s, e):
 
     return {"gross_sales": g, "discounts": d, "returns": r, "net_sales": n,
             "cogs": c, "gross_profit": gp, "pct_gm": gm, "orders": o}
+
+# ─────────────────────────────────────────────────────────────────
+# FETCH: LTV 12M — SHOPIFY CUSTOMER COHORT (12 CLOSED MONTHS)
+# ─────────────────────────────────────────────────────────────────
+def _add_months(d, months):
+    """Return first day of month shifted by `months` without external dependencies."""
+    idx = d.year * 12 + (d.month - 1) + months
+    return date(idx // 12, idx % 12 + 1, 1)
+
+
+def _month_end(d):
+    """Return the last calendar day for the month containing d."""
+    return date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
+
+
+def ltv_12m_closed_window(today=None):
+    """
+    Latest fully matured 12-month acquisition cohort.
+
+    Example on 2026-08-31:
+      last closed month = 2026-07
+      cohort month      = 2025-08
+      measurement       = 2025-08-01 .. 2026-07-31
+
+    The cohort therefore advances only when a calendar month closes.
+    """
+    today = today or datetime.now(TIMEZONE).date()
+    current_month = date(today.year, today.month, 1)
+    last_closed_month = _add_months(current_month, -1)
+    cohort_start = _add_months(last_closed_month, -11)
+    cohort_end = _month_end(cohort_start)
+    measurement_end = _month_end(last_closed_month)
+    return cohort_start, cohort_end, measurement_end
+
+
+def _cohort_key(v):
+    """Normalize Shopify MONTH_TIMESTAMP/date output to YYYY-MM for matching."""
+    txt = str(v or "").strip()
+    m = re.search(r"(\d{4})-(\d{2})", txt)
+    return f"{m.group(1)}-{m.group(2)}" if m else ""
+
+
+def _find_cohort_row(rows, cohort_start):
+    want = cohort_start.strftime("%Y-%m")
+    for row in rows or []:
+        if _cohort_key(row.get("customer_cohort_month")) == want:
+            return row
+    # Defensive fallback: Shopify may omit the grouped dimension when only one row exists.
+    return rows[-1] if rows and len(rows) == 1 else None
+
+
+def fetch_ltv_12m(url, token, today=None):
+    """
+    Calculate a transparent 12-month observed LTV directly from ShopifyQL.
+
+    Revenue LTV 12M = cohort Net Sales over its first 12 closed months / cohort customers.
+    GP LTV 12M      = cohort Gross Profit over the same window / cohort customers.
+
+    Gross-profit reliability is exposed separately using Shopify's cost-recording coverage.
+    No prediction or arbitrary customer-life assumption is used.
+    """
+    cohort_start, cohort_end, measurement_end = ltv_12m_closed_window(today)
+    cohort_month = cohort_start.strftime("%Y-%m")
+
+    # Customer cohort size: customers whose first purchase occurred in the cohort month.
+    customer_q = (
+        "FROM customers SHOW new_customer_records "
+        "GROUP BY customer_cohort_month "
+        f"SINCE {cohort_start} UNTIL {cohort_end} "
+        "ORDER BY customer_cohort_month ASC"
+    )
+    customer_rows = ql_run(url, token, customer_q)
+    customer_row = _find_cohort_row(customer_rows, cohort_start)
+    cohort_customers = int(abs(_m((customer_row or {}).get("new_customer_records"))))
+
+    # Aggregate only sales made during the cohort's first 12 calendar months,
+    # then select the acquisition cohort by Shopify's customer_cohort_month dimension.
+    sales_q = (
+        "FROM sales SHOW net_sales, gross_profit, "
+        "net_sales_with_cost_recorded, net_sales_without_cost_recorded "
+        "GROUP BY customer_cohort_month "
+        f"SINCE {cohort_start} UNTIL {measurement_end} "
+        "ORDER BY customer_cohort_month ASC"
+    )
+    sales_rows = ql_run(url, token, sales_q)
+    sales_row = _find_cohort_row(sales_rows, cohort_start)
+
+    if not customer_row or cohort_customers <= 0 or not sales_row:
+        print(
+            f"    ⚠ LTV 12M: no usable cohort data for {cohort_month} "
+            f"({cohort_customers} customers, sales_row={bool(sales_row)})"
+        )
+        return {
+            "cohort_month": cohort_month,
+            "cohort_start": str(cohort_start),
+            "cohort_end": str(cohort_end),
+            "measurement_start": str(cohort_start),
+            "measurement_end": str(measurement_end),
+            "cohort_customers": cohort_customers,
+            "net_sales_12m": 0,
+            "gross_profit_12m": 0,
+            "net_sales_with_cost_recorded": 0,
+            "net_sales_without_cost_recorded": 0,
+            "cost_coverage_pct": 0,
+            "ltv_revenue_12m": 0,
+            "ltv_gross_profit_12m": 0,
+            "gp_reliable": False,
+            "method": "Observed 12M acquisition cohort · 12 closed months",
+            "source": "ShopifyQL customers + sales",
+            "status": "no_data",
+        }
+
+    net_sales = round(_m(sales_row.get("net_sales")), 2)
+    gross_profit = round(_m(sales_row.get("gross_profit")), 2)
+    ns_cost = round(_m(sales_row.get("net_sales_with_cost_recorded")), 2)
+    ns_no_cost = round(_m(sales_row.get("net_sales_without_cost_recorded")), 2)
+    cost_base = ns_cost + ns_no_cost
+    coverage = round(max(0.0, min(100.0, (ns_cost / cost_base * 100.0) if cost_base > 0 else 0.0)), 1)
+
+    ltv_revenue = round(net_sales / cohort_customers, 2) if cohort_customers > 0 else 0
+    ltv_gp = round(gross_profit / cohort_customers, 2) if cohort_customers > 0 else 0
+    gp_reliable = coverage >= 80.0
+
+    print(
+        f"    LTV 12M cohort {cohort_month}: customers:{cohort_customers}  "
+        f"net:${net_sales:,.2f}  rev_ltv:${ltv_revenue:,.2f}  "
+        f"gp_ltv:${ltv_gp:,.2f}  cost_coverage:{coverage:.1f}%"
+    )
+
+    return {
+        "cohort_month": cohort_month,
+        "cohort_start": str(cohort_start),
+        "cohort_end": str(cohort_end),
+        "measurement_start": str(cohort_start),
+        "measurement_end": str(measurement_end),
+        "cohort_customers": cohort_customers,
+        "net_sales_12m": net_sales,
+        "gross_profit_12m": gross_profit,
+        "net_sales_with_cost_recorded": ns_cost,
+        "net_sales_without_cost_recorded": ns_no_cost,
+        "cost_coverage_pct": coverage,
+        "ltv_revenue_12m": ltv_revenue,
+        "ltv_gross_profit_12m": ltv_gp,
+        "gp_reliable": gp_reliable,
+        "method": "Observed 12M acquisition cohort · 12 closed months",
+        "source": "ShopifyQL customers + sales",
+        "status": "ok",
+    }
+
 
 # ─────────────────────────────────────────────────────────────────
 # FETCH: SESSIONS
@@ -2481,6 +2644,59 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
     print(f"    ad_spend: {len(ad_rows)} months")
 
 
+def refresh_ltv_monthly(gc, sheet_id, brand_name, url, token, now_str):
+    """
+    Upsert one row per matured cohort into ltv_monthly.
+
+    Shopify is queried at most once per brand per calendar month for the current
+    matured cohort. This keeps the KPI lightweight while still rolling forward
+    automatically when a new month closes.
+    """
+    sh = open_sheet_with_retry(gc, sheet_id)
+    try:
+        ws = sh.worksheet("ltv_monthly")
+    except Exception:
+        ws = sh.add_worksheet("ltv_monthly", rows=120, cols=len(LTV_MONTHLY_HEADERS))
+
+    vals = ws.get_all_values()
+    existing = {}
+    if len(vals) >= 2:
+        ex_h = vals[0]
+        for r in vals[1:]:
+            m = _row_to_map(ex_h, r)
+            ck = str(m.get("cohort_month", "")).strip()
+            if ck:
+                existing[ck] = m
+
+    cohort_start, _, _ = ltv_12m_closed_window()
+    current_cohort = cohort_start.strftime("%Y-%m")
+    current_month = datetime.now(TIMEZONE).strftime("%Y-%m")
+    prev = existing.get(current_cohort)
+    prev_updated = str((prev or {}).get("updated_at", ""))[:7]
+    prev_status = str((prev or {}).get("status", "")).strip().lower()
+
+    # Once a valid current-cohort snapshot was refreshed this calendar month,
+    # don't spend ShopifyQL quota repeating a closed-period calculation.
+    if prev and prev_updated == current_month and prev_status == "ok":
+        print(f"    ltv_monthly: {current_cohort} already refreshed in {current_month}; skipping ShopifyQL")
+        return
+
+    snap = fetch_ltv_12m(url, token)
+    row_map = {"updated_at": now_str, "brand": brand_name, **snap}
+    existing[current_cohort] = row_map
+
+    rows = []
+    for ck in sorted(existing):
+        m = existing[ck]
+        rows.append([m.get(h, "") for h in LTV_MONTHLY_HEADERS])
+
+    ws.clear()
+    ws.append_row(LTV_MONTHLY_HEADERS)
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"    ltv_monthly: {len(rows)} cohort rows · current={current_cohort} status={snap.get('status')}")
+
+
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
@@ -2554,6 +2770,9 @@ def main():
             ])
 
         write_all(gc, cfg["sheet_id"], kpi_rows, rs_rows, nvr_rows, brand_name)
+
+        # New additive KPI only: does not alter existing kpis_daily/CAC/LTV behavior.
+        refresh_ltv_monthly(gc, cfg["sheet_id"], brand_name, url, token, now_str)
 
         if brand_name == "cavali":
             # Smartrr Section 06: period-exact product volume using Order Line Item Created Date.

@@ -432,7 +432,7 @@ select:focus{border-color:var(--gr)}
   <div class="kg" id="s-mkt"></div>
 
   <div class="sec"><div class="sec-num">05</div><div class="sec-line"></div><div class="sec-lbl">CAC to LTV — Ratio & Health</div><div class="sec-line"></div></div>
-  <div class="cac-note-box" id="cac-note-box">⏳ <strong>CAC note:</strong> When G+M spend is entered below, CAC is calculated automatically (G+M ÷ new customers from pipeline v4). Until full LTV data is ready, LTV uses the Shopify reference: <strong>$178</strong>. If no CAC can be calculated, CAC is shown only as a reference fallback: <strong>$47</strong>.</div>
+  <div class="cac-note-box" id="cac-note-box">ℹ <strong>LTV note:</strong> The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>). A new adjacent KPI, <strong>Shopify LTV 12M</strong>, is calculated independently from the latest acquisition cohort with 12 fully closed months. It is additive only and does not change the current LTV/CAC ratio until the methodology is approved.</div>
   <div class="cac-grid" id="s-cac"></div>
 
   <!-- 06 · Cavali Product Volume by Product-Variant (Smartrr) -->
@@ -455,7 +455,7 @@ select:focus{border-color:var(--gr)}
       <span class="panel-chev">▾</span>
     </div>
     <div class="panel-body">
-      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). LTV override optional — default $178.</div>
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). Existing LTV override remains optional — default $178. Shopify LTV 12M is read separately from the pipeline and is not overridden here.</div>
       <div class="mi-grid">
         <div class="mi-field">
           <div class="mi-lbl">Google + Meta Ad Spend ($)<span class="mi-note">G+M only — for exact ROAS & CAC</span></div>
@@ -466,7 +466,7 @@ select:focus{border-color:var(--gr)}
           <div class="mi-wrap"><input class="mi-inp no-pre" id="mi-newcust" type="number" min="0" step="1" placeholder="0" oninput="calcDerived()"></div>
         </div>
         <div class="mi-field">
-          <div class="mi-lbl">LTV-12M ($ per customer)<span class="mi-note">Default: $178 (Shopify ref)</span></div>
+          <div class="mi-lbl">Current LTV-12M ($ per customer)<span class="mi-note">Existing manual/reference KPI · default $178</span></div>
           <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-ltv" type="number" min="0" step="0.01" placeholder="178.00" oninput="calcDerived()"></div>
         </div>
         <div class="mi-field">
@@ -543,6 +543,7 @@ const CH_COLORS = {
 
 let brand = "cavali", ptype = "month";
 let cache = {}, manualData = {};
+let shopifyLtvSnapshot = null;
 let __renderToken = 0;
 
 /* ══════════════════════════════════════════════════════
@@ -916,6 +917,20 @@ function bestRow(arr) {
     }
   }
   return Object.keys(merged).length ? merged : (sorted[sorted.length-1] || null);
+}
+
+function latestShopifyLtvRow(rows) {
+  const valid = (rows || []).filter(r => {
+    const status = String(r.status || '').trim().toLowerCase();
+    return (status === '' || status === 'ok') && (parseFloat(r.ltv_revenue_12m || 0) || 0) > 0;
+  });
+  if (!valid.length) return null;
+  return [...valid].sort((a,b) => {
+    const ae = String(a.measurement_end || a.cohort_month || '');
+    const be = String(b.measurement_end || b.cohort_month || '');
+    if (ae !== be) return ae.localeCompare(be);
+    return String(a.updated_at || '').localeCompare(String(b.updated_at || ''));
+  }).pop();
 }
 
 function findRow(rows, opt) {
@@ -1417,20 +1432,41 @@ function renderCAC(cacVal, ltvVal, source) {
   const hbg    = ratio >= 3 ? "var(--gr-bg)" : ratio >= 2 ? "var(--am-bg)" : "var(--rd-bg)";
   const hbd    = ratio >= 3 ? "var(--gr-bd)" : ratio >= 2 ? "var(--am-bd)" : "var(--rd-bd)";
   const cacNote = hasActualCAC ? (source || "Calculated") : "Reference fallback: ~$47";
+
+  // Additive KPI only. It intentionally does NOT replace the existing LTV or ratio yet.
+  const auto = shopifyLtvSnapshot || {};
+  const autoLtv = parseFloat(auto.ltv_revenue_12m || 0) || 0;
+  const gpLtv = parseFloat(auto.ltv_gross_profit_12m || 0) || 0;
+  const coverage = parseFloat(auto.cost_coverage_pct || 0) || 0;
+  const cohort = String(auto.cohort_month || "").trim();
+  let cohortLabel = cohort || "latest matured cohort";
+  if (/^\d{4}-\d{2}$/.test(cohort)) {
+    const [yy,mm] = cohort.split('-').map(Number);
+    cohortLabel = `${MN[mm-1]} ${yy}`;
+  }
+  const gpReliable = String(auto.gp_reliable || "").toLowerCase() === "true" || auto.gp_reliable === true;
+  const autoNote = autoLtv > 0
+    ? `ShopifyQL cohort · ${cohortLabel} · 12 closed months${gpLtv>0?` · GP LTV ${fv(gpLtv,"$")}`:""}${coverage>0?` · cost coverage ${coverage.toFixed(1)}%${gpReliable?" ✓":""}`:""}`
+    : "Waiting for ltv_monthly · existing LTV remains unchanged";
+
   el.innerHTML = `
     <div class="kc"><div class="kc-bar" style="background:var(--bl)"></div>
-      <div class="kc-lbl">LTV (12M)</div>
+      <div class="kc-lbl">Current LTV (12M)</div>
       <div class="kc-val" style="color:var(--bl)">${fv(ltv,"$")}</div>
-      <div class="kc-note">${hasManualLTV?"Manual entry":"Shopify reference: $178"}</div></div>
+      <div class="kc-note">${hasManualLTV?"Manual entry":"Existing reference: $178"}</div></div>
+    <div class="kc"><div class="kc-bar" style="background:var(--pu)"></div>
+      <div class="kc-lbl">Shopify LTV (12M)</div>
+      <div class="kc-val" style="color:var(--pu)">${autoLtv>0?fv(autoLtv,"$"):"—"}</div>
+      <div class="kc-note">${autoNote}</div></div>
     <div class="kc"><div class="kc-bar" style="background:var(--gd)"></div>
       <div class="kc-lbl">CAC${hasActualCAC&&source?" ("+source+")":""}</div>
       <div class="kc-val" style="color:var(--gd)">${fv(cac,"$")}</div>
       <div class="kc-note">${cacNote}</div></div>
     <div class="kc"><div class="kc-bar" style="background:${hcol}"></div>
-      <div class="kc-lbl">LTV / CAC Ratio</div>
+      <div class="kc-lbl">Current LTV / CAC Ratio</div>
       <div class="kc-val" style="color:${hcol}">${ratio.toFixed(2)}x</div>
       <div class="kc-badges"><span class="bdg" style="background:${hbg};color:${hcol};border:1px solid ${hbd}">${health}</span></div>
-      <div class="kc-note">Target ≥ 3x${hasActualCAC?"":" · uses reference CAC"}</div></div>`;
+      <div class="kc-note">Existing methodology preserved · Target ≥ 3x${hasActualCAC?"":" · uses reference CAC"}</div></div>`;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -2153,6 +2189,13 @@ async function render() {
   const rsR  = tabData.revenue_share || [];
   const nvrR = tabData.new_vs_returning || [];
   const adR  = tabData.ad_spend || [];
+
+  // Optional additive tab: fetched separately so a missing ltv_monthly tab can never
+  // break the existing batch request or the rest of the dashboard.
+  let ltvR = [];
+  try { ltvR = await fetchTab(sid, "ltv_monthly", { silent: true }); } catch(e) { ltvR = []; }
+  if (isStale()) return;
+  shopifyLtvSnapshot = latestShopifyLtvRow(ltvR);
 
   const row              = findRow(kpiR, opt);
   const { row:cmpRow, lbl:cmpLbl } = findCmp(kpiR, opt);
