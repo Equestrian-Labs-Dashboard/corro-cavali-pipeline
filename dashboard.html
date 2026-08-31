@@ -432,7 +432,7 @@ select:focus{border-color:var(--gr)}
   <div class="kg" id="s-mkt"></div>
 
   <div class="sec"><div class="sec-num">05</div><div class="sec-line"></div><div class="sec-lbl">CAC to LTV — Ratio & Health</div><div class="sec-line"></div></div>
-  <div class="cac-note-box" id="cac-note-box">ℹ <strong>LTV note:</strong> The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>). A new adjacent KPI, <strong>Shopify LTV 12M</strong>, is calculated independently from the latest acquisition cohort with 12 fully closed months. It is additive only and does not change the current LTV/CAC ratio until the methodology is approved.</div>
+  <div class="cac-note-box" id="cac-note-box">ℹ <strong>LTV note:</strong> The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>). <strong>Shopify LTV 12M</strong> now follows the selected date filter as an <em>as-of</em> metric: Month/MTD and Quarter use the latest cohort fully matured by the selected period end; Week uses the latest fully closed monthly cohort available by that week. Historical values are loaded from Shopify cohorts instead of repeating today's latest LTV.</div>
   <div class="cac-grid" id="s-cac"></div>
 
   <!-- 06 · Cavali Product Volume by Product-Variant (Smartrr) -->
@@ -455,7 +455,7 @@ select:focus{border-color:var(--gr)}
       <span class="panel-chev">▾</span>
     </div>
     <div class="panel-body">
-      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). Existing LTV override remains optional — default $178. Shopify LTV 12M is read separately from the pipeline and is not overridden here.</div>
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). Existing LTV override remains optional — default $178. Shopify LTV 12M is read separately from historical Shopify cohorts and follows the selected Month/MTD, Week or Quarter filter.</div>
       <div class="mi-grid">
         <div class="mi-field">
           <div class="mi-lbl">Google + Meta Ad Spend ($)<span class="mi-note">G+M only — for exact ROAS & CAC</span></div>
@@ -543,7 +543,7 @@ const CH_COLORS = {
 
 let brand = "cavali", ptype = "month";
 let cache = {}, manualData = {};
-let shopifyLtvSnapshot = null;
+let shopifyLtvRows = [];
 let __renderToken = 0;
 
 /* ══════════════════════════════════════════════════════
@@ -919,18 +919,52 @@ function bestRow(arr) {
   return Object.keys(merged).length ? merged : (sorted[sorted.length-1] || null);
 }
 
-function latestShopifyLtvRow(rows) {
-  const valid = (rows || []).filter(r => {
+function _ymIndex(y, m1) { return y * 12 + (m1 - 1); }
+function _ymFromIndex(idx) {
+  const y = Math.floor(idx / 12), m1 = (idx % 12) + 1;
+  return { y, m1, key: `${y}-${String(m1).padStart(2,'0')}` };
+}
+function _monthEndISO(y, m1) {
+  return iso(new Date(y, m1, 0));
+}
+
+function shopifyLtvTargetForPeriod(opt) {
+  if (!opt?.end) return null;
+  const m = String(opt.end).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const y = parseInt(m[1],10), m1 = parseInt(m[2],10);
+  const selectedEnd = `${m[1]}-${m[2]}-${m[3]}`;
+  const selectedYM = _ymIndex(y, m1);
+  const currentYM = _ymIndex(CY, CM + 1);
+  const selectedIsHistoricalMonth = selectedYM < currentYM;
+  const selectedEndsAtMonthEnd = selectedEnd === _monthEndISO(y, m1);
+
+  // LTV 12M is based on CLOSED calendar months. For a historical period that
+  // ends exactly at month-end we can include that month. Current/partial periods
+  // can only use the previous fully closed month.
+  const lastClosedIdx = (selectedIsHistoricalMonth && selectedEndsAtMonthEnd)
+    ? selectedYM
+    : selectedYM - 1;
+  const lastClosed = _ymFromIndex(lastClosedIdx);
+  const cohort = _ymFromIndex(lastClosedIdx - 11);
+  return {
+    selected_end: selectedEnd,
+    last_closed_month: lastClosed.key,
+    measurement_end: _monthEndISO(lastClosed.y, lastClosed.m1),
+    cohort_month: cohort.key,
+  };
+}
+
+function shopifyLtvForPeriod(rows, opt) {
+  const target = shopifyLtvTargetForPeriod(opt);
+  if (!target) return { row:null, target:null };
+  const matches = (rows || []).filter(r => {
     const status = String(r.status || '').trim().toLowerCase();
-    return (status === '' || status === 'ok') && (parseFloat(r.ltv_revenue_12m || 0) || 0) > 0;
+    const ck = String(r.cohort_month || '').trim().slice(0,7);
+    return ck === target.cohort_month && (status === '' || status === 'ok')
+      && (parseFloat(r.ltv_revenue_12m || 0) || 0) > 0;
   });
-  if (!valid.length) return null;
-  return [...valid].sort((a,b) => {
-    const ae = String(a.measurement_end || a.cohort_month || '');
-    const be = String(b.measurement_end || b.cohort_month || '');
-    if (ae !== be) return ae.localeCompare(be);
-    return String(a.updated_at || '').localeCompare(String(b.updated_at || ''));
-  }).pop();
+  return { row: matches.length ? bestRow(matches) : null, target };
 }
 
 function findRow(rows, opt) {
@@ -1434,20 +1468,26 @@ function renderCAC(cacVal, ltvVal, source) {
   const cacNote = hasActualCAC ? (source || "Calculated") : "Reference fallback: ~$47";
 
   // Additive KPI only. It intentionally does NOT replace the existing LTV or ratio yet.
-  const auto = shopifyLtvSnapshot || {};
+  // IMPORTANT: never fall back to the newest cohort for a historical filter.
+  // If the exact historical cohort is not backfilled yet, show — instead of a wrong repeated value.
+  const picked = shopifyLtvForPeriod(shopifyLtvRows, getOpt());
+  const auto = picked.row || {};
+  const target = picked.target || {};
   const autoLtv = parseFloat(auto.ltv_revenue_12m || 0) || 0;
   const gpLtv = parseFloat(auto.ltv_gross_profit_12m || 0) || 0;
   const coverage = parseFloat(auto.cost_coverage_pct || 0) || 0;
-  const cohort = String(auto.cohort_month || "").trim();
-  let cohortLabel = cohort || "latest matured cohort";
+  const cohort = String(auto.cohort_month || target.cohort_month || "").trim();
+  let cohortLabel = cohort || "matured cohort";
   if (/^\d{4}-\d{2}$/.test(cohort)) {
     const [yy,mm] = cohort.split('-').map(Number);
     cohortLabel = `${MN[mm-1]} ${yy}`;
   }
   const gpReliable = String(auto.gp_reliable || "").toLowerCase() === "true" || auto.gp_reliable === true;
+  const asOfLabel = target.selected_end ? fmtD(target.selected_end) : "selected period";
+  const closedLabel = target.last_closed_month || "—";
   const autoNote = autoLtv > 0
-    ? `ShopifyQL cohort · ${cohortLabel} · 12 closed months${gpLtv>0?` · GP LTV ${fv(gpLtv,"$")}`:""}${coverage>0?` · cost coverage ${coverage.toFixed(1)}%${gpReliable?" ✓":""}`:""}`
-    : "Waiting for ltv_monthly · existing LTV remains unchanged";
+    ? `As of ${asOfLabel} · ShopifyQL cohort ${cohortLabel} · 12 closed months${gpLtv>0?` · GP LTV ${fv(gpLtv,"$")}`:""}${coverage>0?` · cost coverage ${coverage.toFixed(1)}%${gpReliable?" ✓":""}`:""}`
+    : `Historical LTV not loaded yet · expected cohort ${cohortLabel} · last closed month ${closedLabel} · rerun pipeline`;
 
   el.innerHTML = `
     <div class="kc"><div class="kc-bar" style="background:var(--bl)"></div>
@@ -1455,7 +1495,7 @@ function renderCAC(cacVal, ltvVal, source) {
       <div class="kc-val" style="color:var(--bl)">${fv(ltv,"$")}</div>
       <div class="kc-note">${hasManualLTV?"Manual entry":"Existing reference: $178"}</div></div>
     <div class="kc"><div class="kc-bar" style="background:var(--pu)"></div>
-      <div class="kc-lbl">Shopify LTV (12M)</div>
+      <div class="kc-lbl">Shopify LTV (12M · as of filter)</div>
       <div class="kc-val" style="color:var(--pu)">${autoLtv>0?fv(autoLtv,"$"):"—"}</div>
       <div class="kc-note">${autoNote}</div></div>
     <div class="kc"><div class="kc-bar" style="background:var(--gd)"></div>
@@ -2195,7 +2235,7 @@ async function render() {
   let ltvR = [];
   try { ltvR = await fetchTab(sid, "ltv_monthly", { silent: true }); } catch(e) { ltvR = []; }
   if (isStale()) return;
-  shopifyLtvSnapshot = latestShopifyLtvRow(ltvR);
+  shopifyLtvRows = ltvR || [];
 
   const row              = findRow(kpiR, opt);
   const { row:cmpRow, lbl:cmpLbl } = findCmp(kpiR, opt);

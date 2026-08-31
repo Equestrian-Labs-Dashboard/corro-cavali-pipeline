@@ -1,5 +1,5 @@
 """
-Pipeline CORRO / CAVALI v4.6 — LTV 12M COHORT
+Pipeline CORRO / CAVALI v4.7 — PERIOD-AWARE LTV 12M COHORT
 =============================================
 Cambios clave de esta versión:
 - Cavali sección 06 YA NO usa la pestaña vieja de resumen Smartrr.
@@ -11,8 +11,10 @@ Cambios clave de esta versión:
   new_subscribers = nuevos del rango seleccionado.
 - Si Smartrr no entrega líneas utilizables, usa fallback de Shopify order line_items para no dejar vacío.
 - Mantiene kpis_daily, revenue_share, new_vs_returning y ad_spend.
-- Agrega ltv_monthly sin alterar el LTV manual/reference del dashboard.
-- LTV automático: cohorte Shopify con 12 meses cerrados; la cohorte avanza una vez por mes.
+- Mantiene ltv_monthly sin alterar el LTV manual/reference del dashboard.
+- LTV automático: cohorte Shopify con 12 meses cerrados.
+- Backfill automático de cohortes históricas necesarias para filtros del dashboard desde 2025.
+- El dashboard puede resolver un LTV histórico distinto por Month/MTD, Week y Quarter usando la fecha fin seleccionada.
 
 EJECUCIÓN:
   python -u pipeline.py
@@ -422,20 +424,28 @@ def _find_cohort_row(rows, cohort_start):
     return rows[-1] if rows and len(rows) == 1 else None
 
 
-def fetch_ltv_12m(url, token, today=None):
-    """
-    Calculate a transparent 12-month observed LTV directly from ShopifyQL.
+def ltv_12m_window_for_cohort(cohort_start):
+    """Return cohort start/end and its exact first 12 calendar months."""
+    cohort_start = date(cohort_start.year, cohort_start.month, 1)
+    cohort_end = _month_end(cohort_start)
+    measurement_end = _month_end(_add_months(cohort_start, 11))
+    return cohort_start, cohort_end, measurement_end
 
-    Revenue LTV 12M = cohort Net Sales over its first 12 closed months / cohort customers.
+
+def fetch_ltv_12m_for_cohort(url, token, cohort_start):
+    """
+    Calculate observed LTV for ONE acquisition cohort.
+
+    Revenue LTV 12M = cohort Net Sales during its first 12 calendar months / cohort customers.
     GP LTV 12M      = cohort Gross Profit over the same window / cohort customers.
 
-    Gross-profit reliability is exposed separately using Shopify's cost-recording coverage.
-    No prediction or arbitrary customer-life assumption is used.
+    Keeping this function cohort-addressable is what allows the dashboard to show the
+    historically correct LTV for a selected 2025/2026 Month, Week or Quarter instead
+    of repeating today's latest snapshot everywhere.
     """
-    cohort_start, cohort_end, measurement_end = ltv_12m_closed_window(today)
+    cohort_start, cohort_end, measurement_end = ltv_12m_window_for_cohort(cohort_start)
     cohort_month = cohort_start.strftime("%Y-%m")
 
-    # Customer cohort size: customers whose first purchase occurred in the cohort month.
     customer_q = (
         "FROM customers SHOW new_customer_records "
         "GROUP BY customer_cohort_month "
@@ -446,8 +456,6 @@ def fetch_ltv_12m(url, token, today=None):
     customer_row = _find_cohort_row(customer_rows, cohort_start)
     cohort_customers = int(abs(_m((customer_row or {}).get("new_customer_records"))))
 
-    # Aggregate only sales made during the cohort's first 12 calendar months,
-    # then select the acquisition cohort by Shopify's customer_cohort_month dimension.
     sales_q = (
         "FROM sales SHOW net_sales, gross_profit, "
         "net_sales_with_cost_recorded, net_sales_without_cost_recorded "
@@ -519,6 +527,12 @@ def fetch_ltv_12m(url, token, today=None):
         "source": "ShopifyQL customers + sales",
         "status": "ok",
     }
+
+
+def fetch_ltv_12m(url, token, today=None):
+    """Backward-compatible wrapper for the latest fully matured cohort."""
+    cohort_start, _, _ = ltv_12m_closed_window(today)
+    return fetch_ltv_12m_for_cohort(url, token, cohort_start)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2646,17 +2660,23 @@ def write_all(gc, sheet_id, kpi_rows, rs_rows, nvr_rows, brand_name):
 
 def refresh_ltv_monthly(gc, sheet_id, brand_name, url, token, now_str):
     """
-    Upsert one row per matured cohort into ltv_monthly.
+    Maintain the historical LTV cohort table used by all dashboard date filters.
 
-    Shopify is queried at most once per brand per calendar month for the current
-    matured cohort. This keeps the KPI lightweight while still rolling forward
-    automatically when a new month closes.
+    Why history is required:
+      - January 2026 must not display the same LTV as July 2026.
+      - Month/MTD, Week and Quarter are "as-of period end" views.
+      - The dashboard maps each selected end date to the latest acquisition cohort
+        that already had 12 fully closed months at that point in time.
+
+    We therefore backfill the cohort history required to support dashboard dates
+    from 2025 onward. Missing cohorts are fetched once; the current latest matured
+    cohort is refreshed once per calendar month.
     """
     sh = open_sheet_with_retry(gc, sheet_id)
     try:
         ws = sh.worksheet("ltv_monthly")
     except Exception:
-        ws = sh.add_worksheet("ltv_monthly", rows=120, cols=len(LTV_MONTHLY_HEADERS))
+        ws = sh.add_worksheet("ltv_monthly", rows=180, cols=len(LTV_MONTHLY_HEADERS))
 
     vals = ws.get_all_values()
     existing = {}
@@ -2668,22 +2688,57 @@ def refresh_ltv_monthly(gc, sheet_id, brand_name, url, token, now_str):
             if ck:
                 existing[ck] = m
 
-    cohort_start, _, _ = ltv_12m_closed_window()
-    current_cohort = cohort_start.strftime("%Y-%m")
-    current_month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    prev = existing.get(current_cohort)
-    prev_updated = str((prev or {}).get("updated_at", ""))[:7]
-    prev_status = str((prev or {}).get("status", "")).strip().lower()
+    today = datetime.now(TIMEZONE).date()
+    current_month = today.strftime("%Y-%m")
+    latest_cohort_start, _, _ = ltv_12m_closed_window(today)
+    latest_cohort = latest_cohort_start.strftime("%Y-%m")
 
-    # Once a valid current-cohort snapshot was refreshed this calendar month,
-    # don't spend ShopifyQL quota repeating a closed-period calculation.
-    if prev and prev_updated == current_month and prev_status == "ok":
-        print(f"    ltv_monthly: {current_cohort} already refreshed in {current_month}; skipping ShopifyQL")
-        return
+    # Earliest dashboard date we promise historical LTV for. A week at the very
+    # beginning of Jan-2025 can only use Dec-2024 as its last closed month, which
+    # means the needed 12M acquisition cohort starts in Jan-2024.
+    history_start_year = int(os.environ.get("LTV_DASHBOARD_HISTORY_START_YEAR", "2025"))
+    first_dashboard_month = date(history_start_year, 1, 1)
+    first_last_closed_month = _add_months(first_dashboard_month, -1)
+    first_cohort_start = _add_months(first_last_closed_month, -11)
 
-    snap = fetch_ltv_12m(url, token)
-    row_map = {"updated_at": now_str, "brand": brand_name, **snap}
-    existing[current_cohort] = row_map
+    max_backfill = int(os.environ.get("LTV_BACKFILL_MAX_PER_RUN", "36"))
+    targets = []
+    cursor = first_cohort_start
+    while cursor <= latest_cohort_start:
+        targets.append(cursor)
+        cursor = _add_months(cursor, 1)
+
+    fetched = 0
+    skipped = 0
+    for cohort_start in targets:
+        ck = cohort_start.strftime("%Y-%m")
+        prev = existing.get(ck)
+        prev_updated_month = str((prev or {}).get("updated_at", ""))[:7]
+        prev_status = str((prev or {}).get("status", "")).strip().lower()
+
+        is_latest = ck == latest_cohort
+        needs_fetch = prev is None
+
+        # Re-check the latest cohort once in the new calendar month. This is the
+        # only historical row expected to roll forward automatically.
+        if is_latest and (prev_updated_month != current_month or prev_status != "ok"):
+            needs_fetch = True
+
+        # If an older row previously failed/no-data, retry at most once per month.
+        if prev is not None and not is_latest and prev_status != "ok" and prev_updated_month != current_month:
+            needs_fetch = True
+
+        if not needs_fetch:
+            skipped += 1
+            continue
+        if fetched >= max_backfill:
+            print(f"    ltv_monthly: backfill cap {max_backfill} reached; remaining cohorts continue next run")
+            break
+
+        snap = fetch_ltv_12m_for_cohort(url, token, cohort_start)
+        existing[ck] = {"updated_at": now_str, "brand": brand_name, **snap}
+        fetched += 1
+        time.sleep(0.10)
 
     rows = []
     for ck in sorted(existing):
@@ -2694,7 +2749,12 @@ def refresh_ltv_monthly(gc, sheet_id, brand_name, url, token, now_str):
     ws.append_row(LTV_MONTHLY_HEADERS)
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"    ltv_monthly: {len(rows)} cohort rows · current={current_cohort} status={snap.get('status')}")
+
+    ok_count = sum(1 for m in existing.values() if str(m.get("status", "")).strip().lower() == "ok")
+    print(
+        f"    ltv_monthly: {len(rows)} cohort rows · ok={ok_count} · fetched={fetched} · "
+        f"skipped={skipped} · history_from={first_cohort_start:%Y-%m} · latest={latest_cohort}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
