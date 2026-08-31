@@ -432,7 +432,7 @@ select:focus{border-color:var(--gr)}
   <div class="kg" id="s-mkt"></div>
 
   <div class="sec"><div class="sec-num">05</div><div class="sec-line"></div><div class="sec-lbl">CAC to LTV — Ratio & Health</div><div class="sec-line"></div></div>
-  <div class="cac-note-box" id="cac-note-box">ℹ <strong>LTV note:</strong> The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>). <strong>Shopify LTV 12M</strong> now follows the selected date filter as an <em>as-of</em> metric: Month/MTD and Quarter use the latest cohort fully matured by the selected period end; Week uses the latest fully closed monthly cohort available by that week. Historical values are loaded from Shopify cohorts instead of repeating today's latest LTV.</div>
+  <div class="cac-note-box" id="cac-note-box">ℹ <strong>LTV note:</strong> LTV metrics are shown only for <strong>Month / MTD</strong> and <strong>Quarter</strong>. The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>) and <strong>Shopify LTV 12M</strong> uses the latest acquisition cohort with 12 fully closed months as of the selected month/quarter end. Weekly LTV is intentionally disabled because the source methodology is monthly-cohort based.</div>
   <div class="cac-grid" id="s-cac"></div>
 
   <!-- 06 · Cavali Product Volume by Product-Variant (Smartrr) -->
@@ -455,7 +455,7 @@ select:focus{border-color:var(--gr)}
       <span class="panel-chev">▾</span>
     </div>
     <div class="panel-body">
-      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). Existing LTV override remains optional — default $178. Shopify LTV 12M is read separately from historical Shopify cohorts and follows the selected Month/MTD, Week or Quarter filter.</div>
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:10px">Values saved locally per brand + period. CAC is calculated automatically with G+M spend ÷ new customers (pipeline v4). Existing LTV override remains optional — default $178. LTV metrics are available only for Month / MTD and Quarter; weekly LTV is intentionally disabled because Shopify LTV 12M is based on monthly acquisition cohorts.</div>
       <div class="mi-grid">
         <div class="mi-field">
           <div class="mi-lbl">Google + Meta Ad Spend ($)<span class="mi-note">G+M only — for exact ROAS & CAC</span></div>
@@ -465,8 +465,8 @@ select:focus{border-color:var(--gr)}
           <div class="mi-lbl">New Customers (period)<span class="mi-note">Auto from pipeline v4 if available</span></div>
           <div class="mi-wrap"><input class="mi-inp no-pre" id="mi-newcust" type="number" min="0" step="1" placeholder="0" oninput="calcDerived()"></div>
         </div>
-        <div class="mi-field">
-          <div class="mi-lbl">Current LTV-12M ($ per customer)<span class="mi-note">Existing manual/reference KPI · default $178</span></div>
+        <div class="mi-field" id="mi-ltv-field">
+          <div class="mi-lbl">Current LTV-12M ($ per customer)<span class="mi-note">Month / MTD & Quarter only · existing reference $178</span></div>
           <div class="mi-wrap"><span class="mi-pre">$</span><input class="mi-inp" id="mi-ltv" type="number" min="0" step="0.01" placeholder="178.00" oninput="calcDerived()"></div>
         </div>
         <div class="mi-field">
@@ -929,6 +929,8 @@ function _monthEndISO(y, m1) {
 }
 
 function shopifyLtvTargetForPeriod(opt) {
+  // LTV 12M is a monthly-cohort metric. Do not approximate/interpolate it for Week.
+  if (ptype === "week") return null;
   if (!opt?.end) return null;
   const m = String(opt.end).match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (!m) return null;
@@ -1456,6 +1458,22 @@ function renderNVR(nvrRows, kpiRow) {
 ══════════════════════════════════════════════════════ */
 function renderCAC(cacVal, ltvVal, source) {
   const el = document.getElementById("s-cac"); if (!el) return;
+  const noteBox = document.getElementById("cac-note-box");
+  const manualLtvField = document.getElementById("mi-ltv-field");
+
+  // Methodology guard: LTV 12M is cohort-based and monthly. A weekly value would
+  // only be a repeated/interpolated monthly observation, so Section 05 is disabled
+  // for Week instead of presenting a misleading LTV or LTV/CAC ratio.
+  if (ptype === "week") {
+    if (manualLtvField) manualLtvField.style.display = "none";
+    if (noteBox) noteBox.innerHTML = `ℹ <strong>LTV methodology:</strong> LTV 12M is intentionally unavailable for <strong>Week</strong>. It is calculated from monthly Shopify acquisition cohorts, so no weekly approximation is displayed.`;
+    el.innerHTML = `<div class="kc" style="grid-column:1/-1"><div class="kc-bar" style="background:var(--am)"></div><div class="kc-lbl">LTV KPIs</div><div class="kc-val">Month / MTD or Quarter only</div><div class="kc-note">Weekly LTV and LTV/CAC are disabled because the underlying LTV 12M methodology is based on fully closed monthly acquisition cohorts.</div></div>`;
+    return;
+  }
+
+  if (manualLtvField) manualLtvField.style.display = "";
+  if (noteBox) noteBox.innerHTML = `ℹ <strong>LTV note:</strong> LTV metrics are shown only for <strong>Month / MTD</strong> and <strong>Quarter</strong>. The existing LTV remains unchanged (manual/reference, default <strong>$178</strong>) and <strong>Shopify LTV 12M</strong> uses the latest acquisition cohort with 12 fully closed months as of the selected period end.`;
+
   const ltv = ltvVal > 0 ? ltvVal : DEFAULT_LTV_12M;
   const cac = cacVal > 0 ? cacVal : DEFAULT_CAC_REF;
   const hasActualCAC = cacVal > 0;
@@ -2012,15 +2030,19 @@ function calcDerived() {
   const roas  = nsOv>0&&spend>0 ? nsOv/spend : null;
   const cacC  = nc>0&&spend>0   ? spend/nc   : null;
   const cac   = cacOv>0 ? cacOv : cacC;
-  const ltvCac= cac&&ltv>0      ? ltv/cac    : null;
+  const ltvCac= ptype!=="week" && cac&&ltv>0 ? ltv/cac : null;
   const dc = (l,v,f,c,n) => `<div class="kc"><div class="kc-bar" style="background:${c||'var(--gd)'}"></div><div class="kc-lbl">${l}</div><div class="kc-val">${v!==null&&v!==undefined&&!isNaN(v)?fv(v,f):"—"}</div><div class="kc-badges"></div>${n?`<div class="kc-note">${n}</div>`:""}</div>`;
   const der = document.getElementById("mi-derived");
-  if (der) der.innerHTML =
-    dc("G+M Ad Spend",  spend>0?spend:null, "$", "var(--gd)") +
-    dc("G+M ROAS",      roas,               "x", "var(--gr)", "Net Sales ÷ G+M spend") +
-    dc("CAC (G+M)",     cac,                "$", "var(--gd)", nc>0?"G+M spend ÷ new customers":"Enter new customers") +
-    dc("LTV / CAC",     ltvCac,             "x", "var(--gd)", "LTV-12M ÷ CAC") +
-    dc("LTV-12M",       ltv>0?ltv:null,     "$", "var(--pu)");
+  if (der) {
+    const baseDerived =
+      dc("G+M Ad Spend",  spend>0?spend:null, "$", "var(--gd)") +
+      dc("G+M ROAS",      roas,               "x", "var(--gr)", "Net Sales ÷ G+M spend") +
+      dc("CAC (G+M)",     cac,                "$", "var(--gd)", nc>0?"G+M spend ÷ new customers":"Enter new customers");
+    const ltvDerived = ptype === "week"
+      ? ``
+      : dc("LTV / CAC", ltvCac, "x", "var(--gd)", "LTV-12M ÷ CAC") + dc("LTV-12M", ltv>0?ltv:null, "$", "var(--pu)");
+    der.innerHTML = baseDerived + ltvDerived;
+  }
   renderCAC(cac||0, ltvIn, spend>0?"G+M":"");
 }
 
